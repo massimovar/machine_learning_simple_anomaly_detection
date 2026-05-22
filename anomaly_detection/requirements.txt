@@ -1,0 +1,26 @@
+# ============================================================================
+# requirements.txt — Python dependencies for this project
+# ============================================================================
+# We keep the list minimal: only what is truly needed.
+#
+#   paho-mqtt      → MQTT client for subscribing to sensor data and publishing alerts
+#   numpy          → numerical arrays, used everywhere for data manipulation
+#   scikit-learn   → provides MinMaxScaler for normalising sensor values to [0,1]
+#   pyyaml         → reads the config.yaml configuration file
+#
+# TFLite / TensorFlow is NOT listed here because the correct package differs
+# per environment:
+#
+#   Edge device (ARM64, Docker image):  tflite-runtime  (inference only, ~few MB)
+#     → installed by Dockerfile
+#
+#   Training (local, outside Docker):  tensorflow
+#     pip install tensorflow
+# ============================================================================
+
+paho-mqtt>=2.0,<3.0
+# numpy<2.0: tflite-runtime 2.14 was compiled against the numpy 1.x C ABI.
+# Pinning here ensures ARM64 edge builds stay compatible with tflite-runtime.
+numpy>=1.26,<2.0
+scikit-learn>=1.3,<2.0
+pyyaml>=6.0,<7.0

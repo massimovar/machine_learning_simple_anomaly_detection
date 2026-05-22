@@ -1,0 +1,66 @@
+# ==========================================================================
+# .gitignore — Files excluded from Git version control
+# ==========================================================================
+
+# --- Python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+*.whl
+
+# --- Virtual environments -------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+Lib/
+Scripts/
+Include/
+pyvenv.cfg
+
+# --- IDE / Editor ---------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS -------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# --- Training data (generated, can be re-created) -------------------------
+anomaly_detection/training/data/
+*.csv
+
+# --- Trained models (binary, re-trainable) --------------------------------
+anomaly_detection/models/
+*.pth
+*.pkl
+
+# --- Environment variables / secrets --------------------------------------
+.env
+.env.*
+
+# --- Logs -----------------------------------------------------------------
+*.log
+
+# --- Docker ---------------------------------------------------------------
+# Ignore nothing Docker-related — compose and Dockerfile should be tracked
+
+# --- FTOptix project ------------------------------------------------------
+# The paper_clip_machine folder is the FTOptix project (binary/generated files,
+# IDE workspace state, compiled assets).
+FTOptix/paper_clip_machine/
+
+# --- tar docker images ----------------------------------------------
+*.tar
+
+# --- Pre-packaged edge Docker images (large binaries, re-exportable) ------
+optix_edge_docker_images/

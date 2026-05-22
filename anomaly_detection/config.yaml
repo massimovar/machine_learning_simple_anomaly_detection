@@ -1,0 +1,52 @@
+# ============================================================================
+# config.yaml — Central configuration for the anomaly detection project
+# ============================================================================
+# Every tuneable parameter lives here so you can experiment without touching
+# code.  Each setting is documented with its purpose and sensible default.
+# ============================================================================
+
+# --- MQTT connection ----------------------------------------------------------
+mqtt:
+  broker_host: "mqtt-broker"        # hostname of the Mosquitto container (Docker Compose service name)
+  broker_port: 1883                 # default MQTT port (unencrypted)
+  sensor_topic: "ftoptix/paperclip/sensors"   # topic where FTOptix publishes sensor data
+  alert_topic:  "anomaly/paperclip/alerts"    # topic where this app publishes anomaly alerts
+  client_id: "anomaly-detector"     # MQTT client identifier
+
+# --- Preprocessing ------------------------------------------------------------
+preprocessing:
+  window_size: 30       # number of samples to collect before running detection
+                        # at 1 Hz, 30 samples = 30 seconds of data
+  # The 10 sensor tag names, in order.  Must match the JSON keys in the MQTT payload.
+  tag_names:
+    - wire_feed_speed
+    - wire_tension
+    - motor_current_feed
+    - motor_current_bend
+    - bend_angle
+    - cycle_time
+    - vibration_rms
+    - cut_force
+    - temperature_motor
+    - reject_count_per_min
+
+# --- Model (Autoencoder) -----------------------------------------------------
+model:
+  input_size: 10        # number of sensor tags (must match tag_names length)
+  hidden_size: 64       # neurons in the first/last hidden layers
+  bottleneck_size: 16   # neurons in the compressed middle layer
+  model_path: "models/autoencoder.tflite"    # TFLite flat-buffer model (replaces .pth)
+  scaler_path: "models/scaler.pkl"           # where the fitted MinMaxScaler is saved
+  threshold_path: "models/threshold.json"    # where the anomaly threshold is saved
+  # NPU acceleration (NXP i.MX 8M Plus eIQ VSI delegate):
+  # Set to true once the NXP eIQ runtime (libvx_delegate.so) is deployed on
+  # the edge device.  Falls back to CPU automatically if the delegate is absent.
+  use_npu: false
+
+# --- Training (used by training/train.py) ------------------------------------
+training:
+  epochs: 100           # number of full passes over the training data
+  learning_rate: 0.001  # Adam optimizer step size
+  batch_size: 32        # samples per training batch
+  threshold_sigma: 3.0  # threshold = mean(mse) + sigma * std(mse)
+                        # 3.0 means the classic "three-sigma" rule

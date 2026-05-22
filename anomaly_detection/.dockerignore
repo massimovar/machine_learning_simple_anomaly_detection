@@ -1,0 +1,40 @@
+# ==========================================================================
+# .dockerignore — Exclude files from the Docker build context
+# ==========================================================================
+# Without this file, the entire anomaly_detection/ directory (including the
+# Python virtual environment in Scripts/) is sent to the Docker daemon.
+# That caused a 640 MB build context.  This file reduces it to <5 MB.
+# ==========================================================================
+
+# Python virtual environment (Scripts/ on Windows, bin/ on Linux)
+Scripts/
+venv/
+bin/
+include/
+Include/
+lib/
+lib64/
+pyvenv.cfg
+
+# Python cache and bytecode
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+*.pyc
+*.pyo
+
+# Training artefacts (not needed at runtime — models/ is explicitly copied)
+training/
+
+# Data files (not needed inside the container)
+data/
+
+# Editor / OS noise
+.venv/
+*.env
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore

@@ -1,0 +1,17 @@
+FROM --platform=${TARGETPLATFORM:-linux/amd64} python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+
+RUN if ! pip install --no-cache-dir "tflite-runtime>=2.14,<2.15"; then \
+      pip install --no-cache-dir "tensorflow>=2.14,<2.16"; \
+    fi
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY config.yaml .
+COPY src/ src/
+COPY models/ models/
+
+CMD ["python", "src/main.py"]
