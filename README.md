@@ -234,7 +234,7 @@ $$\text{MSE} = \frac{1}{10} \sum_{i=1}^{10} (x_i - \hat{x}_i)^2$$
 | motor_current_feed | 0.60 | 0.62 | -0.02 | 0.0004 |
 | ... (7 more) | ... | ... | ... | 0.0014 |
 
-Sum of squares = 0.0001 + 0.0001 + 0.0004 + 0.0014 = 0.0020  
+Sum of squares = 0.0001 + 0.0001 + 0.0004 + 0.0014 = 0.0020
 **MSE = 0.0020 / 10 = 0.0002** ← small error = good reconstruction = **normal**
 
 **Example with anomalous data:**
@@ -246,7 +246,7 @@ Sum of squares = 0.0001 + 0.0001 + 0.0004 + 0.0014 = 0.0020
 | temperature_motor | 0.85 | 0.55 | 0.30 | 0.0900 |
 | ... (7 more) | ... | ... | ... | 0.0080 |
 
-Sum of squares = 0.1225 + 0.3600 + 0.0900 + 0.0080 = 0.5805  
+Sum of squares = 0.1225 + 0.3600 + 0.0900 + 0.0080 = 0.5805
 **MSE = 0.5805 / 10 = 0.05805** ← large error = bad reconstruction = **anomaly!**
 
 ---
@@ -284,12 +284,12 @@ This rule comes from the **Gaussian distribution** (also called **normal distrib
 
 
     Understanding the ranges:
-    
+
     ├────────┤           68% within  μ ± 1σ  (1 standard deviation from mean)
     ├──────────────────┤ 95% within  μ ± 2σ  (2 standard deviations)
     ├────────────────────────────┤ 99.7% within μ ± 3σ  (3 standard deviations)
-                                  
-    
+
+
     Our threshold = μ + 3σ  (right edge of the 99.7% range)
     → Any MSE above this is in the extreme 0.3% tail → ANOMALY!
 ```
@@ -338,7 +338,7 @@ flowchart LR
     A["🏭 FTOptix\n(sensor data)"] -->|MQTT publish\nTCP 1883| B["📫 MQTT Broker\n(Mosquitto)"]
     B -->|MQTT subscribe\nTCP 1883| C["mqtt_client.py\n(receive & parse)"]
     C --> D["preprocessing.py\n(buffer → window → normalise)"]
-    D --> E["model.py\n(autoencoder inference)"]
+    D --> E["detector.py\n(TFLite autoencoder inference)"]
     E --> F["detector.py\n(score → threshold)"]
     F -->|MQTT publish alert\nanomalous/paperclip/alerts| B
     B -->|MQTT subscribe| G["AnomalyFeedbackManager\n(FTOptix NetLogic)\nparses JSON → sets IsAnomaly"]
@@ -354,9 +354,9 @@ flowchart LR
 
 3. **mqtt_client.py** receives the raw message, parses the JSON, and hands the sensor dictionary to the callback defined in `main.py`.
 
-4. **preprocessing.py** buffers 30 messages (= 30 seconds), averages them into a single vector of 10 values, and normalises each value to [0, 1] using a pre-fitted scaler.
+4. **preprocessing.py** buffers 30 messages (= 30 seconds), averages them into a single vector of 10 values, and normalises each value with the saved scaler.
 
-5. **model.py** feeds the normalised vector through the autoencoder and produces a reconstruction.
+5. **detector.py** feeds the normalised vector through the TFLite autoencoder and reads the reconstruction.
 
 6. **detector.py** computes the MSE between the original and the reconstruction. If MSE > threshold → anomaly. The result is published back to the MQTT broker on topic `anomaly/paperclip/alerts`.
 
@@ -398,15 +398,15 @@ flowchart LR
 
 **1. The autoencoder bottleneck** (`src/model.py`):
 ```python
-tf.keras.layers.Dense(bottleneck_size, activation="relu", name="bottleneck")
+tf.keras.layers.Dense(bottleneck_size, activation="relu")
 ```
 This is where the magic happens: the network is forced to compress 64 numbers into 16, learning only the most essential patterns.
 
 **2. Buffer emits a window** (`src/preprocessing.py`):
 ```python
-if len(self.samples) >= self.window_size:
-    window = np.array(self.samples, dtype=np.float32)
-    self.samples = []
+if len(self.samples) == self.window_size:
+    window = np.asarray(self.samples, dtype=np.float32)
+    self.samples.clear()
     return window
 ```
 Samples accumulate one by one until we have a full window (30 samples), then the buffer resets.
@@ -439,9 +439,9 @@ The reconstruction error: low for normal, high for anomalous.
 
 **7. Threshold check** (`src/detector.py`):
 ```python
-is_anomaly = score > threshold
+return DetectionResult(score > threshold, score, threshold)
 ```
-One line, one decision: is the reconstruction error higher than what we saw during training?
+The decision is still one comparison: is the reconstruction error higher than what we saw during training?
 
 **8. Subscribe on connect** (`src/mqtt_client.py`):
 ```python
@@ -492,13 +492,13 @@ The three-sigma rule: anything more than 3 standard deviations above mean traini
 | Python | 3.11 | For running the integration test and (optionally) training |
 | paho-mqtt | ≥ 2.0 | Python package for the test script: `pip install "paho-mqtt>=2.0,<3.0"` |
 
-> **Platform note (ARM64 target):**  
-> The Compose stack is intentionally ARM64-only (`platform: linux/arm64`) to match the NXP edge target.  
-> Build and run this stack on an ARM64 host (or with a builder/runtime that supports ARM64 execution).
+> **Platform note:**
+> The default `docker-compose.yml` is native-platform and can run locally on Windows with Docker Desktop or Podman.
+> Use `docker-compose.edge.yml` only when building/running the ARM64 edge image for the NXP target.
 
 ### Step 1: Generate synthetic data and train the model
 
-These steps run **on your machine** (not in Docker) because training is a one-time offline task.  
+These steps run **on your machine** (not in Docker) because training is a one-time offline task.
 Skip this step if the `models/` directory already contains `autoencoder.tflite`, `scaler.pkl`, and `threshold.json`.
 
 1. Create and activate a virtual environment.
@@ -556,21 +556,21 @@ models/
 
 ### Step 2: Start the containers
 
-#### 2A) Local run with Podman Compose (development machine)
+#### 2A) Local run on Windows/Linux/macOS
 
-```bash
+The default Compose file builds the detector image for your current machine architecture. On Windows with Podman, use either `podman compose` or the Docker-compatible `docker compose` command if your Podman installation provides it.
+
+```powershell
 # still inside anomaly_detection/ from Step 1
-podman compose up
-```
+podman compose up --build
 
-This Compose file assumes the detector image is already built (`anomaly_detection-detector:edge`).
-> ```bash
-> podman build --platform linux/arm64 -t anomaly_detector:edge .
-> ```
+# Equivalent when Podman is exposed through Docker-compatible commands
+docker compose up --build
+```
 
 #### 2B) Deploy on edge device with Portainer (stack)
 
-> **Important (architecture):** This edge image is ARM64-only.
+> **Important (architecture):** The edge override is ARM64-only: `docker-compose.edge.yml` sets `platform: linux/arm64`.
 > On a Windows amd64 Podman machine, `podman build --platform linux/arm64 ...` can fail with
 > `exec container process '/bin/sh': Exec format error` (for example at a `RUN pip install ...` step)
 > if ARM emulation is not enabled.
@@ -595,7 +595,7 @@ This Compose file assumes the detector image is already built (`anomaly_detectio
 
 ```bash
 # from anomaly_detection/
-podman build --platform linux/arm64 -t anomaly_detection-detector:edge .
+podman compose -f docker-compose.yml -f docker-compose.edge.yml build
 podman pull --platform linux/arm64 eclipse-mosquitto:2
 podman save -o edge-images.tar anomaly_detection-detector:edge eclipse-mosquitto:2
 ```

@@ -1,0 +1,6 @@
+services:
+  detector:
+    build:
+      context: .
+    image: anomaly_detection-detector:edge
+    platform: linux/arm64
