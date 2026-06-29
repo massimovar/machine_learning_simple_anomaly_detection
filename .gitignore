@@ -64,3 +64,6 @@ FTOptix/paper_clip_machine/
 
 # --- Pre-packaged edge Docker images (large binaries, re-exportable) ------
 optix_edge_docker_images/
+
+# --- Agent files
+CONTEXT.md
