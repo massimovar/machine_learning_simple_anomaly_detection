@@ -1,4 +1,5 @@
-FROM python:3.11-slim
+ARG IMAGE_PLATFORM=linux/amd64
+FROM --platform=${IMAGE_PLATFORM} python:3.11-slim
 
 WORKDIR /app
 

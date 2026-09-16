@@ -33,6 +33,7 @@ EXIT CODES:
 """
 
 import json
+import os
 import sys
 import time
 import threading
@@ -43,8 +44,8 @@ import paho.mqtt.client as mqtt
 # ---------------------------------------------------------------------------
 # Configuration — matches config.yaml
 # ---------------------------------------------------------------------------
-BROKER_HOST = "localhost"
-BROKER_PORT = 1883
+BROKER_HOST = os.getenv("MQTT_BROKER_HOST", "localhost")
+BROKER_PORT = int(os.getenv("MQTT_BROKER_PORT", "1883"))
 SENSOR_TOPIC = "ftoptix/paperclip/sensors"
 ALERT_TOPIC = "anomaly/paperclip/alerts"
 WINDOW_SIZE = 30          # detector buffers this many samples before detecting
@@ -165,9 +166,13 @@ def publish_window(sensor_data: dict, n_messages: int = WINDOW_SIZE):
     pub.loop_start()
 
     payload = json.dumps(sensor_data)
+    publish_results = []
     for _ in range(n_messages):
-        pub.publish(SENSOR_TOPIC, payload, qos=1)
+        publish_results.append(pub.publish(SENSOR_TOPIC, payload, qos=1))
         time.sleep(MSG_INTERVAL_S)
+
+    for result in publish_results:
+        result.wait_for_publish(timeout=5)
 
     pub.loop_stop()
     pub.disconnect()
@@ -182,7 +187,8 @@ def assert_result(result: Optional[dict], expect_anomaly: bool, scenario: str):
     if result is None:
         raise AssertionError(
             f"[{scenario}] TIMEOUT — no alert received within {ALERT_TIMEOUT_S} s.\n"
-            "Is the detector container running?  Try: podman compose up -d"
+            f"No detector response from the broker at {BROKER_HOST}:{BROKER_PORT}. "
+            "Check the Compose services and detector logs."
         )
 
     actual = result.get("is_anomaly")
