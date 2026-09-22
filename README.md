@@ -4,6 +4,8 @@
 
 ---
 
+<img src="misc/screenshot.png" width="100%"/>
+
 ## Table of Contents
 
 1. [Introduction](#1-introduction)
@@ -384,7 +386,7 @@ flowchart LR
 | `src/detector.py` | Compute anomaly score vs. threshold | Decision logic |
 | `training/generate_synthetic.py` | Create fake sensor data | Synthetic data generation |
 | `training/train.py` | Train the autoencoder offline | Model training |
-| `Dockerfile` | Single arm64 recipe for edge deployment | Containerisation |
+| `Dockerfile` | Native local recipe with an explicit ARM64 edge build target | Containerisation |
 | `docker-compose.yml` | Run broker + detector together (TCP 1883 required; WebSocket 9001 reserved, unused) | Multi-container orchestration |
 | `FTOptix/…/ThePaperClipMachineSimulator.cs` | FTOptix NetLogic — generates the 10 simulated sensor tags and publishes them via MQTT every second. Includes an `[ExportMethod]` to inject an anomaly on demand | Sensor simulation |
 | `FTOptix/…/AnomalyFeedbackManager.cs` | FTOptix NetLogic — subscribes to the MQTT alert topic, parses the JSON payload, and sets `Model/IsAnomaly` | MQTT → OPC UA bridge |
@@ -475,7 +477,7 @@ The three-sigma rule: anything more than 3 standard deviations above mean traini
 | MQTT QoS | Level 1 (at least once) | Don't lose alerts; QoS 2 adds unnecessary overhead | QoS 0 — might lose alerts; QoS 2 — overkill |
 | Docker base | python:3.11-slim | Small image, no compilation issues with pip | Alpine — smaller but C-extension installs often fail |
 | Runtime target | ARM64 only | Matches the NXP i.MX 8M Plus deployment target and keeps the runtime stack simple (`tflite-runtime` only) | Multi-arch image logic — more complexity for this tutorial |
-| Build platform | `platform: linux/arm64` in `docker-compose.yml` + `FROM --platform=${TARGETPLATFORM:-linux/arm64}` | Keeps build and runtime architecture explicit and consistent | Implicit platform selection — can pull the wrong architecture image |
+| Build platform | `platform: linux/arm64` and `IMAGE_PLATFORM=linux/arm64` in `docker-compose.edge.yml` + `FROM --platform=${IMAGE_PLATFORM}` | Keeps build and runtime architecture explicit even when Podman's delegated Compose builder ignores `build.platforms` | Implicit platform selection — can pull the wrong architecture image |
 | Anomaly state → browser | Write `isanomaly.js` to `treeJs_scene/`; browser polls with `fetch('./isanomaly.js')` every 2 s | FTOptix's WebBrowser enforces `default-src 'self'` CSP. Any fetch to a different port (e.g. `http://host:8085/...`) is a cross-origin request and is blocked, even on the same machine. A relative fetch inside the served folder is always same-origin. Worst-case update lag is 4 s (write interval + poll interval), which is acceptable for a visual indicator | `HttpListener` on a dedicated port — blocked by CSP; WebSocket — also cross-origin; MQTT over WebSocket in-browser — requires adding `connect-src ws://...` to the CSP, which is not configurable without access to the FTOptix web server config |
 | `.js` extension for the state file | `isanomaly.js` instead of `isanomaly.json` | FTOptix's embedded web server returns 403 for `.json` files — they are on an internal deny list to protect FTOptix project configuration files. Using `.js` avoids the block. The content is still valid JSON; the browser reads it as text and calls `JSON.parse()` explicitly | Rename to `.txt` — also works, but `.js` is more self-documenting in the context of a JS project |
 
@@ -570,7 +572,7 @@ docker compose up --build
 
 #### 2B) Deploy on edge device with Portainer (stack)
 
-> **Important (architecture):** The edge override is ARM64-only: `docker-compose.edge.yml` sets `platform: linux/arm64`.
+> **Important (architecture):** The edge override is ARM64-only: `docker-compose.edge.yml` sets the service platform, build platform, and `IMAGE_PLATFORM` build argument to `linux/arm64`.
 > On a Windows amd64 Podman machine, `podman build --platform linux/arm64 ...` can fail with
 > `exec container process '/bin/sh': Exec format error` (for example at a `RUN pip install ...` step)
 > if ARM emulation is not enabled.
