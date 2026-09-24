@@ -344,8 +344,8 @@ flowchart LR
     E --> F["detector.py\n(score → threshold)"]
     F -->|MQTT publish alert\nanomalous/paperclip/alerts| B
     B -->|MQTT subscribe| G["AnomalyFeedbackManager\n(FTOptix NetLogic)\nparses JSON → sets IsAnomaly"]
-    G -->|AnomalyInfoWebAPI\nwrites every 2 s| H["isanomaly.js\n(treeJs_scene/ folder)"]
-    H -->|fetch every 2 s\nsame-origin| I["🌐 3-D Digital Twin\n(paper_clip_machine_world.html)\nstack light · screen · operator"]
+    G -->|AnomalyInfoWebAPI\nwrites every 2 s| H["isanomaly.js / .json\n(treeJs_scene/ folder)"]
+    H -->|fetch every 2 s\nsame-origin| I["🌐 3-D Digital Twin\n(paper_clip_machine_world.html)\nbeacon · red floods · stack light · operator"]
 ```
 
 **Step by step:**
@@ -366,7 +366,7 @@ flowchart LR
 
 8. **AnomalyInfoWebAPI** (a second FTOptix NetLogic) runs a `PeriodicTask` every 2 seconds. It reads `IsAnomaly` from the model and writes it as a tiny JSON payload into `treeJs_scene/isanomaly.js` on disk.
 
-9. **The 3-D digital twin** (`paper_clip_machine_world.html`, served by FTOptix's embedded WebPresentationEngine on port 8080) polls `./isanomaly.js` every 2 seconds with a relative `fetch()`. When the flag is `true`, the scene reacts: the stack light turns red, the HMI screen blinks red, and the operator character moves faster.
+9. **The 3-D digital twin** (`paper_clip_machine_world.html`, served by FTOptix's embedded WebPresentationEngine on port 8080) polls the state file every 2 seconds with a relative `fetch()`. It probes `./isanomaly.js` first, then `./isanomaly.json`, and keeps whichever answers (the current `AnomalyFeedbackManager.cs` writes `isanomaly.json`). If no answer arrives for 5 seconds — or the page is opened from `file://`, where `fetch()` is unavailable — the scene falls back to its built-in telemetry simulation. When the flag is `true`, the scene raises an alarm that stays readable even at noon: a rotating red beacon with light beams and a red flood light, the flood-light towers switch to red, the stack light glows red, the HMI screen blinks red, a pulsing red vignette frames the view, the whole scene takes on a red alarm grade, and the operator panics.
 
    **Why a file and not a direct HTTP call?** FTOptix's WebBrowser enforces a strict Content Security Policy (`default-src 'self'`). Any fetch to a different port — even on the same host — is a different origin and is blocked. A relative fetch to a file in the same served folder is always same-origin and requires no special configuration. See the [Decision Log](#6-decision-log) for the full rationale.
 
@@ -391,9 +391,10 @@ flowchart LR
 | `FTOptix/…/ThePaperClipMachineSimulator.cs` | FTOptix NetLogic — generates the 10 simulated sensor tags and publishes them via MQTT every second. Includes an `[ExportMethod]` to inject an anomaly on demand | Sensor simulation |
 | `FTOptix/…/AnomalyFeedbackManager.cs` | FTOptix NetLogic — subscribes to the MQTT alert topic, parses the JSON payload, and sets `Model/IsAnomaly` | MQTT → OPC UA bridge |
 | `FTOptix/…/AnomalyInfoWebAPI.cs` | FTOptix NetLogic — `PeriodicTask` writes `isanomaly.js` every 2 s from `Model/IsAnomaly` | File-based state export |
-| `FTOptix/…/paper_clip_machine_world.html` | 3-D digital twin entry point (Three.js scene), served by FTOptix WebPresentationEngine on port 8080 | Live browser visualisation |
+| `FTOptix/…/paper_clip_machine_world.html` | 3-D digital twin entry point (Three.js r128): the paper-clip machine outdoors on sand, with paper-clip mountains, a bulldozer and a 24 h day/night cycle in 60 s. Served by FTOptix WebPresentationEngine on port 8080 | Live browser visualisation |
+| `FTOptix/…/js/scene/*.js` | The scene code: 12 ES5 classic scripts loaded in order, sharing one `window.PCM` namespace — `core` (renderer, quality tiers, dynamic resolution, URL parameters), `assets` (shared materials, shader hook, procedural textures, geometry helpers), `fx` (glow halos, light cones, particles, ground decals), `sky` (sky dome, sun, moon, stars, clouds, day/night controller), `terrain` (sand, paper-clip mountains, scattered clips), `rockwell` (GuardLogix 5380 safety PLC, Compact 5000 I/O, PowerFlex 525, Stratix, 440G, 450L, OptixEdge and other device faces), `machine`, `characters` (operator, bulldozer driver), `site` (flood-light towers, props, bulldozer), `anomaly` (state polling, alarm effects), `ui` (tour, balloons, hints, title), `main` (build order, frame loop) | Modular, CSP-safe, no build step |
 | `FTOptix/…/js/hydrate.js` | Initialises HTML elements from `window.CONTENT` at page load. Extracted from inline `<script>` to satisfy CSP `script-src 'self'` | CSP-compliant hydration |
-| `FTOptix/…/js/content.js` | Editable text content for labels, walkthrough text, and stack panel | Content / configuration |
+| `FTOptix/…/js/content.js` | Editable text content for labels, walkthrough text, and stack panel, plus the scene settings `dayNight`, `branding` and `quality` | Content / configuration |
 | `FTOptix/…/treeJs_scene/isanomaly.js` | Runtime file written by `AnomalyInfoWebAPI`. Contains `{"isAnomaly":true/false}`. The `.js` extension is required because FTOptix's web server blocks `.json` file downloads | Anomaly state handshake |
 
 ### The 10 Most Important Lines of Code
@@ -480,6 +481,9 @@ The three-sigma rule: anything more than 3 standard deviations above mean traini
 | Build platform | `platform: linux/arm64` and `IMAGE_PLATFORM=linux/arm64` in `docker-compose.edge.yml` + `FROM --platform=${IMAGE_PLATFORM}` | Keeps build and runtime architecture explicit even when Podman's delegated Compose builder ignores `build.platforms` | Implicit platform selection — can pull the wrong architecture image |
 | Anomaly state → browser | Write `isanomaly.js` to `treeJs_scene/`; browser polls with `fetch('./isanomaly.js')` every 2 s | FTOptix's WebBrowser enforces `default-src 'self'` CSP. Any fetch to a different port (e.g. `http://host:8085/...`) is a cross-origin request and is blocked, even on the same machine. A relative fetch inside the served folder is always same-origin. Worst-case update lag is 4 s (write interval + poll interval), which is acceptable for a visual indicator | `HttpListener` on a dedicated port — blocked by CSP; WebSocket — also cross-origin; MQTT over WebSocket in-browser — requires adding `connect-src ws://...` to the CSP, which is not configurable without access to the FTOptix web server config |
 | `.js` extension for the state file | `isanomaly.js` instead of `isanomaly.json` | FTOptix's embedded web server returns 403 for `.json` files — they are on an internal deny list to protect FTOptix project configuration files. Using `.js` avoids the block. The content is still valid JSON; the browser reads it as text and calls `JSON.parse()` explicitly | Rename to `.txt` — also works, but `.js` is more self-documenting in the context of a JS project |
+| State file name in the 3-D scene | Probe `./isanomaly.js`, then `./isanomaly.json`; lock onto the one that answers and re-probe after 3 misses | The `.js` decision above and the current `AnomalyFeedbackManager.cs` (which writes `isanomaly.json`) disagree. Auto-detection keeps the scene working with either file, with no configuration | Hard-code one name — the alarm silently stops working when the other file is deployed |
+| 3-D scene code structure | 12 ES5 classic scripts in `js/scene/`, one shared `window.PCM` namespace, no build step | The page must run inside FTOptix's WebBrowser under CSP `script-src 'self'` and also from `file://`, where inline scripts and ES modules are blocked. Static parts are merged per material and repeated parts are instanced, so the whole scene renders in about 70 draw calls (shadow pass included) with 41 shared materials | ES modules + bundler — adds a build step and does not load from `file://` |
+| 3-D quality tiers | `auto` picks `low` on software renderers (SwiftShader, llvmpipe), `medium` on mobile or ≤ 4-core devices, `high` otherwise; dynamic resolution on top | Panels without GPU acceleration stay interactive (low tier: no MSAA, simpler shadows, fewer instanced clips, 30 fps cap), while PCs get MSAA, soft 2048 px shadows and denser detail. All tiers use the same 7 constant lights, switched by intensity only, so day/night and alarm changes never recompile shaders | One fixed quality — too slow on panels or too plain on PCs |
 
 ---
 
@@ -660,7 +664,18 @@ services:
 file:///.../FTOptix/paper_clip_machine/ProjectFiles/treeJs_scene/paper_clip_machine_world.html
 ```
 
-Or serve it from any static HTTP server (e.g. VS Code Live Server, Nginx, or FTOptix's own embedded web server). The page currently runs as a standalone 3-D visualisation while MQTT browser sync is disabled.
+Or serve it from any static HTTP server (e.g. VS Code Live Server, Nginx, or FTOptix's own embedded web server). The page currently runs as a standalone 3-D visualisation while MQTT browser sync is disabled. Opened from `file://`, the page cannot `fetch()` the state file and runs on its built-in simulation; served over HTTP, it follows `isanomaly.js` / `isanomaly.json`.
+
+Optional URL parameters for demos and debugging (for example `paper_clip_machine_world.html?time=19.2&anomaly=1`):
+
+| Parameter | Values | Effect |
+|---|---|---|
+| `quality` | `auto` (default), `high`, `medium`, `low` | Render quality tier; overrides `quality.tier` in `content.js` |
+| `time` | `0`–`24` | Freeze the day/night clock at this hour (e.g. `12` noon, `18.2` sunset, `0` midnight) |
+| `speed` | number, default `1` | Day/night speed multiplier; `1` = 24 h in 60 s (`dayNight.cycleSeconds`) |
+| `anomaly` | `1` / `0` | Force the alarm on / off, ignoring the state file |
+| `stats` | `1` | Show an overlay with tier, FPS, frame time, draw calls, triangles, pixel ratio and GPU name |
+| `dynres` | `0` | Disable dynamic resolution (useful for benchmarks) |
 
 4. Validate logs in Portainer:
 - `mqtt-broker` shows Mosquitto startup
