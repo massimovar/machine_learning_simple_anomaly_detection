@@ -1,0 +1,24 @@
+# ============================================================================
+# requirements.txt — Python dependencies for the gesture recognition service
+# ============================================================================
+# We keep the list minimal: only what is truly needed.
+#
+#   paho-mqtt               -> publishes gesture events and status to Mosquitto
+#   numpy                   -> arrays passed to and from the TFLite model
+#   opencv-python-headless  -> reads RTSP / HTTP-MJPEG / webcam / video files and
+#                              resizes frames (headless = no GUI libs, smaller image)
+#   pyyaml                  -> reads the config.yaml configuration file
+#   ai-edge-litert          -> runs MoveNet (LiteRT, the successor of tflite-runtime);
+#                              same package on Windows, amd64 and arm64 Linux
+#
+# On the edge device the NPU may instead need the tflite_runtime that ships
+# with NXP's BSP; src/pose.py uses it automatically when LiteRT is missing.
+# ============================================================================
+
+paho-mqtt>=2.0,<3.0
+# numpy<2.0: the combination tested with this service.
+numpy>=1.26,<2.0
+# <4.12: opencv-python-headless 4.12 requires numpy>=2 (see above).
+opencv-python-headless>=4.8,<4.12
+pyyaml>=6.0,<7.0
+ai-edge-litert>=2.2,<3.0

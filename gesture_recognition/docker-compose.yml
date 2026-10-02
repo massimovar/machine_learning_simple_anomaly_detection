@@ -1,0 +1,47 @@
+# Development stack (laptop, amd64, Podman or Docker).
+#
+# Needs on the host:
+#   1. the webcam bridge (tools/webcam_bridge.py), reachable from containers
+#   2. an MQTT broker published on the host, e.g. the anomaly_detection stack
+#      (it must be the broker FT Optix subscribes to)
+#
+# Run on Windows with Podman, in PowerShell from the repository root.
+# WHY the WSL adapter address: containers in the Podman (WSL) machine cannot
+# reach the Windows 127.0.0.1, and host.containers.internal points at the
+# Podman machine itself.  Only this PC can reach the adapter address, and it
+# can change after a reboot, so look it up every time.
+#   Terminal 1 (webcam bridge, leave it running):
+#     $wsl = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias "vEthernet (WSL*").IPAddress
+#     python gesture_recognition\tools\webcam_bridge.py --bind $wsl
+#   Terminal 2 (service):
+#     $wsl = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias "vEthernet (WSL*").IPAddress
+#     $env:CAMERA_URL = "http://${wsl}:8090/stream.mjpg"
+#     podman compose -f gesture_recognition\docker-compose.yml up --build
+#
+# Different broker port, e.g.:  $env:MQTT_PORT = "1884"   (before "up")
+services:
+  gesture:
+    build:
+      context: .
+    image: gesture_recognition-gesture:local
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TF_CPP_MIN_LOG_LEVEL=3
+      - CAMERA_URL=${CAMERA_URL:-http://host.containers.internal:8090/stream.mjpg}
+      - MQTT_HOST=${MQTT_HOST:-host.containers.internal}
+      - MQTT_PORT=${MQTT_PORT:-1883}
+      - USE_NPU=false
+    # WHY here and not in the Dockerfile: Podman builds OCI images, which
+    # drop a Dockerfile HEALTHCHECK.  main.py rewrites the file every 2 s.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,tempfile,time; sys.exit(time.time() - os.path.getmtime(os.path.join(tempfile.gettempdir(), 'gesture_heartbeat')) > 10)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

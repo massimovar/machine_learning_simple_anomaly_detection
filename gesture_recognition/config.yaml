@@ -1,0 +1,87 @@
+# ============================================================================
+# config.yaml — Central configuration for the gesture recognition service
+# ============================================================================
+# Every tuneable parameter lives here so you can experiment without touching
+# code.  Each setting is documented with its purpose and sensible default.
+#
+# Four values differ between the laptop and the edge device, so environment
+# variables override them (set them in docker-compose / the Portainer stack):
+#   CAMERA_URL  -> camera.url
+#   MQTT_HOST   -> mqtt.broker_host
+#   MQTT_PORT   -> mqtt.broker_port
+#   USE_NPU     -> model.use_npu        (1 / true / yes = on)
+# ============================================================================
+
+# --- Camera -------------------------------------------------------------------
+camera:
+  # Where frames come from.  OpenCV accepts:
+  #   http://.../stream.mjpg   MJPEG over HTTP (laptop: tools/webcam_bridge.py)
+  #   rtsp://...               Ethernet IP camera (edge; never commit credentials)
+  #   0                        a local webcam index (running outside a container)
+  #   clips/test.mp4           a recorded video (replayed at its own speed, looped)
+  url: "http://host.containers.internal:8090/stream.mjpg"
+  mirror: true              # name gestures from the user's point of view, like a mirror
+  open_timeout_ms: 5000     # give up opening the stream after this long
+  read_timeout_ms: 2000     # no frame for this long = camera lost -> reconnect
+  reconnect_max_s: 10       # reconnect waits 1 -> 2 -> 4 -> 8 -> 10 s between attempts
+
+# --- Model (MoveNet SinglePose Lightning int8) --------------------------------
+model:
+  model_path: "models/movenet_lightning_int8.tflite"   # downloaded by tools/fetch_model.py
+  # NPU acceleration (NXP i.MX 8M Plus VX delegate).  Falls back to the CPU
+  # automatically if the delegate cannot be loaded.
+  use_npu: false
+  vx_delegate_path: "/usr/lib/libvx_delegate.so"
+  num_threads: 2            # CPU threads for TFLite; leaves cores free for FT Optix
+  target_fps: 20            # inference rate cap; a swipe (0.3-0.6 s) still gets 6-12 frames
+                            # tip: set the camera to about this rate too; every frame costs
+                            # decode CPU, and faster cameras add up to one frame of waiting
+
+# --- MQTT ---------------------------------------------------------------------
+mqtt:
+  broker_host: "host.containers.internal"   # laptop: broker port published on the host
+  broker_port: 1883                         # must be the broker FT Optix subscribes to
+  client_id: "gesture-recognizer"           # must be unique on the broker
+  events_topic: "gesture/paperclip/events"  # one message per gesture (QoS 1, not retained)
+  status_topic: "gesture/paperclip/status"  # heartbeat (QoS 1, retained); last will = offline
+  status_interval_s: 2                      # heartbeat period in seconds
+
+# --- Gesture rules ------------------------------------------------------------
+# Hand positions are measured from the middle of the shoulders, in shoulder
+# widths (SW): x = +1.0 is one shoulder width to the user's right, y = +1.0 is
+# one shoulder width above the shoulders.  Times are in seconds.
+# Each key maps 1:1 to GestureConfig in src/gestures.py (a typo stops the
+# service at startup).  tests/test_gestures.py checks that these values equal
+# the code defaults, so the unit tests always cover the deployed thresholds.
+gestures:
+  # Who counts as "the operator"
+  min_keypoint_score: 0.3       # ignore body points the model is unsure about
+  min_shoulder_width: 0.12      # narrower shoulders (fraction of image) = too far away
+  max_center_offset: 0.35       # shoulders further from the image centre = passer-by
+  max_wrist_speed: 15.0         # SW/s; faster "jumps" are tracking glitches, not motion
+  max_gap_s: 0.3                # no frame for this long (camera hiccup) also starts a new track; a wrist missed in any frame always does
+  lost_s: 0.5                   # a person unseen this long is forgotten; a hand unseen this long counts as lowered and stopped
+
+  # Repeat protection
+  cooldown_s: 1.0               # minimum time between two gestures
+  opposite_swipe_block_s: 1.5   # an opposite swipe STARTING this soon after a swipe (the return stroke) is ignored
+  release_y: -1.0               # palm gestures re-arm only after the hand drops below this
+  max_off_axis_ratio: 0.5       # swipes must be mostly horizontal, palm-up mostly vertical
+
+  # open_palm: hand held still at shoulder/face height with the forearm up
+  palm_hold_s: 1.0
+  palm_zone_min_y: -0.6
+  palm_zone_max_y: 0.8
+  palm_still_radius: 0.2
+  palm_min_forearm_rise: 0.3    # wrist at least this far above the elbow
+
+  # palm_up: hand pushed up above the head
+  up_min_rise: 1.2
+  up_window_s: 0.7
+  up_end_y: 1.0
+
+  # swipe_left / swipe_right: fast horizontal hand movement, chest to head height
+  swipe_min_dx: 1.5
+  swipe_window_s: 0.6
+  swipe_band_min_y: -1.2
+  swipe_band_max_y: 1.0

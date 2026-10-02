@@ -41,6 +41,8 @@ anomaly_detection/training/data/
 
 # --- Trained models (binary, re-trainable) --------------------------------
 anomaly_detection/models/
+# MoveNet is downloaded by gesture_recognition/tools/fetch_model.py
+gesture_recognition/models/
 *.pth
 *.pkl
 
