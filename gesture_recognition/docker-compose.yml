@@ -24,6 +24,10 @@ services:
     build:
       context: .
     image: gesture_recognition-gesture:local
+    # WHY the default network: Podman creates every compose project network
+    # with isolate=true, and two isolated networks cannot reach each other, so
+    # a broker started by another stack (e.g. anomaly_detection) would time out.
+    network_mode: bridge
     environment:
       - PYTHONUNBUFFERED=1
       - TF_CPP_MIN_LOG_LEVEL=3
