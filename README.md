@@ -169,8 +169,6 @@ The NPU is switched on in the **device tree**, the hardware description the kern
 | The model runs on | The CPU (float32) | The NPU (int8); the CPU if the NPU is unusable |
 | How to start it | [7.5](#75-run-it-on-your-pc) | [7.8](#78-deploy-on-the-optixedge-with-portainer) (Portainer) or [7.9](#79-deploy-on-the-optixedge-from-the-command-line) (command line) |
 
-> `docker-compose.edge.yml` is an older, CPU-only arm64 image, kept for reference. The NPU image replaces it.
-
 ### 1.7 Three ground rules
 
 Three rules shaped every decision of the NPU work:
@@ -883,7 +881,6 @@ Whatever tool deploys it, the detector container needs exactly these things from
 | A volume for compiled NPU graphs | `npu-graph-cache:/var/cache/npu` and `VIV_VX_ENABLE_CACHE_GRAPH_BINARY=1`, `VIV_VX_CACHE_BINARY_GRAPH_DIR=/var/cache/npu` | Evidence (the `.nb` file) and a faster restart ([5.5.3](#553-the-evidence-ladder)) |
 | The switch | `USE_NPU=${USE_NPU:-true}` (`false` for the negative control) | Read by `InferenceEngine` ([5.3](#53-inferenceengine-try-the-npu-fall-back-remember-why)) |
 | Native log lines | `TF_CPP_MIN_LOG_LEVEL=0` | Keeps TFLite's INFO lines, which carry delegation evidence ([5.4](#54-catching-the-c-evidence)) |
-| The broker on port 1884 as well as 1883 | `mqtt-broker` `ports: - "1884:1883"` | The FactoryTalk Optix project's `MQTTClient1` connects to `127.0.0.1:1884` |
 
 `docker-compose.npu.yml` adds exactly these lines to the base `docker-compose.yml`. Nothing else is needed: no extra capabilities, no host network, nothing installed. The device must already *have* its NPU stack in `/usr/lib` (the **Device** rows of [4.3](#43-every-module-library-and-driver)); on our OptixEdge it does.
 
@@ -917,8 +914,7 @@ All paths are relative to `anomaly_detection/`, except the `FTOptix/…` rows.
 | `tools/npu_entrypoint.sh` | At every start, links the device's NPU libraries into the container and checks that nothing is missing ([4.4](#44-the-entrypoint-borrow-only-the-npu-libraries)) | Borrowing libraries |
 | `tools/npu_check.py` | One-shot proof: "can this container run our model on the NPU?" ([7.10](#710-check-that-it-runs-on-the-npu)) | Smoke test |
 | `docker-compose.yml` | Runs the broker and the detector together (TCP 1883 required; WebSocket 9001 reserved, unused) | Multi-container orchestration |
-| `docker-compose.npu.yml` | Override for the OptixEdge: the NPU device, the device's libraries read-only, the graph-cache volume, port 1884 ([4.8](#48-what-the-npu-container-receives-from-the-device)) | Compose override |
-| `docker-compose.edge.yml` | Legacy: an arm64 image that runs on the CPU only. Replaced by the NPU image | — |
+| `docker-compose.npu.yml` | Override for the OptixEdge: the NPU device, the device's libraries read-only, the graph-cache volume ([4.8](#48-what-the-npu-container-receives-from-the-device)) | Compose override |
 | `FTOptix/…/ThePaperClipMachineSimulator.cs` | FTOptix NetLogic: generates the 10 simulated sensor tags and publishes them via MQTT every second. Includes an `[ExportMethod]` to inject an anomaly on demand | Sensor simulation |
 | `FTOptix/…/AnomalyFeedbackManager.cs` | FTOptix NetLogic: subscribes to the alert topic, parses the JSON, sets `IsAnomaly`, and every 2 s writes `treeJs_scene/isanomaly.json` for the 3-D scene | MQTT → OPC UA bridge, file-based state export |
 | `FTOptix/…/NpuStatusManager.cs`, `NpuModelBuilder.cs` | FTOptix NetLogic: the NPU evidence variables and the Benchmark button ([5.8](#58-the-factorytalk-optix-proof-panel)) | HMI proof |
@@ -1607,7 +1603,7 @@ On Linux or macOS, the loop is `for i in $(seq 30); do echo "$normal"; done | po
 anomaly/paperclip/benchmark {"model": "autoencoder.tflite", "precision": "float32", "runs": 1000, "cpu": {"accelerator": "cpu", "runs": 1000, "p50_ms": 0.0099, "p95_ms": 0.0147, ...}, "npu": null, "npu_unavailable": "NPU not requested (USE_NPU=false)", ...}
 ```
 
-**And FactoryTalk Optix?** The FactoryTalk Optix project in `FTOptix/` is the real publisher: its simulator NetLogic publishes the 10 tags every second, and the panel shows the alerts and the NPU evidence. Its MQTT client connects to port 1884 of the broker, which only the NPU override opens ([4.8](#48-what-the-npu-container-receives-from-the-device)).
+**And FactoryTalk Optix?** The FactoryTalk Optix project in `FTOptix/` is the real publisher: its simulator NetLogic publishes the 10 tags every second, and the panel shows the alerts and the NPU evidence. Its MQTT client, `MQTTClient1`, connects to `127.0.0.1:1883`: the same broker port, so it works with this PC stack when FactoryTalk Optix runs on the same PC, and with the device stack when it runs on the OptixEdge.
 
 When you are done, stop everything with `podman compose down` ([7.11](#711-stop-and-remove-everything)).
 
@@ -1681,8 +1677,7 @@ services:
   mqtt-broker:
     image: eclipse-mosquitto:2
     ports:
-      - "1883:1883"   # MQTT for the detector and other clients
-      - "1884:1883"   # the same broker, for the FactoryTalk Optix project's MQTTClient1
+      - "1883:1883"   # MQTT for the detector, FactoryTalk Optix (MQTTClient1) and other clients
       - "9001:9001"   # reserved for MQTT over WebSocket
     command:
       - /bin/sh
@@ -1956,7 +1951,7 @@ Over SSH, also delete the folder: `rm -r /persistent/anomaly_detection`.
 | `undefined symbol: tflite_plugin_create_delegate` | Delegate | The file is not a TFLite external delegate; check `VX_DELEGATE_PATH` |
 | Delegate loads, crash or error at the first invoke | Runtime ↔ delegate | Switch runtime: `HOST_TFLITE_RUNTIME=0` uses the image's LiteRT instead of the borrowed `tflite_runtime` ([4.5](#45-which-tflite-runtime)) |
 | Delegation `0/5` | Model | The delegate rejected every op: check that the int8 model is used (`precision: int8`) |
-| Badge stays `?` in FactoryTalk Optix | MQTT | Check the plain-text subscription to `anomaly/paperclip/status` and the broker port 1884 ([5.8.2](#582-the-variables-in-modelnpu)) |
+| Badge stays `?` in FactoryTalk Optix | MQTT | Check the plain-text subscription to `anomaly/paperclip/status` and the broker port 1883 of `MQTTClient1` ([5.8.2](#582-the-variables-in-modelnpu)) |
 
 ### 7.13 The 3-D digital twin
 

@@ -18,12 +18,6 @@
 #                       NPU, so it is evidence, and it makes later starts faster.
 # ============================================================================
 services:
-  mqtt-broker:
-    ports:
-      # Added to the base file's 1883/9001: the FTOptix project's MQTTClient1
-      # connects to 127.0.0.1:1884, so the same broker answers there too.
-      - "1884:1883"
-
   detector:
     build:
       context: .
