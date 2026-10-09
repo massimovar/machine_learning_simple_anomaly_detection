@@ -2,9 +2,8 @@
 
 > **What is this?** A self-contained learning project with two small AI applications for an industrial HMI built with **FactoryTalk Optix**. Both target the **NXP i.MX 8M Plus** edge controller (ARM Cortex-A53 CPU with an on-chip Neural Processing Unit, NPU), run in containers and talk to the HMI over **MQTT**. There is no GPU and no cloud.
 >
-> - **Part 1, anomaly detection:** a lightweight neural network that we train ourselves watches the machine's sensor data and raises an alert when the pattern looks abnormal. Inference runs on **TensorFlow Lite** because it integrates with the NXP eIQ/VSI delegate stack used on this target platform. By default it runs on the ARM CPU.
+> - **Part 1, anomaly detection:** a lightweight neural network that we train ourselves watches the machine's sensor data and raises an alert when the pattern looks abnormal. It runs on **TensorFlow Lite**: on the CPU of your PC, and on the NPU of an OptixEdge from a container that borrows the device's NPU libraries read-only, with nothing installed on the device. A FactoryTalk Optix panel proves where it runs ([status](#11-what-is-this-project)).
 > - **Part 2, gesture control (work in progress):** a camera watches the operator, a ready-made pose model (**MoveNet**) finds the body joints in every picture, and simple rules turn hand movements into four HMI commands. The service is built and tested on a laptop; the FactoryTalk Optix side and the NPU are not built yet ([status](#92-what-is-built-and-what-is-not)).
-> - **Part 3, anomaly detection on the NPU:** the same detector, with an int8 model, running on the NPU from inside a container that borrows the device's NPU libraries read-only, with nothing installed on the device, and the proof shown on a FactoryTalk Optix panel ([status](#26-goal-and-ground-rules)).
 >
 > **No machine-learning background is assumed:** every concept is explained from scratch.
 
@@ -18,28 +17,29 @@
 |---|---|
 | Understand the anomaly-detection project from zero | [1. Introduction](#1-introduction) |
 | Run the anomaly detector | [7. How to Run](#7-how-to-run) |
+| Run the anomaly detector on the OptixEdge NPU | [7.7 Build the image for the OptixEdge](#77-build-the-image-for-the-optixedge) |
+| Understand how the anomaly detector runs on the NPU, and how it is proven | [4.2](#42-the-chain-from-python-to-silicon), [5.5](#55-evidence-over-mqtt), [7.10](#710-check-that-it-runs-on-the-npu) |
 | See what gesture control does and how finished it is | [9. Gesture Control Overview](#9-gesture-control-overview) |
 | Learn the ML ideas behind it (keypoints, MoveNet, quantization, NPU) | [10. Machine Learning Basics for Gesture Control](#10-machine-learning-basics-for-gesture-control) |
 | Understand how a hand movement becomes a command | [13. From Keypoints to Gestures](#13-from-keypoints-to-gestures) |
 | Run the gesture service on a Windows laptop | [23. How to Run the Gesture Service](#23-how-to-run-the-gesture-service) |
 | Know what is missing and what comes next | [25. Gesture Status and Next Steps](#25-gesture-status-and-next-steps) |
-| Understand how the anomaly detector runs on the NPU, and how it is proven | [Part 3: 26–35](#26-goal-and-ground-rules) |
 | Look up a term | [Glossary](#glossary) |
 | Check where a fact comes from | [Sources](#sources) |
 
-**New to all of this?** Read [2.1 What is MQTT?](#21-what-is-mqtt) first, then sections 9 to 15 in order, then try [section 23](#23-how-to-run-the-gesture-service).
+**New to all of this?** For anomaly detection, read chapter [2](#2-background-concepts), then [3.1–3.3](#3-how-the-algorithm-works), then run it on your PC with [7.1–7.6](#7-how-to-run). For gesture control, read [2.1 What is MQTT?](#21-what-is-mqtt) first, then sections 9 to 15 in order, then try [section 23](#23-how-to-run-the-gesture-service).
 
 ## Table of Contents
 
 **Part 1: Anomaly Detection**
 
 1. [Introduction](#1-introduction)
-2. [Background Concepts](#2-background-concepts)
-3. [How the Algorithm Works](#3-how-the-algorithm-works)
-4. [Architecture & Data Flow](#4-architecture--data-flow)
-5. [Project Walkthrough](#5-project-walkthrough)
+2. [Background Concepts](#2-background-concepts): MQTT, Docker, Linux, NPU, TensorFlow Lite
+3. [How the Algorithm Works](#3-how-the-algorithm-works): the autoencoder, and quantization to int8
+4. [Architecture & Data Flow](#4-architecture--data-flow): from a sensor to the NPU silicon
+5. [Project Walkthrough](#5-project-walkthrough): the files, the NPU-aware detector, the evidence, the benchmark, the proof panel
 6. [Decision Log](#6-decision-log)
-7. [How to Run](#7-how-to-run)
+7. [How to Run](#7-how-to-run): on your PC, and on the OptixEdge with Portainer or the command line
 8. [Experimenting & Next Steps](#8-experimenting--next-steps)
 
 **Part 2: Gesture Control**
@@ -62,19 +62,6 @@
 24. [Tuning the Gesture Parameters](#24-tuning-the-gesture-parameters)
 25. [Gesture Status and Next Steps](#25-gesture-status-and-next-steps)
 
-**Part 3: Anomaly Detection on the NPU**
-
-26. [Goal and Ground Rules](#26-goal-and-ground-rules)
-27. [What an NPU Needs](#27-what-an-npu-needs)
-28. [Quantization on Our Own Model](#28-quantization-on-our-own-model)
-29. [The NPU-Aware Detector](#29-the-npu-aware-detector)
-30. [Evidence over MQTT](#30-evidence-over-mqtt)
-31. [Why the NPU May Be Slower Here](#31-why-the-npu-may-be-slower-here)
-32. [The FactoryTalk Optix Proof Panel](#32-the-factorytalk-optix-proof-panel)
-33. [Deploying to the Device](#33-deploying-to-the-device)
-34. [The Ladder Log: Predictions vs Results](#34-the-ladder-log-predictions-vs-results)
-35. [Decision Log](#35-decision-log)
-
 **Reference**
 
 - [Glossary](#glossary)
@@ -84,31 +71,122 @@
 
 # Part 1 — Anomaly Detection
 
-> Sections 1 to 8: a small neural network learns what "normal" sensor data looks like and flags anything else.
+> Sections 1 to 8: a small neural network learns what "normal" sensor data looks like and flags anything else. It runs on the CPU of your PC, and on the NPU of an OptixEdge, where a FactoryTalk Optix panel proves it.
 
 ## 1. Introduction
 
-### What is this project?
+### 1.1 What is this project?
 
-This project monitors a **paper-clip manufacturing machine** — a line that feeds steel wire, bends it into paper-clip shape, cuts it, and packages it. Sensors on the machine produce readings (motor current, temperature, vibration, etc.) once per second. Our Python application subscribes to those readings over MQTT, feeds them to a small neural network called an **autoencoder**, and raises an alert when the sensor pattern looks abnormal.
+This project monitors a **paper-clip manufacturing machine**: a line that feeds steel wire, bends it into paper-clip shape, cuts it, and packages it. Sensors on the machine produce readings (motor current, temperature, vibration, etc.) once per second. Our Python application subscribes to those readings over MQTT, feeds them to a small neural network called an **autoencoder**, and raises an alert when the sensor pattern looks abnormal.
 
-### Who is it for?
+The same program runs in two places:
+
+| Where | Which chip does the math | Model file | Why |
+|---|---|---|---|
+| **Your PC** (Windows, Linux or macOS; amd64) | The CPU | `autoencoder.tflite` (float32) | To learn, test and change the project without special hardware |
+| **OptixEdge** (NXP i.MX 8M Plus; arm64) | The **NPU**, the chip's neural-network accelerator, with the CPU as fallback | `autoencoder_int8.tflite` (int8) | The real target: a small industrial computer next to the machine |
+
+> 📝 **Status.** Both paths are built and measured. On the OptixEdge (Yocto scarthgap, kernel 6.12, NPU driver galcore 6.4.11) the container runs our int8 model on the NPU, and nothing is installed on the device's operating system: the device **lends** its NPU libraries to the container, read-only. A FactoryTalk Optix panel shows the proof ([5.8](#58-the-factorytalk-optix-proof-panel)). The ladder log ([6.3](#63-the-ladder-log-predictions-vs-results)) puts every prediction next to the measured result.
+
+### 1.2 The machine and its 10 sensors
+
+Every second, FactoryTalk Optix publishes one JSON message with 10 readings on the MQTT topic `ftoptix/paperclip/sensors`:
+
+```json
+{"wire_feed_speed": 10.2, "wire_tension": 22.5, "motor_current_feed": 2.1, "motor_current_bend": 3.3,
+ "bend_angle": 180.1, "cycle_time": 198, "vibration_rms": 1.8, "cut_force": 55.0,
+ "temperature_motor": 48.3, "reject_count_per_min": 1}
+```
+
+| Tag | What it measures | Unit | What's happening physically |
+|---|---|---|---|
+| **wire_feed_speed** | How fast the steel wire is being pulled into the machine | m/min | A motor-driven roller feeds wire from a spool. Too fast → bad bends; too slow → low throughput |
+| **wire_tension** | How taut the wire is as it enters the machine | N (Newtons) | The wire must be under consistent tension to bend cleanly. Too loose → sloppy clips; too tight → wire snaps |
+| **motor_current_feed** | Electrical current drawn by the **feed motor** (the one pulling wire) | A (Amps) | Higher current = motor working harder. A spike could mean a jam or worn bearings |
+| **motor_current_bend** | Electrical current drawn by the **bending motor** (the one shaping the clip) | A (Amps) | Same idea — if bending becomes harder (e.g. wrong wire gauge, worn tooling), current rises |
+| **bend_angle** | The angle at which the wire is bent to form the clip shape | ° (degrees) | A paper clip has specific bends (~180°). Deviations mean the tooling is misaligned or worn |
+| **cycle_time** | Time to produce one complete paper clip | ms | A healthy machine has a consistent rhythm. Slower cycles could indicate a mechanical issue |
+| **vibration_rms** | Overall vibration intensity (RMS = root mean square, a standard vibration measure) | mm/s | All machines vibrate, but excessive vibration signals loose parts, imbalance, or bearing wear |
+| **cut_force** | The force applied by the blade that cuts the wire after bending | N (Newtons) | Consistent cutting force = sharp blade. Rising force = blade is dulling or wire is harder than expected |
+| **temperature_motor** | Temperature of the main motor | °C | Motors heat up during operation. Overheating means overload, poor cooling, or failing bearings |
+| **reject_count_per_min** | Number of defective clips detected per minute | count | Quality sensors (e.g. vision camera) count bad clips. A sudden rise means something has gone wrong |
+
+Together, these 10 tags cover the key failure modes: **mechanical wear** (vibration, motor current, cut force), **process drift** (bend angle, cycle time, wire tension), **thermal issues** (motor temperature), and **quality impact** (reject count).
+
+In this project the machine is simulated: a NetLogic in the FactoryTalk Optix project (`ThePaperClipMachineSimulator.cs`) generates the live readings, and `training/generate_synthetic.py` generates the training data.
+
+### 1.3 Who is it for?
 
 Developers and engineers who want to understand:
 
 - How machine learning can detect equipment problems in real time
-- How MQTT works for industrial data
-- How to package an ML application in Docker for edge deployment
+- How MQTT moves industrial data
+- How to package an ML application in a container and run it on an edge device
+- How a neural network runs on an NPU, and how to prove that it does
 
-**Prerequisite**: Basic Python knowledge. No ML or IoT experience required — this README teaches everything from scratch.
+**Prerequisites:** basic Python, and being able to type commands in a terminal. No machine-learning, Linux or Docker experience is required: sections [2.4](#24-what-is-docker) and [2.5](#25-linux-basics-for-the-npu-part) explain what you need.
 
-### What will you learn?
+### 1.4 What will you learn?
 
 - **MQTT**: publish/subscribe messaging for IoT
 - **Anomaly detection**: finding unusual patterns without labelled examples
 - **Autoencoders**: a type of neural network that learns "normal" and flags deviations
 - **Data preprocessing**: windowing, averaging, and normalisation
-- **Edge deployment**: running ML in a Docker container on a small device
+- **Containers**: images, compose, volumes, and why an image for a PC does not run on an ARM device
+- **Quantization**: the same network computed with 8-bit integers
+- **NPUs**: the chain of libraries and drivers between one Python call and the silicon, and why a tiny model is faster on the CPU
+- **Evidence**: how to prove where a computation really ran
+
+### 1.5 The device: OptixEdge
+
+The OptixEdge is an industrial edge computer from ASEM (Rockwell Automation). Inside is an NXP **i.MX 8M Plus** chip, which holds a CPU, a GPU and an NPU.
+
+| Part | What it is | Why it matters here |
+|---|---|---|
+| **CPU** | 4 × ARM Cortex-A53, 64-bit (**arm64**) | Runs Linux, Docker and our Python program. Programs must be compiled for ARM: an image built for a PC does not run here ([2.4](#24-what-is-docker)) |
+| **NPU** | VeriSilicon VIP8000, about 2.3 TOPS (trillion operations per second), an 8-bit integer engine | Runs our neural network. It needs an int8 model ([3.4](#34-quantization-the-same-network-in-integers)) and a driver ([4.2](#42-the-chain-from-python-to-silicon)) |
+| **GPU** | Vivante GC7000 | Graphics. It shares one kernel driver (`galcore`) with the NPU |
+| **Operating system** | Yocto Linux *scarthgap*, kernel 6.12, glibc 2.39, Python 3.12 | Our test device runs an **open** Yocto image: SSH login, and NXP's machine-learning libraries installed. Products usually ship a **closed** image ([4.7](#47-host-or-container-where-each-moving-part-belongs)) |
+| **NPU software** | Kernel driver `galcore` 6.4.11, Vivante user-space driver, TIM-VX, VX delegate, TensorFlow Lite 2.16.2 | Lent read-only to our container ([4.3](#43-every-module-library-and-driver)) |
+| **Containers** | Docker, usually managed with Portainer (our test device: rootless Docker, used over SSH) | How our program is installed and started ([7](#7-how-to-run)) |
+| **Storage** | 12 GB eMMC; Docker keeps its data on `/persistent` | The root partition `/` is almost full (20 MB free on our device). Copy big files to `/persistent`, never to `/` |
+
+The NPU is switched on in the **device tree**, the hardware description the kernel reads at boot:
+
+```text
+&ml_vipsi {
+    status = "okay";
+};
+```
+
+### 1.6 Two ways to run it
+
+| | On your PC | On the OptixEdge |
+|---|---|---|
+| CPU architecture | amd64 (x86-64) | arm64 (aarch64) |
+| Container image | `anomaly_detection-detector:local`, built from `Dockerfile` | `localhost/anomaly_detection-detector:npu`, built from `Dockerfile.npu`, on your PC |
+| Compose files | `docker-compose.yml` | `docker-compose.yml` + `docker-compose.npu.yml`, or the same two merged into one Portainer stack |
+| The model runs on | The CPU (float32) | The NPU (int8); the CPU if the NPU is unusable |
+| How to start it | [7.5](#75-run-it-on-your-pc) | [7.8](#78-deploy-on-the-optixedge-with-portainer) (Portainer) or [7.9](#79-deploy-on-the-optixedge-from-the-command-line) (command line) |
+
+> `docker-compose.edge.yml` is an older, CPU-only arm64 image, kept for reference. The NPU image replaces it.
+
+### 1.7 Three ground rules
+
+Three rules shaped every decision of the NPU work:
+
+1. **Install nothing on the device's operating system.** The NPU is used *from inside the detector's container*. The device contributes only what it already has: the NPU kernel driver and its NPU libraries, lent read-only.
+2. **Change one thing at a time.** Each step adds exactly one new unknown, so when something fails we know which layer broke ([6.3](#63-the-ladder-log-predictions-vs-results)).
+3. **Prove, don't claim.** A label saying "NPU" is not evidence. We collect evidence from four independent sources ([5.5.3](#553-the-evidence-ladder)).
+
+### 1.8 A reading path
+
+| If you are… | Read |
+|---|---|
+| New to everything | 2 (all of it), 3.1–3.3, 4.1, then run it on your PC: 7.1–7.6 |
+| Curious about the machine learning | 3, then 5.2 |
+| Here for the NPU | 2.4–2.7, 3.4, 4.2–4.8, 5.3–5.8, then 7.7–7.10 |
+| Here to deploy | 7 |
 
 ---
 
@@ -174,17 +252,123 @@ We use the **unsupervised** approach because in real factories it's easy to coll
 
 **Trade-off**: Edge devices have limited CPU and RAM, so the model must be small and efficient. That's why we use a tiny autoencoder with about 3,482 parameters instead of a large deep-learning model.
 
-### 2.4 What is Docker? (briefly)
+<a id="24-what-is-docker-briefly"></a>
 
-**Docker** packages your application and all its dependencies into a **container** — a lightweight, portable box that runs the same way on your laptop, a server, or an edge device.
+### 2.4 What is Docker?
 
-Think of it like shipping: instead of sending loose items and hoping the recipient has the right shelves, you ship a sealed container with everything inside.
+**The problem.** A Python program needs Python, the right versions of a dozen packages, and the C libraries under them. "It works on my machine" usually means "my machine has the right versions". A **container** ships the program together with everything it needs.
 
-For this project, Docker means:
+**Analogy: a shipping container.** Instead of sending loose items and hoping the recipient has the right shelves, you ship a sealed box with everything inside. The ship (the computer) only needs to know how to carry boxes.
 
-- You don't need to install Python, TFLite runtime, or paho-mqtt on the edge device
-- You just copy the Docker image and run it
-- `docker compose up` starts both the MQTT broker and the detector container
+#### Image and container
+
+- An **image** is the sealed box, and it is read-only: a file system (a small Linux distribution, Python, our packages, our code, our model) plus the command to start. It is built once, from a recipe called a **Dockerfile**.
+- A **container** is a running copy of an image. It has its own processes, its own network address and a thin writable layer on top of the image. Delete the container and the image is untouched; start a new one and it starts clean.
+
+Each line of a Dockerfile adds one **layer** to the image. Layers are cached, so after a code change a rebuild redoes only the last steps.
+
+An image is named `registry/name:tag`. `eclipse-mosquitto:2` comes from Docker Hub, the public registry. Our images are never uploaded anywhere: Podman names them `localhost/...`, which simply means "built on this computer". The **tag** after the colon tells variants apart: `:local` for the PC, `:npu` for the OptixEdge.
+
+#### Docker, Podman and the daemon
+
+The `docker` command is only a **client**. It sends each request to a **daemon**, a background service that stores the images and runs the containers. The environment variable `DOCKER_HOST` tells the client which daemon to talk to, and that daemon can be on another computer ([7.9](#79-deploy-on-the-optixedge-from-the-command-line)).
+
+**Podman** is a Docker-compatible alternative: same commands (`podman build`, `podman run`…), same images. Containers need a Linux kernel, so on Windows and macOS Podman runs a small Linux virtual machine, the **Podman machine** (`podman machine start`). Docker Desktop does the same thing behind the scenes.
+
+**Rootless** means the daemon runs as a normal user instead of `root`, the administrator. A container it starts cannot get more rights than that user. Our test OptixEdge runs Docker rootless.
+
+**Portainer** is a web page for a daemon: images, containers, stacks and logs, all by clicking.
+
+#### Compose: several containers as one application
+
+Our application is two containers: the MQTT broker and the detector. **Compose** starts them together from a YAML file, `docker-compose.yml`. Each entry under `services:` becomes a container.
+
+- **Service names are host names.** Compose creates a private network where the detector reaches the broker under the name `mqtt-broker`. That is the `broker_host` in `config.yaml`.
+- **Ports connect inside and outside.** `"1883:1883"` means "port 1883 of the computer leads to port 1883 of the container". That is how FactoryTalk Optix and the test script reach the broker.
+- **Several files merge.** `-f docker-compose.yml -f docker-compose.npu.yml` reads the first file, then lets the second add or change settings. The NPU file changes only what the NPU needs ([4.8](#48-what-the-npu-container-receives-from-the-device)).
+- **The project name** (`-p anomaly_detection`) groups everything. Containers are called `anomaly_detection-detector-1`, volumes `anomaly_detection_npu-graph-cache`. Without `-p`, compose uses the folder name, which here is also `anomaly_detection`.
+- **A Portainer stack** is a compose file pasted into a web form.
+
+#### Volumes and devices: doors in the box
+
+A container sees only its own files, unless you open a door:
+
+- A **bind mount**, `- /usr/lib:/host/usr/lib:ro`, shows a folder of the host inside the container. `:ro` means read-only: the container can read the files but never change them.
+- A **named volume**, `- npu-graph-cache:/var/cache/npu`, is a folder that Docker manages. It survives when the container is deleted.
+- A **device**, `- /dev/galcore:/dev/galcore`, passes a door to a hardware driver into the container ([2.5](#25-linux-basics-for-the-npu-part)).
+
+#### amd64 and arm64
+
+A CPU understands one instruction set. PCs use **amd64** (also called x86-64); the OptixEdge uses **arm64** (also called aarch64). A program compiled for one is gibberish to the other, so images are built per architecture. Starting the wrong one fails with `exec format error`.
+
+A PC can still *build* an arm64 image. **QEMU** imitates an ARM CPU in software, and **binfmt** is the Linux feature that hands every ARM program to QEMU automatically. It is slow, but fine for building ([7.7](#77-build-the-image-for-the-optixedge)).
+
+#### Containers share the kernel
+
+This is the most important fact for the NPU. A container is not a virtual machine: it has its own files, but **no kernel of its own**. Every container on the OptixEdge uses the OptixEdge's kernel, and with it the kernel's NPU driver. So an image can never bring its own NPU driver, and the device must have one ([4.7](#47-host-or-container-where-each-moving-part-belongs)).
+
+For this project, containers mean:
+
+- Nothing to install on the edge device except the image
+- One command, `docker compose up`, starts both the broker and the detector
+
+### 2.5 Linux basics for the NPU part
+
+Just enough Linux to follow [section 4](#4-architecture--data-flow).
+
+| Idea | Plain explanation | Where you meet it |
+|---|---|---|
+| **Kernel and user space** | The **kernel** is the core of the operating system: only it may touch the hardware. Everything else, our Python program included, runs in **user space** and must ask the kernel | The NPU driver `galcore` lives in the kernel |
+| **Driver** | Code that knows how to operate one piece of hardware. Often it has two halves: a kernel driver and a user-space library that talks to it | `galcore` (kernel) and `libGAL.so` (user space) |
+| **Device file** | Hardware appears as a file under `/dev`. Opening `/dev/galcore` opens a line to the NPU driver | `devices: - /dev/galcore` |
+| **ioctl** | The system call a library uses to send commands to a driver through a device file. The layout of the data is private to each driver release | Why `libGAL.so` must match `galcore` ([4.7](#47-host-or-container-where-each-moving-part-belongs)) |
+| **Shared library (`.so`)** | Compiled code that programs load while they run (on Windows: a `.dll`) | Every NPU piece is a `.so` ([4.3](#43-every-module-library-and-driver)) |
+| **Loader and `LD_LIBRARY_PATH`** | When a program needs a `.so`, the **loader** searches for it: first in the folders listed in `LD_LIBRARY_PATH`, then in the standard ones | The entrypoint puts `/opt/npu/lib` first ([4.4](#44-the-entrypoint-borrow-only-the-npu-libraries)) |
+| **`ldd`** | Prints which `.so` files a program or library needs, and where the loader finds each. `not found` names a missing one | The entrypoint's check ([4.4](#44-the-entrypoint-borrow-only-the-npu-libraries)) |
+| **Symbolic link** | A tiny file that points to another file, like a shortcut | The entrypoint links the device's NPU libraries |
+| **glibc** | The C library, the base under almost every Linux program. It is **backward compatible only**: code built for an older glibc runs on a newer one, never the reverse | [4.6](#46-the-c-runtime-rule) |
+| **ABI** | The binary agreement between compiled pieces: function names, the order of arguments, the layout of structures. Two pieces built for different ABIs crash, even when their source code looks the same | The delegate and TFLite ([4.5](#45-which-tflite-runtime)) |
+| **Environment variable** | A named value a program receives when it starts, such as `USE_NPU=true`. Compose sets them under `environment:` | [8.2](#82-switches-environment-variables) |
+| **root and uid** | `root` is the administrator. Every user has a number, the **uid**: root is 0, the Docker user on our device is 985 | Rootless Docker |
+| **debugfs** | A special folder, `/sys/kernel/debug`, where drivers show internal data. Only root can read it | The driver's client list ([5.5.3](#553-the-evidence-ladder)) |
+| **Yocto** | A tool kit that builds a custom Linux for one device. The result is a firmware image: what is installed is decided when the image is built, not afterwards with a package manager | Open and closed images ([4.7](#47-host-or-container-where-each-moving-part-belongs)) |
+
+### 2.6 What is an NPU?
+
+A CPU is a Swiss-army knife: it can do anything, a few things at a time. An **NPU** (Neural Processing Unit) is a power drill: it does one job, multiply-and-add on many numbers at once, which is almost all the work of a neural network. [10.7](#107-cpu-npu-runtime-and-delegates) (in Part 2) tells the longer story.
+
+The drill has two quirks that drive the whole NPU work:
+
+- **It works in 8-bit integers.** It multiplies small whole numbers very fast. A float32 model must first be translated into integers ([3.4](#34-quantization-the-same-network-in-integers)).
+- **It sits behind a driver.** Our program cannot touch the hardware. It asks a chain of libraries, which ask a kernel driver, which programs the NPU ([4.2](#42-the-chain-from-python-to-silicon)).
+
+And one surprise: a fast drill is not always quicker. Taking the work to the drill costs a fixed amount of time. For a model as tiny as ours, that trip costs more than the work itself ([5.7](#57-why-the-npu-is-slower-here)).
+
+### 2.7 TensorFlow Lite, runtimes and delegates
+
+- **TensorFlow** is Google's library to *train* neural networks. It is large (hundreds of MB), so we use it only on the PC, for training.
+- A **`.tflite` file** is a trained network exported for *running*: the list of operations (the **graph**) and the learned numbers (the **weights**) in one compact file. Our float model is 16 KB.
+- A **runtime**, also called an **interpreter**, loads a `.tflite` file and executes it. Four calls are the whole job:
+
+```python
+interpreter.allocate_tensors()             # plan memory for inputs, outputs and intermediate values
+interpreter.set_tensor(input_index, x)     # write the input
+interpreter.invoke()                       # run the network
+y = interpreter.get_tensor(output_index)   # read the output
+```
+
+The same runtime comes in three packages:
+
+| Package | What it is | Where we use it |
+|---|---|---|
+| `tensorflow` | The full library; TFLite is inside, as `tf.lite` | Training, on the PC |
+| `tflite-runtime` | Only the runtime, a few MB | The PC image (2.14). The OptixEdge has its own copy (2.16.2), which it lends to the container |
+| `ai-edge-litert` | Google's newer packaging of the same runtime, called LiteRT | The NPU image, as fallback ([4.5](#45-which-tflite-runtime)) |
+
+A **delegate** is a plug-in that takes over part of the graph and runs it somewhere else. The runtime asks it: "which of these operations can you run?" The operations it claims form a **partition**; the rest stay on the CPU.
+
+- **XNNPACK** is built into TFLite and runs operations on the CPU with hand-tuned code. On your PC the detector's log says `Created TensorFlow Lite XNNPACK delegate for CPU`.
+- The **VX delegate** (`libvx_delegate.so`) is NXP and VeriSilicon's plug-in that sends operations to the NPU. It is an **external** delegate: a separate `.so` file, loaded while the program runs with `load_delegate(path)`.
 
 ---
 
@@ -395,11 +579,95 @@ The 3-sigma rule is the engineering sweet spot: sensitive enough to catch real a
 | **Input** | CSV of normal data | Live MQTT sensor readings |
 | **Goal** | Learn to reconstruct normal data well | Check if new data is normal or not |
 | **Output** | Saved model weights + threshold | Anomaly score + alert |
-| **Runs** | On your laptop | On the edge device in Docker |
+| **Runs** | On your laptop | In a container: on your PC (CPU) or on the OptixEdge (NPU) |
+
+### 3.4 Quantization: the same network in integers
+
+The NPU computes with 8-bit integers (**int8**: whole numbers from −128 to 127). Our network was trained with 32-bit floating-point numbers (**float32**). **Quantization** translates one into the other.
+
+**Analogy: a ruler with 256 marks.** To store a value between 0 and 1 in 8 bits, lay a ruler with 256 marks across that range, and store the number of the nearest mark. Two numbers describe the ruler: the **scale** (the distance between two marks) and the **zero point** (the mark that stands for 0.0). Converting takes one line each way:
+
+```text
+q    = round(x / scale) + zero_point      # real value -> mark number
+back = (q - zero_point) * scale           # mark number -> real value
+```
+
+The price is a small rounding error, at most half a mark. [10.6](#106-quantization) (in Part 2) tells the same story for a camera model.
+
+#### 3.4.1 From float to int8, without retraining
+
+`training/train.py` makes the int8 twin itself, right after training: `quantize.export_int8` converts the same trained weights to full int8, next to the float model. `training/quantize.py`, run on its own, does the same starting from `models/autoencoder.tflite`: it reads the weights out of the file, rebuilds the identical Keras network (largest difference 2.98 × 10⁻⁷, a rounding error), converts it and prints the float-vs-int8 comparison (optional; `--per-channel` tries the other kind of ruler, see 3.4.4). Either way, the conversion changes only one thing: how the numbers are stored. So any difference between the two files is caused by quantization alone.
+
+The converter needs a **representative dataset**: real inputs, to measure the range of every intermediate value. We pass the scaled training windows, exactly what the model sees in production. Ranges measured on unrealistic data would put the ruler's marks in the wrong place.
+
+#### 3.4.2 The ruler of our input
+
+Measured with the interpreter:
+
+```text
+input  int8  scale=0.003922  zero_point=-128  covers [0.000, 1.000]
+output int8  scale=0.003906  zero_point=-128  covers [0.000, 0.996]
+weights (64, 10)  int8  per-tensor
+weights (16, 64)  int8  per-tensor
+weights (64, 16)  int8  per-tensor
+weights (10, 64)  int8  per-tensor
+```
+
+The scale is 0.003922 = 1/255, and the zero point −128 sits at 0.0. So the 256 marks cover exactly [0, 1], the output range of the MinMaxScaler. The converter found this by itself from the representative data.
+
+Worked examples, with `q = round(x / scale) + zero_point` and `back = (q − zero_point) × scale`:
+
+| Real value x | Stored q | Read back | Error |
+|---|---|---|---|
+| 0.0 | −128 | 0.000000 | 0 |
+| 0.25 | −64 | 0.250980 | 0.00098 |
+| 0.5 | −1 | 0.498039 | 0.00196 |
+| 0.731 | 58 | 0.729412 | 0.00159 |
+| 1.0 | 127 | 1.000000 | 0 |
+| 1.2 | 127 (clipped) | 1.000000 | 0.2 |
+
+The error is at most half a mark (0.00196). The last row matters: a sensor value **outside** the training range saturates at the edge of the ruler. The float model would have seen 1.2; the int8 model sees 1.0. Detection still works, because the score is computed against the original float input (below), so a saturated input still differs from the reconstruction.
+
+#### 3.4.3 Where the conversion happens
+
+The int8 model takes and returns int8 numbers. `src/detector.py` translates at the edges, using the scale and zero point stored in the model file:
+
+```python
+q = np.clip(np.round(x / scale) + zero_point, -128, 127)   # float -> int8, before invoke()
+y = (q_out.astype(np.float32) - zero_point) * scale         # int8 -> float, after
+score = mean((x - y) ** 2)                                  # always in float, for both models
+```
+
+The same code serves both files. For the float model there is no scale, and the translation is skipped.
+
+#### 3.4.4 Per-tensor, and a separate threshold
+
+TFLite quantizes `Dense` weights **per-channel** by default (one ruler per output neuron). Reports for this chip say the NPU prefers **per-tensor** (one ruler per matrix) ([19.4](#194-how-the-npu-will-be-used), Step 3). `quantize.py` asks the converter for per-tensor through a flag whose name begins with `_experimental`, so a future TensorFlow may change it. For MoveNet, per-tensor destroyed accuracy. So we measured instead of assuming:
+
+| | float32 | int8 per-tensor | int8 per-channel |
+|---|---|---|---|
+| File size | 16 544 B | 7 064 B | 10 648 B |
+| Threshold | 0.010150 | 0.010236 | (own) |
+| Faults caught (100 sustained-fault windows) | 100 | 100 | 100 |
+| False alarms (200 normal windows) | 10 | 10 | 10 |
+| Decisions different from float32 | — | **0** | **0** |
+
+Why its own threshold? Rounding adds a small error to every reconstruction, so "normal" scores are slightly larger (0.010236 vs 0.010150). The float threshold would raise false alarms slowly over time. `quantize.py` therefore recalibrates the three-sigma threshold ([3.2](#32-the-math)) on the int8 model's own scores and writes `models/threshold_int8.json`. `config.yaml` keeps each model with its threshold:
+
+```yaml
+variants:
+  float32: { model_path: models/autoencoder.tflite,      threshold_path: models/threshold.json }
+  int8:    { model_path: models/autoencoder_int8.tflite, threshold_path: models/threshold_int8.json }
+precision: auto   # int8 when use_npu is true, float32 otherwise
+```
+
+The gate passed with zero decision changes, so per-tensor is the default.
 
 ---
 
 ## 4. Architecture & Data Flow
+
+### 4.1 The data flow
 
 ```mermaid
 flowchart LR
@@ -408,9 +676,9 @@ flowchart LR
     C --> D["preprocessing.py\n(buffer → window → normalise)"]
     D --> E["detector.py\n(TFLite autoencoder inference)"]
     E --> F["detector.py\n(score → threshold)"]
-    F -->|MQTT publish alert\nanomalous/paperclip/alerts| B
+    F -->|MQTT publish alert\nanomaly/paperclip/alerts| B
     B -->|MQTT subscribe| G["AnomalyFeedbackManager\n(FTOptix NetLogic)\nparses JSON → sets IsAnomaly"]
-    G -->|AnomalyInfoWebAPI\nwrites every 2 s| H["isanomaly.js / .json\n(treeJs_scene/ folder)"]
+    G -->|PeriodicTask\nwrites every 2 s| H["isanomaly.json (or .js)\n(treeJs_scene/ folder)"]
     H -->|fetch every 2 s\nsame-origin| I["🌐 3-D Digital Twin\n(paper_clip_machine_world.html)\nbeacon · red floods · stack light · operator"]
 ```
 
@@ -428,42 +696,239 @@ flowchart LR
 
 6. **detector.py** computes the MSE between the original and the reconstruction. If MSE > threshold → anomaly. The result is published back to the MQTT broker on topic `anomaly/paperclip/alerts`.
 
-7. **AnomalyFeedbackManager** (a FTOptix NetLogic) subscribes to `anomaly/paperclip/alerts`, parses the JSON payload, and writes the `IsAnomaly` boolean into the FTOptix information model.
+7. **AnomalyFeedbackManager** (a FTOptix NetLogic) subscribes to `anomaly/paperclip/alerts`, parses the JSON payload, and writes the `IsAnomaly` Boolean into the FTOptix information model.
 
-8. **AnomalyInfoWebAPI** (a second FTOptix NetLogic) runs a `PeriodicTask` every 2 seconds. It reads `IsAnomaly` from the model and writes it as a tiny JSON payload into `treeJs_scene/isanomaly.js` on disk.
+8. **The same NetLogic** also runs a `PeriodicTask` every 2 seconds. It reads `IsAnomaly` and writes it as a tiny JSON payload, `{"isAnomaly":true}` or `false`, into `treeJs_scene/isanomaly.json` on disk.
 
 9. **The 3-D digital twin** (`paper_clip_machine_world.html`, served by FTOptix's embedded WebPresentationEngine on port 8080) polls the state file every 2 seconds with a relative `fetch()`. It probes `./isanomaly.js` first, then `./isanomaly.json`, and keeps whichever answers (the current `AnomalyFeedbackManager.cs` writes `isanomaly.json`). If no answer arrives for 5 seconds — or the page is opened from `file://`, where `fetch()` is unavailable — the scene falls back to its built-in telemetry simulation. When the flag is `true`, the scene raises an alarm that stays readable even at noon: a rotating red beacon with light beams and a red flood light, the flood-light towers switch to red, the stack light glows red, the HMI screen blinks red, a pulsing red vignette frames the view, the whole scene takes on a red alarm grade, and the operator panics.
 
    **Why a file and not a direct HTTP call?** FTOptix's WebBrowser enforces a strict Content Security Policy (`default-src 'self'`). Any fetch to a different port — even on the same host — is a different origin and is blocked. A relative fetch to a file in the same served folder is always same-origin and requires no special configuration. See the [Decision Log](#6-decision-log) for the full rationale.
 
+On the OptixEdge, step 5 runs the int8 model on the NPU instead of the CPU, and everything else stays the same. The rest of this chapter follows that one step all the way down to the silicon.
+
+### 4.2 The chain, from Python to silicon
+
+One `interpreter.invoke()` in our detector travels through this chain. The boxes say who provides each piece:
+
+```mermaid
+flowchart TB
+  subgraph IMG["In our image"]
+    A["detector: Python 3.12 + numpy + paho-mqtt"]
+    L["ai-edge-litert 1.2.0 (fallback runtime)"]
+  end
+  subgraph LENT["Lent by the device, read-only (from its /usr/lib)"]
+    R["tflite_runtime 2.16.2 (Python module)"] --> T["libtensorflow-lite.so.2.16.2 (TFLite runtime + XNNPACK)"]
+    T -. "load_delegate()" .-> B["libvx_delegate.so (VX delegate)"]
+    B --> T
+    B --> V["libtim-vx.so (TIM-VX + OVXLIB)"]
+    V -- "OpenVX API (public standard)" --> O["libOpenVX.so.1 (+ OpenVXU)"]
+    O --> G["libGAL.so"]
+    O --> S["libVSC, libCLC, libArchModelSw, libNNArchPerf, kernel binaries"]
+  end
+  subgraph KERNEL["The device's kernel (shared by every container)"]
+    D["galcore driver, reached through /dev/galcore"]
+  end
+  A --> R
+  G -- "ioctl (private protocol)" --> D --> E["NPU hardware (VIP8000)"]
+```
+
+Only the top box is ours. Everything that touches the NPU, from the Python module down, comes from the device. The two labeled arrows are where the pieces speak a *public* and a *private* language; [4.7](#47-host-or-container-where-each-moving-part-belongs) shows why that difference decides what could ever move into the image.
+
+### 4.3 Every module, library and driver
+
+Read the table top-down: each row uses the row below it.
+
+| Piece | What it is | What it does for us | Where it comes from |
+|---|---|---|---|
+| **Our detector** (`src/`) | Python application | Reads sensor windows from MQTT, calls the model, publishes alerts and evidence | Image |
+| **paho-mqtt, PyYAML, scikit-learn** | Python packages | MQTT client; reads `config.yaml`; the MinMaxScaler that maps sensor values to [0, 1] | Image (pip) |
+| **numpy** 1.26 | Python package | Holds every tensor we pass in and out. TFLite's Python bridge is compiled against numpy's C interface, so the major version is pinned (`<2.0`) | Image (pip) |
+| **`tflite_runtime`** 2.16.2 | Python package: `interpreter.py` (the `Interpreter` and `load_delegate` API) plus `_pywrap_tensorflow_interpreter_wrapper.so`, a compiled bridge | Turns Python calls into calls on the C++ runtime. The bridge is machine code built for CPython **3.12**, so the image's Python must be 3.12 ([4.5](#45-which-tflite-runtime)) | **Device**, lent read-only from `/usr/lib/python3.12/site-packages` |
+| **`ai-edge-litert`** 1.2.0 | Google's newer packaging of the same runtime (LiteRT), with its own TFLite copy inside | The fallback: runs the model on the CPU when the device has no `tflite_runtime`, and is runtime B of [4.5](#45-which-tflite-runtime) | Image (pip) |
+| **`libtensorflow-lite.so.2.16.2`** | The TensorFlow Lite C++ runtime | Loads the `.tflite` file, plans memory, runs each op. Any op not taken by a delegate runs here, on the CPU | **Device**, lent read-only |
+| **XNNPACK, ruy** | CPU math libraries inside TFLite | Hand-tuned ARM NEON kernels and matrix multiplication. They are why our model takes only 10 µs on the CPU ([5.7](#57-why-the-npu-is-slower-here)) | Inside `libtensorflow-lite` |
+| **`libvx_delegate.so`** | A TFLite **external delegate**: a plug-in loaded at run time through the C function `tflite_plugin_create_delegate` | Looks at the model's graph, claims the ops the NPU supports, and rewrites them as TIM-VX operations. It reports "5 of 5 nodes" to TFLite ([5.4](#54-catching-the-c-evidence)). It is linked against the device's `libtensorflow-lite.so.2.16.2` | **Device**, lent read-only |
+| **`libtim-vx.so`** | TIM-VX ("Tensor Interface Module for OpenVX"), VeriSilicon's C++ library, with **OVXLIB** inside | Translates neural-network operations (fully connected, ReLU, sigmoid…) into an OpenVX graph. The `OVXLIB_VERSION 1.2.14` lines in [5.4](#54-catching-the-c-evidence) come from here | **Device**, lent read-only |
+| **`libOpenVX.so.1`**, `libOpenVXU.so` | VeriSilicon's implementation of **OpenVX**, a public standard API (from the Khronos Group) for graphs of image and neural-network operations | `vxVerifyGraph` compiles the whole graph into NPU instructions (the 65 ms warm-up); `vxProcessGraph` runs it (each `invoke`). It also writes and reads the `.nb` graph cache ([5.5.3](#553-the-evidence-ladder)) | **Device**, lent read-only |
+| **`libGAL.so`** | The Graphics Abstraction Layer: the user-space half of the Vivante driver | Allocates memory the NPU can read, fills command buffers, submits them, waits. It speaks to the kernel driver with `ioctl` calls whose data layout is private to one driver release. Its version string is our `GalcoreVersion` ([5.8.2](#582-the-variables-in-modelnpu)) | **Device**, lent read-only |
+| **`libVSC.so`**, `libCLC.so` | VeriSilicon shader compiler and its OpenCL C front end | Compile small programs for the NPU's programmable cores, used for operations the fixed neural-network engine does not do itself | **Device**, lent read-only |
+| **`libArchModelSw.so`**, `libNNArchPerf.so` | A software model of the NPU's architecture | Used while compiling the graph to estimate the cost of each layout and choose how to split work | **Device**, lent read-only |
+| `libNNVXCBinary*`, `libOvx12VXCBinary*`, `libNNGPUBinary*`, `libOvxGPUVXCBinary*` | Libraries of pre-compiled kernels for this chip | Save compiling common kernels at run time. Not every device has all of them; the entrypoint links whichever exist | **Device**, lent read-only |
+| **`galcore`** | The Vivante GPU/NPU **kernel driver** (version 6.4.11 on our device) | Owns the hardware: power, interrupts, memory mapping, scheduling the GPU core (GC7000) and the NPU core (VIP8000) between processes. Its `/sys/kernel/debug/gc/clients` list is our hardware evidence ([5.5.3](#553-the-evidence-ladder)) | **Device kernel** |
+| **`/dev/galcore`** | A device file: the door into the kernel driver | Every user-space request enters the kernel here. A container sees it only if it is passed with `--device` | **Device**, passed in |
+| **`&ml_vipsi` in the device tree** | The hardware description the kernel reads at boot | `status = "okay"` switches the NPU block on, so `galcore` finds it. Without it there is no NPU for any program | **Device firmware** |
+| **Python 3.12, glibc 2.41, libstdc++** | The base image (Debian *trixie*) | Run everything above, including the lent libraries ([4.6](#46-the-c-runtime-rule)) | Image |
+
+Two packages of NXP's Yocto build supply the lent rows. **`imx-gpu-viv`** is the Vivante user-space driver: OpenVX, GAL, VSC, CLC, the architecture models and the kernel binaries. It is released together with the `galcore` kernel driver, one version for both (6.4.11 here). The machine-learning packages (`tensorflow-lite`, `tensorflow-lite-vx-delegate`, `tim-vx`) sit on top of it. Our device's firmware includes both groups. That is why borrowing works here, and why it is the first thing to check on another device.
+
+### 4.4 The entrypoint: borrow only the NPU libraries
+
+The simple idea, "point the container at the device's whole `/usr/lib`", fails. That folder also contains the device's C library (glibc), C++ library (libstdc++), Python… Our image has its own copies. Two copies of glibc in one process crash in confusing ways.
+
+So `tools/npu_entrypoint.sh` does surgery at every start. The whole `/usr/lib` is mounted at `/host/usr/lib` (read-only: nothing can be changed), but only the NPU libraries are linked into `/opt/npu/lib`, and only that folder is put first on the library search path:
+
+```sh
+NPU_HOST_LIBS="libvx_delegate.so* libtim-vx.so* libOpenVX.so* libOpenVXU.so* libGAL.so* libVSC.so* ... libtensorflow-lite.so*"
+for pattern in $NPU_HOST_LIBS; do
+    for lib in "$HOST_LIB_DIR"/$pattern; do
+        ln -sf "$lib" "$NPU_LIB_DIR/$(basename "$lib")"
+```
+
+Then it runs `ldd` on the delegate. `ldd` lists every library the delegate needs, directly or through TIM-VX, and where the loader finds it. A line ending in `not found` names exactly what is still missing, *before* Python starts. That turns a cryptic crash into a one-line diagnosis. With `NPU_DEBUG=1` it prints the full list, which shows the split of [4.2](#42-the-chain-from-python-to-silicon) on the real system:
+
+```text
+[npu] linked 20 host libraries from /host/usr/lib into /opt/npu/lib
+[npu] every dependency of /opt/npu/lib/libvx_delegate.so resolves
+	libtensorflow-lite.so.2.16.2 => /opt/npu/lib/libtensorflow-lite.so.2.16.2
+	libtim-vx.so => /opt/npu/lib/libtim-vx.so
+	libstdc++.so.6 => /lib/aarch64-linux-gnu/libstdc++.so.6
+	libgcc_s.so.1 => /lib/aarch64-linux-gnu/libgcc_s.so.1
+	libc.so.6 => /lib/aarch64-linux-gnu/libc.so.6
+	libm.so.6 => /lib/aarch64-linux-gnu/libm.so.6
+	libOpenVX.so.1 => /opt/npu/lib/libOpenVX.so.1
+	libVSC.so => /opt/npu/lib/libVSC.so
+	libGAL.so => /opt/npu/lib/libGAL.so
+	libArchModelSw.so => /opt/npu/lib/libArchModelSw.so
+	libNNArchPerf.so => /opt/npu/lib/libNNArchPerf.so
+[npu] using the host's tflite_runtime (/host/usr/lib/python3.12/site-packages/tflite_runtime)
+[npu] /dev/galcore is present
+```
+
+Read the right-hand side. Every NPU library resolves to `/opt/npu/lib`, which means it was lent by the device. The C and C++ runtime (`libc`, `libstdc++`, `libm`, `libgcc_s`) resolves to `/lib/aarch64-linux-gnu`, which means it is the image's own. That is the split of the table above, and the reason the C-runtime rule ([4.6](#46-the-c-runtime-rule)) exists: the device's libraries run on the image's glibc.
+
+Last, it borrows the device's Python runtime package the same way: `/host/usr/lib/python3.12/site-packages/tflite_runtime` is linked into `/opt/npu/lib/python`, which goes first on `PYTHONPATH`. `src/model.py` tries `tflite_runtime` before `ai_edge_litert`, so this borrowed runtime wins whenever it is present ([4.5](#45-which-tflite-runtime)).
+
+### 4.5 Which TFLite runtime
+
+**What we assumed, and what the device said.** The plan assumed TFLite 2.19, from a folder name seen earlier. The read-only probe found `/usr/bin/tensorflow-lite-2.16.2/` instead, and `ldd /usr/lib/libvx_delegate.so` settled it:
+
+```text
+libtensorflow-lite.so.2.16.2 => /usr/lib/libtensorflow-lite.so.2.16.2
+libtim-vx.so => /usr/lib/libtim-vx.so
+libOpenVX.so.1 => /usr/lib/libOpenVX.so.1
+...
+```
+
+The delegate is not a stand-alone plug-in: it is **linked against the device's own TFLite library**. That gives two ways to pair it with a runtime:
+
+| Option | Runtime in the process | Risk |
+|---|---|---|
+| **A** (default) | The device's `tflite_runtime` 2.16.2, borrowed read-only. It uses the *same* `libtensorflow-lite.so.2.16.2` as the delegate | None known: this is the pairing NXP builds and tests. Needs the image's Python = the device's Python (3.12) |
+| **B** (`HOST_TFLITE_RUNTIME=0`) | The image's `ai-edge-litert` 1.2.0, which contains its own TFLite copy | Two TFLite copies in one process. They meet only through the delegate's C interface, which is stable, so it *can* work, but nobody tests that combination |
+
+We measured both on the device ([6.3](#63-the-ladder-log-predictions-vs-results)): **both ran the model on the NPU, with outputs identical to the CPU**. We keep A as the default because it is the tested pairing. B stays in the image for two reasons: it is the CPU runtime when the device has no `tflite_runtime`, and it is a live experiment that teaches why ABI pairing matters.
+
+**Why "linked against the same library" matters.** A delegate receives pointers to TFLite's internal structures (tensors, nodes, the context). If the runtime that owns those structures is a different TFLite version, a field may sit at a different offset, and the delegate reads garbage. Same library, same layout, no doubt.
+
+`ai-edge-litert` 1.2.0 was originally picked by date (published one day after TensorFlow 2.19.0), to match the 2.19 we expected. The image's `LITERT_VERSION` build argument selects another one.
+
+### 4.6 The C-runtime rule
+
+The lent libraries were compiled by NXP against the device's glibc. glibc is **backward compatible only**: a program built against an older glibc runs on a newer one, never the reverse. So the image's glibc must be **at least as new as the device's**. Measured with `ldd --version`: the device has glibc **2.39**; `Dockerfile.npu` uses Debian *trixie* (glibc 2.41), while the CPU image (`Dockerfile`) uses *bookworm* (glibc 2.36, too old for the lent libraries).
+
+Newer glibc brought one surprise. glibc 2.41 refuses to load a library marked as needing an *executable stack* (a memory area that is both writable and executable, an old security weakness). The LiteRT wheel carries that mark by accident, and its import failed with `cannot enable executable stack`. The image clears the flag with `patchelf --clear-execstack` when it is built. The library does not actually need it, and the image is safer without it.
+
+### 4.7 Host or container: where each moving part belongs
+
+Today the device lends everything from `tflite_runtime` down. It works, and it is the simplest design that keeps rule 1. But it asks a lot of the device: TensorFlow Lite, the VX delegate, TIM-VX, and a `tflite_runtime` compiled for **exactly** our Python version. On an open Yocto image like ours, they are there. A closed product image, built without the machine-learning packages, would leave the detector on the CPU, and our image's Python version would always be chained to the firmware's.
+
+So where should the line between host and container be? There are three places where pieces meet, and they differ in one thing: **is the language spoken there public or private?**
+
+**Below OpenVX, the conversation is private.** `libGAL` and `galcore` talk through `ioctl` calls: binary structures whose fields can change between driver releases. NXP builds both halves from the same source tree and tests them only as a pair. And the kernel driver **cannot** come from an image: a container has no kernel of its own, it uses the host's. So the user-space driver must follow the kernel driver, which means it must come from the device. When a firmware update changes the driver, the lent libraries change with it, automatically.
+
+**Above OpenVX, the conversation is public.** TIM-VX calls OpenVX functions such as `vxCreateGraph`, `vxVerifyGraph` and `vxProcessGraph`. OpenVX is a published standard. Everything above it (TIM-VX, the delegate, TFLite, the Python module) can travel inside the image.
+
+**Analogy: a wall socket.** The wiring inside the wall and the socket belong to the building (kernel driver and user-space driver: the electrician installs them together). The socket's shape is a standard (OpenVX). The appliance (our image) can bring its own cable and plug, and work in any building with that socket. Today we borrow the building's extension cord as well; it fits, but not every building has one.
+
+| | Borrow everything from `tflite_runtime` down (**current**) | Line at OpenVX (**recommended next step**) | Everything in the image |
+|---|---|---|---|
+| The device must have | `galcore`, the Vivante driver libs, **plus** TFLite, the VX delegate, TIM-VX and a `tflite_runtime` for our Python | `galcore` and the Vivante driver libs (`imx-gpu-viv`) only | Only `galcore`, but… |
+| Works on a closed Yocto image without the ML packages | No: CPU fallback | Yes | In theory |
+| Our Python version | Chained to the device's (3.12) | Our choice | Our choice |
+| TFLite version | Whatever the firmware ships; follows firmware updates | Pinned in the image, the same on every device | Pinned |
+| Breaks when | The firmware drops the ML packages or changes Python | The driver release changes, and the image was compiled for another one | Any driver update: the image's `libGAL` would speak an old `ioctl` dialect to a new kernel driver |
+| Build effort | `pip install` only | Cross-compiling TFLite, the delegate and TIM-VX (about 25 min) | Same, plus NXP's licensed driver binaries inside the image |
+
+**The recommendation:** the host provides the kernel driver and the Vivante user-space driver, nothing more; the container carries everything above OpenVX. The last column is a trap: it looks the most independent, but it welds the image to one kernel driver release while making the mismatch invisible until run time.
+
+**What we learned trying it.** We built that image: TFLite 2.16.2, the VX delegate and TIM-VX compiled from NXP's sources at the commits of the device's BSP release, with only the Vivante driver lent. It taught the fine print of "OpenVX is a public standard".
+
+TIM-VX uses OpenVX's standard functions *and* VeriSilicon's neural-network extensions (`vxFullyConnectedLayer`, `vxTensorSelectLayer`…). Extensions are vendor-defined, and each driver release adds some. One header says what a release can do: `VX/vx_khr_compatible.h`, a list of switches like `#define VX_TENSOR_SELECT_VX_SUPPORT 1`. TIM-VX reads the switches and compiles each feature in or out.
+
+The first attempt was compiled against the headers bundled with TIM-VX, from driver **6.4.15**; the device runs **6.4.11**. We started it with `LD_BIND_NOW=1`, which makes the loader look up *every* function at start-up instead of at first use, so a missing one shows at once instead of crashing some day in the middle of a run. It failed immediately:
+
+```text
+NPU requested but unusable (OSError: /opt/npu/lib/libtim-vx.so: undefined symbol: vxTensorSelectLayer); running on CPU
+```
+
+The detector fell back to the CPU, as designed ([5.3](#53-inferenceengine-try-the-npu-fall-back-remember-why)). Then a diff of two lists showed the whole gap: the 109 OpenVX functions that `libtim-vx.so` imports, against the 2 426 symbols the device's `libOpenVX.so.1` exports (both read with `nm -D`). Exactly two were missing: `vxTensorSelectLayer` and `vxInvalidateHandleVSI`. Comparing the two releases' `vx_khr_compatible.h` showed more: 6.4.15 switches on 15 features that 6.4.11 does not have, a few of which change *how* existing functions are called. Turning off only the two missing functions would have hidden the problem, not solved it.
+
+The fix is headers from the matching release. VeriSilicon's public TIM-VX repository kept, at tag `v1.1.57`, the SDK of driver **6.4.11**. With those headers, and with TIM-VX linked using `-z defs` (every function must be found at link time, so a future mismatch fails on the build machine, not on the device), TIM-VX compiled and linked cleanly. NXP's own driver package (`imx-gpu-viv-6.4.11`) contains the real ARM headers too, but downloading it requires accepting NXP's license agreement.
+
+**Status.** That version is not finished: the full image was not completed and validated on the device, so this project keeps the borrowed design, which is measured end to end. The prototype left three rules for whoever finishes it:
+
+1. **Compile for the driver release you will meet.** One image per driver release, with the release written in the Dockerfile. Check the device's release first (`GalcoreVersion` on the panel shows it).
+2. **Find missing functions before the device does.** Link with `-z defs`, and start a check container with `LD_BIND_NOW=1`.
+3. **Ask the firmware for the driver, not for TensorFlow.** On a closed Yocto image, the requirement for the NPU is `galcore` with `&ml_vipsi` enabled, plus `imx-gpu-viv`. Everything else is the application's business.
+
+### 4.8 What the NPU container receives from the device
+
+Whatever tool deploys it, the detector container needs exactly these things from the device, and nothing more:
+
+| What | In the compose file | Why |
+|---|---|---|
+| The image `localhost/anomaly_detection-detector:npu` (arm64) | `image:` with `pull_policy: never` | It is not in a public registry, so it is imported as a file. `never` stops Docker from looking for it online |
+| The NPU's door | `devices: - /dev/galcore:/dev/galcore` | The only way into the kernel driver ([4.3](#43-every-module-library-and-driver)). On our device it is mode 0666, so no extra permission is needed |
+| The device's NPU libraries, read-only | `volumes: - /usr/lib:/host/usr/lib:ro` | The entrypoint links only the NPU libraries and the `tflite_runtime` package from it ([4.4](#44-the-entrypoint-borrow-only-the-npu-libraries)). `:ro` makes the device's files unchangeable from inside |
+| A volume for compiled NPU graphs | `npu-graph-cache:/var/cache/npu` and `VIV_VX_ENABLE_CACHE_GRAPH_BINARY=1`, `VIV_VX_CACHE_BINARY_GRAPH_DIR=/var/cache/npu` | Evidence (the `.nb` file) and a faster restart ([5.5.3](#553-the-evidence-ladder)) |
+| The switch | `USE_NPU=${USE_NPU:-true}` (`false` for the negative control) | Read by `InferenceEngine` ([5.3](#53-inferenceengine-try-the-npu-fall-back-remember-why)) |
+| Native log lines | `TF_CPP_MIN_LOG_LEVEL=0` | Keeps TFLite's INFO lines, which carry delegation evidence ([5.4](#54-catching-the-c-evidence)) |
+| The broker on port 1884 as well as 1883 | `mqtt-broker` `ports: - "1884:1883"` | The FactoryTalk Optix project's `MQTTClient1` connects to `127.0.0.1:1884` |
+
+`docker-compose.npu.yml` adds exactly these lines to the base `docker-compose.yml`. Nothing else is needed: no extra capabilities, no host network, nothing installed. The device must already *have* its NPU stack in `/usr/lib` (the **Device** rows of [4.3](#43-every-module-library-and-driver)); on our OptixEdge it does.
+
+**The image travels as a file.** `docker save` (or `podman save`) writes an image with all its layers into one `.tar` archive, and `docker load` (or Portainer's import) unpacks it into the device's image store. On our OptixEdge that store is on `/persistent`; the root file system had only 20 MB free, so never copy the archive to `/`.
+
 ---
 
 ## 5. Project Walkthrough
 
-### File-by-file guide
+### 5.1 File-by-file guide
+
+All paths are relative to `anomaly_detection/`, except the `FTOptix/…` rows.
 
 | File | Purpose | Key concept |
 |---|---|---|
-| `config.yaml` | All tuneable parameters in one place | Centralised configuration |
-| `src/main.py` | Entry point — wires everything together | Application "conductor" |
-| `src/mqtt_client.py` | MQTT subscribe + publish helpers | Pub/sub messaging |
+| `config.yaml` | All tuneable parameters in one place: MQTT topics, window size, the two model variants, `use_npu` | Centralised configuration |
+| `src/main.py` | Entry point: wires everything together and answers the benchmark command | Application "conductor" |
+| `src/mqtt_client.py` | MQTT subscribe and publish helpers; the status, command and benchmark topics; the Last Will | Pub/sub messaging |
 | `src/preprocessing.py` | Buffer samples, window, normalise | Feature engineering |
-| `src/model.py` | Autoencoder neural network definition | The ML model itself |
-| `src/detector.py` | Compute anomaly score vs. threshold | Decision logic |
-| `training/generate_synthetic.py` | Create fake sensor data | Synthetic data generation |
-| `training/train.py` | Train the autoencoder offline | Model training |
-| `Dockerfile` | Native local recipe with an explicit ARM64 edge build target | Containerisation |
-| `docker-compose.yml` | Run broker + detector together (TCP 1883 required; WebSocket 9001 reserved, unused) | Multi-container orchestration |
-| `FTOptix/…/ThePaperClipMachineSimulator.cs` | FTOptix NetLogic — generates the 10 simulated sensor tags and publishes them via MQTT every second. Includes an `[ExportMethod]` to inject an anomaly on demand | Sensor simulation |
-| `FTOptix/…/AnomalyFeedbackManager.cs` | FTOptix NetLogic — subscribes to the MQTT alert topic, parses the JSON payload, and sets `Model/IsAnomaly` | MQTT → OPC UA bridge |
-| `FTOptix/…/AnomalyInfoWebAPI.cs` | FTOptix NetLogic — `PeriodicTask` writes `isanomaly.js` every 2 s from `Model/IsAnomaly` | File-based state export |
+| `src/model.py` | Builds the autoencoder for training, and `InferenceEngine`: chooses the runtime, loads the NPU delegate, falls back to the CPU, records evidence ([5.3](#53-inferenceengine-try-the-npu-fall-back-remember-why)) | The ML model, and where it runs |
+| `src/detector.py` | Converts float ↔ int8 at the model's edges ([3.4.3](#343-where-the-conversion-happens)) and compares the anomaly score with the threshold | Decision logic |
+| `src/benchmark.py` | Times the same model on the CPU and on the NPU, with the same input ([5.6](#56-the-benchmark-call-step-by-step)) | A/B measurement |
+| `src/npu_evidence.py` | Reads the driver version, the NPU graph-cache files and, optionally, driver counters | Evidence |
+| `training/generate_synthetic.py` | Creates fake sensor data | Synthetic data generation |
+| `training/train.py` | Trains the autoencoder offline; writes the float model, its int8 twin and a threshold for each | Model training |
+| `training/quantize.py` | Rebuilds the int8 twin from `autoencoder.tflite`, calibrates its threshold and compares float with int8 ([3.4](#34-quantization-the-same-network-in-integers)) | Quantization |
+| `tests/test_integration.py` | Sends a normal and an anomalous window through a running broker and checks both alerts ([7.6](#76-test-it)) | End-to-end test |
+| `tests/test_inference.py`, `tests/test_preprocessing.py` | Unit tests: run without a broker or an NPU | Unit testing |
+| `Dockerfile` | The PC image: Python 3.11 on Debian *bookworm*, `tflite-runtime` 2.14, amd64, CPU only | Containerisation |
+| `Dockerfile.npu` | The OptixEdge image: Python 3.12 on Debian *trixie*, arm64, our application, and LiteRT as fallback runtime | Containerisation for the NPU |
+| `tools/npu_entrypoint.sh` | At every start, links the device's NPU libraries into the container and checks that nothing is missing ([4.4](#44-the-entrypoint-borrow-only-the-npu-libraries)) | Borrowing libraries |
+| `tools/npu_check.py` | One-shot proof: "can this container run our model on the NPU?" ([7.10](#710-check-that-it-runs-on-the-npu)) | Smoke test |
+| `docker-compose.yml` | Runs the broker and the detector together (TCP 1883 required; WebSocket 9001 reserved, unused) | Multi-container orchestration |
+| `docker-compose.npu.yml` | Override for the OptixEdge: the NPU device, the device's libraries read-only, the graph-cache volume, port 1884 ([4.8](#48-what-the-npu-container-receives-from-the-device)) | Compose override |
+| `docker-compose.edge.yml` | Legacy: an arm64 image that runs on the CPU only. Replaced by the NPU image | — |
+| `FTOptix/…/ThePaperClipMachineSimulator.cs` | FTOptix NetLogic: generates the 10 simulated sensor tags and publishes them via MQTT every second. Includes an `[ExportMethod]` to inject an anomaly on demand | Sensor simulation |
+| `FTOptix/…/AnomalyFeedbackManager.cs` | FTOptix NetLogic: subscribes to the alert topic, parses the JSON, sets `IsAnomaly`, and every 2 s writes `treeJs_scene/isanomaly.json` for the 3-D scene | MQTT → OPC UA bridge, file-based state export |
+| `FTOptix/…/NpuStatusManager.cs`, `NpuModelBuilder.cs` | FTOptix NetLogic: the NPU evidence variables and the Benchmark button ([5.8](#58-the-factorytalk-optix-proof-panel)) | HMI proof |
 | `FTOptix/…/paper_clip_machine_world.html` | 3-D digital twin entry point (Three.js r128): the paper-clip machine outdoors on sand, with paper-clip mountains, a bulldozer and a 24 h day/night cycle in 60 s. Served by FTOptix WebPresentationEngine on port 8080 | Live browser visualisation |
 | `FTOptix/…/js/scene/*.js` | The scene code: 12 ES5 classic scripts loaded in order, sharing one `window.PCM` namespace — `core` (renderer, quality tiers, dynamic resolution, URL parameters), `assets` (shared materials, shader hook, procedural textures, geometry helpers), `fx` (glow halos, light cones, particles, ground decals), `sky` (sky dome, sun, moon, stars, clouds, day/night controller), `terrain` (sand, paper-clip mountains, scattered clips), `rockwell` (GuardLogix 5380 safety PLC, Compact 5000 I/O, PowerFlex 525, Stratix, 440G, 450L, OptixEdge and other device faces), `machine`, `characters` (operator, bulldozer driver), `site` (flood-light towers, props, bulldozer), `anomaly` (state polling, alarm effects), `ui` (tour, balloons, hints, title), `main` (build order, frame loop) | Modular, CSP-safe, no build step |
 | `FTOptix/…/js/hydrate.js` | Initialises HTML elements from `window.CONTENT` at page load. Extracted from inline `<script>` to satisfy CSP `script-src 'self'` | CSP-compliant hydration |
 | `FTOptix/…/js/content.js` | Editable text content for labels, walkthrough text, and stack panel, plus the scene settings `dayNight`, `branding` and `quality` | Content / configuration |
-| `FTOptix/…/treeJs_scene/isanomaly.js` | Runtime file written by `AnomalyInfoWebAPI`. Contains `{"isAnomaly":true/false}`. The `.js` extension is required because FTOptix's web server blocks `.json` file downloads | Anomaly state handshake |
+| `FTOptix/…/treeJs_scene/isanomaly.json` (or `.js`) | Runtime file with `{"isAnomaly":true/false}`, written by `AnomalyFeedbackManager`. The scene accepts either extension ([6.1](#61-detector-mqtt-and-hmi)) | Anomaly state handshake |
 
-### The 10 Most Important Lines of Code
+### 5.2 The 10 most important lines of code
 
 **1. The autoencoder bottleneck** (`src/model.py`):
 ```python
@@ -530,9 +995,359 @@ threshold = mse_mean + sigma * mse_std
 ```
 The three-sigma rule: anything more than 3 standard deviations above mean training error is an anomaly.
 
+### 5.3 `InferenceEngine`: try the NPU, fall back, remember why
+
+`src/model.py` wraps one TFLite interpreter plus the facts that prove where it runs:
+
+```python
+if use_npu:
+    try:
+        delegate = load_delegate(vx_delegate_path)
+        self.interpreter = Interpreter(model_path=model_path, experimental_delegates=[delegate])
+        self.interpreter.allocate_tensors()
+        self.warmup_ms = self._timed_zero_run()   # first invoke: the NPU compiles the graph here
+        self.accelerator = "npu"
+    except Exception as exc:
+        self.npu_error = f"{type(exc).__name__}: {exc}"
+        self.interpreter = None
+if self.interpreter is None:
+    self.interpreter = Interpreter(model_path=model_path)   # CPU, same model file
+```
+
+Three details, each for a reason:
+
+- **The warm-up `invoke()` is inside the `try`.** The NPU compiles the graph at the first inference, and a mismatched driver fails exactly there. Outside the `try`, that failure would crash the detector instead of falling back.
+- **`accelerator` becomes `"npu"` only after a successful inference.** Loading the delegate is not enough proof.
+- **The fallback uses the same int8 file.** The threshold therefore still matches the model.
+
+The runtime is chosen in the order `tflite_runtime` → `ai_edge_litert` → `tensorflow`: whichever imports first. In the NPU container that is the device's `tflite_runtime` 2.16.2, borrowed by the entrypoint, because it shares its TFLite library with the delegate ([4.5](#45-which-tflite-runtime)). With `HOST_TFLITE_RUNTIME=0`, or on a laptop, LiteRT runs the same model.
+
+### 5.4 Catching the C++ evidence
+
+When a delegate takes over part of a graph, many TFLite builds print a line like:
+
+```text
+INFO: Replacing 5 out of 5 node(s) with delegate (Vx Delegate) node, yielding 1 partitions.
+```
+
+That is evidence, but it is printed by C++ code directly to a file descriptor, below Python's `sys.stdout`/`sys.stderr`. `capture_native_output()` temporarily redirects descriptors 1 and 2 into a file, keeps the lines, and echoes them to the real log. `delegation_summary()` turns them into `{"delegate": "Vx Delegate", "nodes": 5, "of": 5}`. Our graph has 5 nodes: 4 `FULLY_CONNECTED` and 1 `LOGISTIC` (the sigmoid). "5 out of 5" would mean the whole model runs on the NPU; "4 out of 5" would mean the sigmoid stays on the CPU, and data travels CPU → NPU → CPU every inference.
+
+**Two surprises from the device**, both found by measuring:
+
+1. **The device's TFLite 2.16.2 does not print the "Replacing" line at all.** So the code also reads the graph itself (`graph_delegation()`). After a delegate is applied, the interpreter lists the original ops *plus* one `DELEGATE` node per partition:
+
+   ```text
+   ['FULLY_CONNECTED', 'FULLY_CONNECTED', 'FULLY_CONNECTED', 'FULLY_CONNECTED', 'LOGISTIC', 'DELEGATE']
+   ```
+
+   An original op belongs to the partition if it lies on a path from the `DELEGATE` node's inputs to its outputs. On the device: `Vx Delegate: 5/5 nodes`.
+2. **The VX delegate writes its own lines (`INFO: Vx delegate: ...`) to stdout, not stderr.** We found it by running the check twice, once with `2>/dev/null` and once with `>/dev/null`. That is why the capture covers both descriptors, and calls C's `fflush()` before restoring them: when stdout is not a terminal, C keeps it in a buffer that would otherwise be written after the capture ends.
+
+`TF_CPP_MIN_LOG_LEVEL=3` in the base compose file hides INFO lines. The NPU override sets it to `0`.
+
+**Going one level deeper (lab only).** The NPU's own graph compiler, OVXLIB, can describe what it built. With `VSI_NN_LOG_LEVEL=4` on the device it prints every NPU node:
+
+```text
+I [vsi_nn_CreateGraph:1327]OVXLIB_VERSION==1.2.14
+D [setup_node:535]Setup node id[8] uid[30000] op[DATACONVERT]
+D [print_tensor:166]in(0) : ... fmt[i8 ] qnt[ASM zp=-128, scale=0.003922]
+D [print_tensor:166]out(0): ... fmt[u8 ] qnt[ASM zp=  0, scale=0.003922]
+D [setup_node:535]Setup node id[0] uid[1] op[FCL2]
+D [setup_node:535]Setup node id[1] uid[2] op[RELU]
+...
+D [setup_node:535]Setup node id[7] uid[8] op[SIGMOID]
+D [setup_node:535]Setup node id[9] uid[30001] op[DATACONVERT]
+```
+
+Read it like a recipe. Our 5 TFLite ops became 4 `FCL2` (fully connected), 3 `RELU` (TFLite had fused the ReLU into each FULLY_CONNECTED; the NPU wants it as a separate step) and 1 `SIGMOID`. And two `DATACONVERT` nodes appear at the edges: this NPU prefers **uint8** (0…255) over int8 (−128…127). Same ruler, shifted: int8 with zero point −128 and uint8 with zero point 0 describe exactly the same real numbers, so the conversion just adds 128 to every byte. The weights were converted the same way (`fmt[u8] zp=128`).
+
+### 5.5 Evidence over MQTT
+
+#### 5.5.1 Topics
+
+| Topic | Direction | Retained | Content |
+|---|---|---|---|
+| `anomaly/paperclip/alerts` | detector → HMI | no | `is_anomaly`, `score`, `threshold`, plus `accelerator`, `precision`, `inference_ms` for every window |
+| `anomaly/paperclip/status` | detector → HMI | **yes** | Where the model runs and why: accelerator, NPU error, runtime, delegate, delegation, warm-up, driver version, graph-cache files |
+| `anomaly/paperclip/cmd` | HMI → detector | no | `{"cmd": "benchmark", "runs": 1000}` (capped at 5000, see [5.6](#56-the-benchmark-call-step-by-step)) |
+| `anomaly/paperclip/benchmark` | detector → HMI | no | CPU vs active engine: p50, p95, largest output difference |
+
+The full payloads are documented in the `src/mqtt_client.py` docstring. The alert payload only **adds** fields, so the existing `AnomalyFeedbackManager`, which reads `is_anomaly`, keeps working.
+
+#### 5.5.2 Retained status and the Last Will
+
+The status is **retained**: the broker keeps the last copy and gives it to anyone who subscribes later. FactoryTalk Optix can start after the detector and still see the badge at once. The same idea as the gesture service ([15.4](#154-retained-status-and-the-last-will)).
+
+A retained "online, NPU" would lie forever if the detector crashed. So the detector registers a **Last Will** at connect time: `{"state": "offline"}`, retained, same topic. If the connection dies without a goodbye, the broker publishes the will itself, and the HMI badge turns to *offline*.
+
+#### 5.5.3 The evidence ladder
+
+Each rung is harder to fake than the one below. A strong proof uses several.
+
+| Rung | Evidence | Who produces it | Fooled by |
+|---|---|---|---|
+| 1 | `"accelerator": "npu"` | Our code | A bug in our code |
+| 2 | `Vx Delegate: 5/5 nodes`: TFLite's "Replacing N out of M" line, or the `DELEGATE` node in the interpreter's own graph | TFLite itself | Nothing in our code, but it says only that the delegate *accepted* the nodes |
+| 3 | A `*.nb` file in the graph cache | The NPU driver stack | Nothing: OpenVX writes it only after compiling the graph *for the NPU*. Measured: 54 976 bytes, and the next start's warm-up drops from about 65 ms to 16 ms because the compilation is skipped |
+| 4 | The kernel driver's own bookkeeping lists our process as an NPU client, with memory on the NPU core | The kernel driver | Nothing. Measured: `/sys/kernel/debug/gc/clients` lists `python`; `/proc/<pid>/cgroup` puts it in `docker-9c2e699aadaa…`, the detector container; `/proc/<pid>/fd` shows `/dev/galcore` open; and `/sys/kernel/debug/gc/database` lists that process with `VideoMemory` records on **GPU 1**, which `gc/info` names as the VIP8000 NPU (GPU 0 is the GC7000 graphics core). Root-only, so a host lab check from an SSH shell |
+| 5 | **Negative control:** with `USE_NPU=false` rungs 1–4 disappear | The experiment | — Measured: status `cpu` / `float32`, no delegate, benchmark `NPU not requested`, and `gc/clients` **empty** |
+
+**Why rung 4 is only a lab check.** `/sys/kernel/debug` is readable only by the host's root. Our rootless container runs as uid 985, so it gets *Permission denied*. Opening debugfs to the container would need `--privileged` or a rootful daemon, and we refuse both. So the panel shows rungs 1–3, and rung 4 is checked from an SSH shell.
+
+**A counter that lied (to us).** We planned rung 4 as "the NPU's **On** time grows during a benchmark", from `/sys/kernel/debug/gc/idle`. We measured it three times around the same 5 000-run benchmark: it grew by **601 ms** once, and by **0 ms** twice, even when read again 1 s later. The file has one set of numbers for the whole GPU+NPU block, not one per core, and the driver seems to update it only at some power-state changes (`poweroff_timeout` is 300 ms). The lesson: **evidence you cannot explain is not evidence.** We replaced it with the process list above, which says *who* uses the NPU, without timing problems.
+
+The graph cache is enabled by NXP's variables `VIV_VX_ENABLE_CACHE_GRAPH_BINARY=1` and `VIV_VX_CACHE_BINARY_GRAPH_DIR` ([19.4](#194-how-the-npu-will-be-used)). `docker-compose.npu.yml` points the folder to a named volume, so the file survives restarts and later starts skip the compilation.
+
+The **negative control** is what makes the badge trustworthy. A panel that shows "NPU" whatever happens proves nothing. A panel that changes to "CPU", loses the delegation line and the `.nb` file when we switch the NPU off, proves it is reading reality.
+
+### 5.6 The benchmark call, step by step
+
+The **Benchmark** button asks one precise question: *for **one** inference of **our** model, how long does each engine take, and do both compute the same thing?* Everything below follows from that sentence.
+
+**The round trip.** Five actors, two MQTT messages, one worker thread:
+
+```mermaid
+sequenceDiagram
+    participant Op as Operator
+    participant NL as NpuStatusManager (FTOptix)
+    participant B as Mosquitto broker
+    participant D as Detector, MQTT thread
+    participant W as Detector, benchmark thread
+    Op->>NL: click Benchmark
+    NL->>NL: refuse if BenchmarkRunning; clamp runs to 1..5000
+    NL->>B: {"cmd":"benchmark","runs":N} on anomaly/paperclip/cmd (QoS 1, not retained)
+    NL->>NL: BenchmarkRunning = true
+    B->>D: the command
+    D->>D: handle_command: refuse if a benchmark is running, else mark it running
+    D->>W: start thread benchmark_worker(N)
+    Note over D: keeps receiving the 1 Hz sensor data
+    W->>W: run_benchmark: N runs on CPU, then N runs on the NPU
+    W->>B: result JSON on anomaly/paperclip/benchmark
+    W->>B: fresh status (retained): the graph cache may be new
+    B->>NL: the result, via the MQTT subscriber into Model/NPU/BenchmarkJson
+    NL->>NL: ParseBenchmark: fill Bench*, BenchmarkRunning = false
+```
+
+| Step | Code | What it does | Why |
+|---|---|---|---|
+| 1 | `NpuStatusManager.RequestBenchmark()` | Reads `BenchmarkRuns`, clamps it to 1–5 000, publishes the command, sets `BenchmarkRunning` | It only *sends*: the UI thread never waits for the answer. QoS 1 so the command is not lost; **not retained**, or the detector would run a benchmark again at every reconnect |
+| 2 | `main.handle_command()` | Ignores unknown commands. Under `bench_lock`: if a benchmark is running, answers `{"error": "benchmark already running"}`; else marks it running and starts a thread | Two benchmarks at once would compete for the CPU and spoil each other's numbers. Check-and-set under a lock, so two quick clicks cannot both pass |
+| 3 | `main.benchmark_worker()` | Creates the CPU engine on first use, picks the input, calls `run_benchmark`, adds `finished_at`, frees the slot in `finally`, publishes the result and a fresh status | A **thread**, because the MQTT loop must keep delivering sensor data. `finally`, because a crashed benchmark must not block all the next ones |
+| 4 | `benchmark.run_benchmark()` | Clamps `runs` again (never trust the request), times N runs on the CPU, then N on the main engine, compares the outputs | The CPU first and then the NPU, never at the same time, so they do not compete for the CPU |
+| 5 | `NpuStatusManager.ParseBenchmark()` | Copies the numbers into the `Bench*` variables and writes `BenchMessage` | The panel only displays; all the measuring happens next to the model |
+
+**The two engines, and the one thing that differs.** The CPU engine is a second interpreter on the **same `.tflite` file**, created with `use_npu=False`. Both get the **same input**: the last real normalised window (`bench["last_vector"]`), or a vector of 0.5 (the middle of the normal range) if no window has arrived yet. Same model, same input, same code path: only the engine changes. That is the "one variable at a time" rule from the ladder.
+
+**What one run measures.** One run is one call of `engine.reconstruct(vector)`: one complete inference, batch 1, exactly what the detector does for every window:
+
+```
+start = perf_counter()
+    float → int8 (quantize, with the input's scale and zero point)
+    set_tensor                       copy the input into the interpreter
+    invoke()                         CPU: XNNPACK kernels / NPU: the trip to the VIP8000 and back
+    get_tensor                       copy the output out
+    int8 → float (dequantize)
+stop  = perf_counter()               → one duration, in ms
+```
+
+The one-time graph compilation (the warm-up, 16–72 ms) happened when the engine was built, so it is **not** in these numbers. The benchmark thread and the sensor handler share the same NPU interpreter, and a TFLite interpreter is not thread-safe, so each `reconstruct()` takes the engine's lock. A sensor window that arrives mid-benchmark waits at most one inference, under 1 ms.
+
+**The answer, field by field.**
+
+| Field | Panel variable | Meaning |
+|---|---|---|
+| `runs` | `BenchRuns` | How many runs per engine, after the clamp |
+| `cpu.p50_ms` / `npu.p50_ms` | `BenchCpuP50Ms` / `BenchNpuP50Ms` | **Median**: half the runs were faster. The *typical* cost of one inference. A few runs slowed down by the OS cannot move it |
+| `cpu.p95_ms` / `npu.p95_ms` | `BenchCpuP95Ms` / `BenchNpuP95Ms` | 95 % of the runs were faster: the "bad but normal" case. The gap p95 − p50 shows how steady the engine is |
+| `mean_ms`, `min_ms` | — (in the JSON only) | The mean is pulled up by the slow outliers; the min is the best case, with no noise |
+| `npu_vs_cpu_p50` | `BenchNpuVsCpu` | NPU p50 ÷ CPU p50. **Above 1: the NPU is slower** for one inference of this model |
+| `max_output_difference` | `BenchMaxOutputDiff` | The largest gap between the CPU's and the NPU's outputs for the same input. Measured: **0.0** |
+| `npu_unavailable` | `BenchMessage` | Why there is no NPU run (`npu` is `null`), for example `NPU not requested (USE_NPU=false)` |
+| `counters_before` / `counters_after` | `NpuCounterDelta` | Driver counters read just before and after the NPU runs, if `NPU_COUNTERS_PATH` is readable. Usually `null` ([5.5.3](#553-the-evidence-ladder)) |
+| `finished_at` | `BenchFinishedAt` | UTC time when the result was ready |
+
+**How many runs? More runs do not make the NPU win.** It is tempting to raise the run count until the NPU comes out ahead. We tried it on the device: the same benchmark with 1 000, 10 000 and 50 000 runs:
+
+| Runs per engine | CPU p50 | NPU p50 | NPU ÷ CPU | Total time (both engines) |
+|---|---|---|---|---|
+| 1 000 | 0.3450 ms | 0.7595 ms | 2.20 | 1.2 s |
+| 10 000 | 0.3461 ms | 0.7583 ms | 2.19 | 11.5 s |
+| 50 000 | 0.3439 ms | 0.7539 ms | 2.19 | 56.4 s |
+| 1 000 000 (extrapolated) | same | same | same | about 19 minutes |
+
+The ratio does not move. Why: **a run is a repetition of the measurement, not a bigger job.** Each run is a separate inference of one window, and it pays the full trip to the NPU again. In the truck analogy of [5.7](#57-why-the-npu-is-slower-here), a million runs are a million trucks, each carrying one box: the millionth trip costs the same as the first. More runs only make the p50 and p95 more *precise*; after a few hundred runs they are already stable to the third decimal.
+
+A million runs would also cost something real: about 19 minutes with the panel stuck on "running", one CPU core busy the whole time (shared with FactoryTalk Optix), and about 40 MB of RAM to hold the durations. And the panel clamps the request to 5 000 anyway. That is why `benchmark.MAX_RUNS` is **5 000**: enough for stable percentiles in about 6 s.
+
+**What would make the NPU win: more work per trip.** Put more boxes in each truck:
+
+- **A bigger model.** Our network does 3 328 multiply-adds per inference. The CPU does them in about 0.01 ms; the NPU's trip alone costs about 0.15 ms ([5.7](#57-why-the-npu-is-slower-here)). The CPU time grows with the multiply-adds; the NPU's trip stays almost fixed, and its compute part grows far more slowly. Somewhere along that line the two curves cross. The measurement below finds where.
+- **A batch.** Several windows in one `invoke()` (input shape `[N, 10]` instead of `[1, 10]`) pay one trip for N inferences. Our detector sees one window every 30 s, so it has nothing to batch: this lever exists, but not for this application.
+
+**The crossover, measured.** To test the first lever we built five throwaway models with the same shape as ours but wider: 10 → W → W → W → 10, int8, per-tensor, random weights. That is about 2·W² multiply-adds. We timed them on the device inside the detector image, with the same `run_benchmark` the button uses (1 000 runs; 200 for the two largest). **Prediction: the NPU starts to win between W = 512 and W = 1 024, so between 0.5 and 2 million multiply-adds.**
+
+| Model | Multiply-adds | `invoke()` CPU, 1 thread | `invoke()` CPU, 4 threads | `invoke()` NPU | `reconstruct()` CPU, 1 thread | `reconstruct()` NPU | NPU warm-up |
+|---|---|---|---|---|---|---|---|
+| ours (10→64→16→64→10) | 3 328 | 0.009 ms | 0.011 ms | 0.160 ms | 0.350 ms | 0.754 ms | 61 ms |
+| W = 64 | 9 472 | 0.012 ms | 0.013 ms | 0.155 ms | 0.356 ms | 0.742 ms | 36 ms |
+| W = 256 | 136 192 | 0.057 ms | 0.026 ms | 0.187 ms | 0.421 ms | 0.776 ms | 80 ms |
+| W = 512 | 534 528 | 0.228 ms | 0.081 ms | 0.261 ms | 0.701 ms | 0.851 ms | 217 ms |
+| W = 1 024 | 2 117 632 | 0.920 ms | 0.329 ms | **0.549 ms** | 1.499 ms | **1.148 ms** | 802 ms |
+| W = 2 048 | 8 429 568 | 3.535 ms | **1.097 ms** | 1.680 ms | 4.117 ms | **2.286 ms** | 3 530 ms |
+
+All six models were fully delegated (5 of 5 nodes), and the CPU and NPU outputs were identical (difference 0.0) every time. Four things to read in this table:
+
+1. **The prediction held against one CPU core.** The detector's CPU engine uses one thread. Against it the NPU is almost even at W = 512 (0.228 vs 0.261 ms) and wins from W = 1 024: 1.7× faster on `invoke()`, 1.3× on the full `reconstruct()`. At W = 2 048 it is 2.1× and 1.8× faster. The CPU's time grows about 4× each time W doubles, like the multiply-adds. The NPU's time starts from its fixed ~0.15 ms trip and grows much more slowly.
+2. **Against all four cores, the CPU never lost, not even at 8.4 million multiply-adds.** That was the surprise. A Dense layer with batch 1 is a matrix × vector product: each weight is read from memory and used **once**. So the speed is set by how fast the weights arrive from RAM, not by how fast the multipliers are, and both engines read the same RAM. The NPU's 2.3 TOPS shine on **convolutions**, where each weight is reused across the whole image (many multiply-adds per byte read). That is why MoveNet ([19](#19-performance-and-the-npu-plan)) is the NPU's home ground and a plain MLP is not.
+3. **But four cores are the whole CPU.** Beating the NPU with 4 threads means taking every core away from FactoryTalk Optix during each inference. The NPU at 1.68 ms leaves the CPU free. On a shared HMI device "faster" and "better" are not the same thing.
+4. **The NPU path costs more around the model too.** `reconstruct()` − `invoke()` is about 0.34 ms on the CPU but about 0.59 ms on the NPU, for every model size. That gap is the copies of the input and output to and from the NPU's buffers, done in `set_tensor`/`get_tensor`. It is why our own model is 15× slower on the NPU at the `invoke()` level but only about 2.2× slower at the `reconstruct()` level the button measures. The warm-up, meanwhile, grows with the weights the driver must compile and upload: 3.5 s at W = 2 048, paid once per start (or skipped with the graph cache).
+
+The honest summary for the panel: the benchmark proves that the **same model gives the same answer on both engines** (difference 0.0) and shows the **real cost of one inference** on each. It is not a race the NPU is supposed to win with this model. A model about 600 times bigger would win it against one core.
+
+### 5.7 Why the NPU is slower here
+
+**Prediction: for our model, the NPU will be slower than the CPU. Result: confirmed, 15 times slower per inference.** This is not a failure; it is the most important lesson of this project.
+
+Count the work. Our network is 10 → 64 → 16 → 64 → 10:
+
+```
+10×64 + 64×16 + 16×64 + 64×10 = 640 + 1024 + 1024 + 640 = 3 328 multiply-adds per inference
+```
+
+The NPU is rated at 2.3 TOPS: it could do our math thousands of times in a microsecond. But each inference also costs a fixed **trip**: copy the input into memory the NPU can read, ask the driver through `/dev/galcore`, wait for the NPU, copy the output back. That trip costs a fixed amount of time, however small the math.
+
+**Analogy: a moving truck for one box.** Moving one box across town, you carry it in your hands (CPU). Hiring a truck (NPU) is faster *per box* but costs an hour of booking and loading. For one box the hands win; for a house the truck wins.
+
+The laptop gave the scale: one int8 inference on the CPU takes **0.029 ms**. We predicted 0.05–0.2 ms on the Cortex-A53 and 0.2–1 ms for one trip to the NPU. Measured on the OptixEdge (1 000 runs, same input, only `invoke()` timed, `tflite_runtime` 2.16.2):
+
+| Model | CPU p50 | NPU p50 | NPU first run (compiles the graph) |
+|---|---|---|---|
+| int8 | **0.0106 ms** | **0.157 ms** (15× slower) | 72 ms |
+| float32 | 0.0129 ms | 0.248 ms | 67 ms |
+
+Both predictions were too pessimistic for the CPU: the A53 with XNNPACK does our 3 328 multiply-adds in about 10 µs. The NPU trip, about 0.15 ms, landed inside the predicted range. **The truck for one box, measured.**
+
+Now the detector's real path, `engine.reconstruct()`, which also converts float → int8, copies the input in, copies the output out and converts back (200 runs, inside the container):
+
+| Path | CPU p50 | NPU p50 | NPU ÷ CPU |
+|---|---|---|---|
+| `reconstruct()`, `npu_check.py` (200 runs) | 0.347 ms | 0.766 ms | 2.2× |
+| `reconstruct()`, the running detector's benchmark from MQTT (5 000 runs) | 0.347 ms | 0.870 ms | 2.5× |
+| The same, a later run after a restart | 0.350 ms | 0.656 ms | 1.9× |
+
+The rows differ because the running detector shares the CPU with its MQTT thread, and because the NPU trip varies between runs (0.656 to 0.870 ms for the same benchmark): a single number would hide that spread, which is why the panel shows p95 too. In both cases the largest output difference between CPU and NPU was **0.0**: the same integers came out of both engines.
+
+The alerts report one inference each: 1.3–1.9 ms on the NPU, more than the benchmark's p50. A single call after a pause starts with cold CPU caches and may find the NPU powered down (`poweroff_timeout`: 300 ms). It is still far below the 30 s between windows.
+
+A second lesson hides here: **the Python around the model costs 30 times more than the model itself** on the CPU (0.347 vs 0.0106 ms). Whoever optimizes the "AI" part first is optimizing the wrong thing. Either way, one inference every 30 s costs less than a millisecond: both engines are far more than fast enough.
+
+And a surprise: the delegate also accepted the **float32** model, which we expected it to reject. The VIP8000 can compute in 16-bit floating point, and the driver converts on the fly. It is slower than int8 (0.248 vs 0.157 ms), and its outputs differ slightly from the CPU's (0.5045132 vs 0.50451314: float16 rounding). Quantization is still the right choice for an NPU, but "float does not run at all" was wrong.
+
+So why use the NPU at all? Three reasons:
+
+1. **Proof of the pipeline.** Quantization, delegate, container and evidence are the same for a model 1 000× larger, like MoveNet ([19](#19-performance-and-the-npu-plan)), where the NPU wins clearly.
+2. **CPU left for the HMI.** On the OptixEdge, FactoryTalk Optix shares the CPU. Work moved to the NPU is work the HMI does not wait for.
+3. **Room to grow.** A bigger model (more tags, longer windows, the V2 model in the root `plan.md`) moves toward the truck's side of the trade-off.
+
+### 5.8 The FactoryTalk Optix proof panel
+
+#### 5.8.1 What the NetLogic does
+
+- **`NpuModelBuilder.cs`** (design-time) creates the folder `Model/NPU` with 35 typed variables, once. It never overwrites: running it twice is safe.
+- **`NpuStatusManager.cs`** (runtime) listens to three variables written by MQTT subscriptions, parses the JSON and fills the `Model/NPU` variables the UI binds to. It also exports `RequestBenchmark()`, which publishes `{"cmd":"benchmark","runs":N}` through `MQTTClient.Publish` (QoS 1, never retained, or the detector would re-run the benchmark at every reconnect).
+
+If the status says `offline` (the Last Will), it clears `IsOnNpu`, so a stale NPU badge cannot survive.
+
+#### 5.8.2 The variables in `Model/NPU`
+
+**Why two steps, text then typed variables?** An MQTT subscription can write a whole message into one variable, but only as one string. A badge color needs a Boolean, a bar needs a number. So the subscriptions write the raw JSON into `StatusJson` and `BenchmarkJson`, and `NpuStatusManager` reacts to every change of those strings, reads the fields and writes them into typed variables. The panel binds only to the typed ones. A third input is the existing `Model/anomaly_detector_feedback`, which already receives every alert.
+
+```mermaid
+flowchart LR
+  S["anomaly/paperclip/status"] --> SJ["StatusJson"]
+  B["anomaly/paperclip/benchmark"] --> BJ["BenchmarkJson"]
+  A["anomaly/paperclip/alerts"] --> AF["Model/anomaly_detector_feedback"]
+  SJ --> M["NpuStatusManager (parses JSON)"]
+  BJ --> M
+  AF --> M
+  M --> V["typed variables in Model/NPU"] --> UI["panel widgets"]
+  UI -- "Benchmark button: RequestBenchmark()" --> C["anomaly/paperclip/cmd"]
+```
+
+The tables give each variable, the JSON field it comes from, and the value on our device with the NPU running.
+
+**Inputs and settings**
+
+| Variable | Type | Written by | Meaning |
+|---|---|---|---|
+| `StatusJson` | String | MQTT subscription to `anomaly/paperclip/status` | The raw retained status message. Starts as `waiting for detector status ...` |
+| `BenchmarkJson` | String | MQTT subscription to `anomaly/paperclip/benchmark` | The raw result of the last benchmark |
+| `MqttClientPath` | String | Design time (`MQTT/MQTTClient1`) | Which MQTT client node `RequestBenchmark()` publishes with |
+| `CommandTopic` | String | Design time (`anomaly/paperclip/cmd`) | Where the benchmark request is published |
+| `BenchmarkRuns` | Int32 | The operator (default 1000) | How many inferences per engine. `RequestBenchmark()` clamps it to 1–5 000, the same cap the detector applies |
+
+**Where the model runs** (from `anomaly/paperclip/status`, refreshed at every detector start and after each benchmark)
+
+| Variable | Type | JSON field | Meaning | On our device |
+|---|---|---|---|---|
+| `DetectorState` | String | `state` | `online` while the detector is connected; `offline` comes from the Last Will ([5.5.2](#552-retained-status-and-the-last-will)) | `online` |
+| `Accelerator` | String | `accelerator` | The engine that **actually** ran the warm-up inference: `npu` or `cpu`; set to `offline` when the detector is gone | `npu` |
+| `IsOnNpu` | Boolean | `accelerator == "npu"` | The badge's color. Forced to false when offline | true |
+| `NpuRequested` | Boolean | `npu_requested` | Whether `USE_NPU` asked for the NPU. With `Accelerator`, separates "NPU failed" from "NPU not asked" | true |
+| `NpuError` | String | `npu_error` | Empty when the NPU works. Otherwise the exception text, naming the failing layer ([7.12](#712-troubleshooting)) | empty |
+| `ModelName` | String | `model` | The model file in use | `autoencoder_int8.tflite` |
+| `Precision` | String | `precision` | `int8` or `float32` ([3.4.4](#344-per-tensor-and-a-separate-threshold)) | `int8` |
+| `Runtime` | String | `runtime` | The TFLite Python package that was imported, and its version ([5.3](#53-inferenceengine-try-the-npu-fall-back-remember-why)) | `tflite_runtime 2.16.2` |
+| `Delegate` | String | `delegate` | Path of the delegate library loaded inside the container; `none (CPU)` when none | `/opt/npu/lib/libvx_delegate.so` |
+| `Delegation` | String | `delegation` | How many of the model's nodes each delegate took ([5.4](#54-catching-the-c-evidence)); `no delegate took any node` on the CPU | `Vx Delegate: 5/5 nodes` |
+| `WarmupMs` | Double | `warmup_ms` | Duration of the first inference, where the NPU compiles the graph | about 66 ms; 16 ms with the graph cache |
+| `Threshold` | Double | `threshold` | The anomaly threshold of the loaded model variant | 0.010236 |
+| `GalcoreVersion` | String | `galcore_version` | The NPU driver's version. The kernel driver's own version file is in sysfs on some devices; on ours it is only in debugfs, readable by root. So the detector falls back to the version string compiled into the lent `libGAL.so` (the user-space half of the same driver release). The prefix says which source was read | `libGAL 6.4.11:745085` |
+| `GraphCacheFiles` | Int32 | `graph_cache.files` | Number of compiled NPU graphs (`*.nb`) in the cache volume ([5.5.3](#553-the-evidence-ladder)) | 1 |
+| `GraphCacheBytes` | Int32 | `graph_cache.bytes` | Their total size | 54 976 |
+| `GraphCacheNames` | String | `graph_cache.names` | Their file names; `cache disabled` when the cache variables are not set | one `<hash>.nb` |
+| `StartedAt` | String | `started_at` | When the detector process started (UTC) | an ISO time stamp |
+
+**Every window** (from the alerts, about every 30 s)
+
+| Variable | Type | JSON field | Meaning |
+|---|---|---|---|
+| `LastInferenceMs` | Double | `inference_ms` | Time of the last real inference: 1.3–1.9 ms on the NPU, more than the benchmark's p50 because the caches are cold after 30 s ([5.7](#57-why-the-npu-is-slower-here)) |
+| `LastAlertAccelerator` | String | `accelerator` | The engine that computed that window. It proves the NPU is used for *production* windows, not only for the warm-up |
+
+**Benchmark** (from `anomaly/paperclip/benchmark`, after the button)
+
+| Variable | Type | JSON field | Meaning | Measured (5 000 runs) |
+|---|---|---|---|---|
+| `BenchmarkRunning` | Boolean | — | Set true by `RequestBenchmark()`, false when a result arrives. A second click while true is refused | |
+| `BenchRuns` | Int32 | `runs` | Inferences per engine | 5 000 |
+| `BenchCpuP50Ms`, `BenchCpuP95Ms` | Double | `cpu.p50_ms`, `cpu.p95_ms` | Median and 95th-percentile time of `reconstruct()` on the CPU | 0.350, 0.547 ms |
+| `BenchNpuP50Ms`, `BenchNpuP95Ms` | Double | `npu.p50_ms`, `npu.p95_ms` | The same on the active engine; 0 when the NPU is not in use | 0.656, 0.754 ms |
+| `BenchNpuVsCpu` | Double | `npu_vs_cpu_p50` | NPU p50 ÷ CPU p50. Above 1 means the NPU is slower ([5.7](#57-why-the-npu-is-slower-here)) | 1.87 (2.5 in an earlier run) |
+| `BenchMaxOutputDiff` | Double | `max_output_difference` | Largest difference between the CPU and NPU outputs for the same input | 0.0 |
+| `BenchMessage` | String | built by the NetLogic | A sentence for the operator: the ratio explained, `No NPU run: <reason>` (from `npu_unavailable`), or an error | |
+| `BenchFinishedAt` | String | `finished_at` | When the benchmark ended | |
+| `NpuCounterDelta` | String | `counters_before`, `counters_after` | Change of driver counters during the benchmark. Here always `n/a (driver counters not exposed to the container)`: the rootless container cannot read debugfs ([5.5.3](#553-the-evidence-ladder)) | n/a |
+
+Percentiles, briefly: run the same inference 5 000 times and sort the times. p50 is the one in the middle (the typical case), p95 the one at position 4 750 (a bad but common case). A mean would be dragged up by a few slow runs, when the operating system paused our process.
+
+#### 5.8.3 Reading the panel
+
+| You see | It means |
+|---|---|
+| Badge NPU, delegation `Vx Delegate: 5/5`, a `.nb` file | The whole model runs on the NPU, proven by three independent sources |
+| Badge NPU, delegation `4/5` | The sigmoid stays on the CPU; each inference crosses CPU ↔ NPU twice |
+| Badge CPU, `NpuError` filled | The NPU was requested but failed; the text says at which layer ([7.12](#712-troubleshooting)) |
+| Badge CPU, `NpuError` empty, precision `float32` | The NPU was not requested (`USE_NPU=false`): the negative control |
+| `BenchNpuVsCpu` > 1 | The NPU is slower for this model: expected ([5.7](#57-why-the-npu-is-slower-here)) |
+| `BenchMaxOutputDiff` about 0.004 or less | CPU and NPU compute the same int8 model; differences are at most about one quantization mark. Measured: 0.0 |
+| Badge `?` | No status message has arrived: check the subscription to `anomaly/paperclip/status` and the broker port |
+
 ---
 
 ## 6. Decision Log
+
+### 6.1 Detector, MQTT and HMI
 
 | Decision | Choice | Why | Alternative Considered |
 |---|---|---|---|
@@ -542,162 +1357,340 @@ The three-sigma rule: anything more than 3 standard deviations above mean traini
 | Normalisation | MinMaxScaler to [0, 1] | Matches Sigmoid output; prevents scale imbalance | StandardScaler (z-score) — works too, but [0,1] matches Sigmoid naturally |
 | Threshold | mean + 3σ | Classic, easy to explain, well-understood | Fixed threshold — doesn't adapt; percentile — needs more data |
 | MQTT QoS | Level 1 (at least once) | Don't lose alerts; QoS 2 adds unnecessary overhead | QoS 0 — might lose alerts; QoS 2 — overkill |
-| Docker base | python:3.11-slim | Small image, no compilation issues with pip | Alpine — smaller but C-extension installs often fail |
-| Runtime target | ARM64 only | Matches the NXP i.MX 8M Plus deployment target and keeps the runtime stack simple (`tflite-runtime` only) | Multi-arch image logic — more complexity for this tutorial |
-| Build platform | `platform: linux/arm64` and `IMAGE_PLATFORM=linux/arm64` in `docker-compose.edge.yml` + `FROM --platform=${IMAGE_PLATFORM}` | Keeps build and runtime architecture explicit even when Podman's delegated Compose builder ignores `build.platforms` | Implicit platform selection — can pull the wrong architecture image |
+| Docker base | PC image: `python:3.11-slim` (Debian *bookworm*) + `tflite-runtime` 2.14. NPU image: `python:3.12-slim-trixie` ([6.2](#62-running-on-the-npu)) | Small image, no compilation issues with pip | Alpine — smaller but C-extension installs often fail |
+| Runtime target | Two images: `Dockerfile` (amd64, CPU, for the PC) and `Dockerfile.npu` (arm64, NPU, for the OptixEdge) | Each image stays simple and fits one machine | One multi-arch image — more logic in one file, and the NPU image needs a newer base anyway |
+| Build platform | `podman build --platform linux/arm64 -f Dockerfile.npu` + `FROM --platform=${IMAGE_PLATFORM}` | Keeps build and runtime architecture explicit even when Podman's delegated Compose builder ignores `build.platforms` | Implicit platform selection — can pull the wrong architecture image |
 | Anomaly state → browser | Write `isanomaly.js` to `treeJs_scene/`; browser polls with `fetch('./isanomaly.js')` every 2 s | FTOptix's WebBrowser enforces `default-src 'self'` CSP. Any fetch to a different port (e.g. `http://host:8085/...`) is a cross-origin request and is blocked, even on the same machine. A relative fetch inside the served folder is always same-origin. Worst-case update lag is 4 s (write interval + poll interval), which is acceptable for a visual indicator | `HttpListener` on a dedicated port — blocked by CSP; WebSocket — also cross-origin; MQTT over WebSocket in-browser — requires adding `connect-src ws://...` to the CSP, which is not configurable without access to the FTOptix web server config |
 | `.js` extension for the state file | `isanomaly.js` instead of `isanomaly.json` | FTOptix's embedded web server returns 403 for `.json` files — they are on an internal deny list to protect FTOptix project configuration files. Using `.js` avoids the block. The content is still valid JSON; the browser reads it as text and calls `JSON.parse()` explicitly | Rename to `.txt` — also works, but `.js` is more self-documenting in the context of a JS project |
 | State file name in the 3-D scene | Probe `./isanomaly.js`, then `./isanomaly.json`; lock onto the one that answers and re-probe after 3 misses | The `.js` decision above and the current `AnomalyFeedbackManager.cs` (which writes `isanomaly.json`) disagree. Auto-detection keeps the scene working with either file, with no configuration | Hard-code one name — the alarm silently stops working when the other file is deployed |
 | 3-D scene code structure | 12 ES5 classic scripts in `js/scene/`, one shared `window.PCM` namespace, no build step | The page must run inside FTOptix's WebBrowser under CSP `script-src 'self'` and also from `file://`, where inline scripts and ES modules are blocked. Static parts are merged per material and repeated parts are instanced, so the whole scene renders in about 70 draw calls (shadow pass included) with 41 shared materials | ES modules + bundler — adds a build step and does not load from `file://` |
 | 3-D quality tiers | `auto` picks `low` on software renderers (SwiftShader, llvmpipe), `medium` on mobile or ≤ 4-core devices, `high` otherwise; dynamic resolution on top | Panels without GPU acceleration stay interactive (low tier: no MSAA, simpler shadows, fewer instanced clips, 30 fps cap), while PCs get MSAA, soft 2048 px shadows and denser detail. All tiers use the same 7 constant lights, switched by intensity only, so day/night and alarm changes never recompile shaders | One fixed quality — too slow on panels or too plain on PCs |
 
+### 6.2 Running on the NPU
+
+| Decision | Alternatives | Why |
+|---|---|---|
+| Borrow the NPU stack from the device, read-only: Vivante driver, TIM-VX, VX delegate, TFLite and `tflite_runtime` | Image that carries everything above OpenVX ([4.7](#47-host-or-container-where-each-moving-part-belongs)); image built from the NXP BSP (path N2 of [19.4](#194-how-the-npu-will-be-used)); install packages on the device | Rule 1: nothing installed on the host. The device's libraries always match its kernel driver, and the design is measured end to end. The line at OpenVX is the recommended next step, once validated |
+| Link only the NPU libraries, not the whole `/usr/lib` | `LD_LIBRARY_PATH=/host/usr/lib` | Two glibc or libstdc++ copies in one process crash in confusing ways ([4.4](#44-the-entrypoint-borrow-only-the-npu-libraries)) |
+| The device's `tflite_runtime` as default runtime (A), LiteRT in the image as fallback (B) | LiteRT only | A uses the same `libtensorflow-lite.so.2.16.2` as the delegate: the pairing NXP tests ([4.5](#45-which-tflite-runtime)). B keeps a CPU runtime when the device has none |
+| Debian trixie base, Python 3.12 | bookworm (the CPU image), Python 3.11 | glibc must be ≥ the device's 2.39 ([4.6](#46-the-c-runtime-rule)); the borrowed `tflite_runtime` is compiled for CPython 3.12 |
+| Clear the executable-stack mark on LiteRT | An older base image | glibc 2.41 refuses the mark; the library does not need it, and the image is safer without it |
+| Keep the self-contained prototype out of the image | Ship it | Not validated end to end on the device. Its lesson, compile for the device's driver release, is recorded in [4.7](#47-host-or-container-where-each-moving-part-belongs) |
+| Work with the device's rootless Docker | Switch to a rootful daemon | Nothing changed on the host. It also keeps debugfs closed to containers, so the driver evidence stays a root lab check |
+| Driver client list as hardware evidence | The `gc/idle` On-time counter | The counter gave 601 ms once and 0 ms twice for the same benchmark; the client list was right every time ([5.5.3](#553-the-evidence-ladder)) |
+| `GalcoreVersion` read from the lent `libGAL.so` when the kernel's version file is unreadable | Show `unknown` | On our device the kernel driver's version is only in debugfs (root-only). `libGAL` is built from the same driver release and carries its version string |
+| A separate int8 file next to the float one | Replace float with int8 | The float model stays the CPU reference; `precision: auto` picks |
+| Per-tensor weights | Per-channel (TFLite default) | NPU-friendly, and measured: zero decision changes |
+| Fallback to the CPU on any NPU error | Fail hard | The detector must keep protecting the machine; the status explains why |
+| Benchmark in a worker thread, on request | Benchmark at start-up | Never blocks the 1 Hz sensor path; the operator sees it happen |
+
+### 6.3 The ladder log: predictions vs results
+
+The core learning loop: predict, measure, compare, explain the gap. Results from the OptixEdge unless marked.
+
+| Question | Prediction | Reason | Result |
+|---|---|---|---|
+| Does int8 change any detection? | No | Error ≤ half a mark (0.002) on [0,1] inputs | ✅ 0 of 300 windows changed (laptop) |
+| Does the image load on ARM with the CPU? | Yes | Same code as the amd64 test image | ✅ under QEMU on the laptop, and on the device |
+| Does the delegate load inside the container? | Yes, if `ldd` resolves | Libraries lent from the same release as the driver | ✅ with the device's `tflite_runtime` (runtime A) and with the image's LiteRT 1.2.0 (runtime B) |
+| Is the device's TFLite 2.19, as first reported? | Yes | The examples path given at the start | ❌ **2.16.2**: this device has `/usr/bin/tensorflow-lite-2.16.2/`, and `ldd` on the delegate and the device's `tflite_runtime` agree. Ask the device, not memory. The image therefore borrows the device's 2.16.2 runtime ([4.5](#45-which-tflite-runtime)) |
+| How many nodes go to the NPU? | 5 of 5 | FULLY_CONNECTED and LOGISTIC are common int8 ops | ✅ 5 of 5 (`DELEGATE` node in the graph; OVXLIB log: 4 FCL2, 3 RELU, 1 SIGMOID) |
+| Does the float32 model run on the NPU? | No, falls back | The NPU is an integer engine | ❌ Yes, in float16: 0.248 ms, outputs differ in the 7th decimal ([5.7](#57-why-the-npu-is-slower-here)) |
+| Warm-up on the NPU | 100–1 000 ms | Graph compilation at the first invoke | ✅ better: 63–72 ms; 16 ms with the graph cache |
+| p50 on the CPU (A53), `invoke()` only | 0.05–0.2 ms | Laptop 0.029 ms, A53 several times slower | ❌ better: **0.0106 ms** (XNNPACK) |
+| p50 on the NPU, `invoke()` only | 0.2–1 ms | Fixed trip cost dominates 3 328 multiply-adds | ✅ **0.157 ms**, just below the range |
+| Largest CPU vs NPU output difference | ≤ 0.004 | One output mark is 0.0039 | ✅ **0.0**: identical integers |
+| The NPU On-time counter moves during a benchmark | Yes | The driver counts powered-on time | ❌ 601 ms once, 0 ms twice: not usable ([5.5.3](#553-the-evidence-ladder)) |
+| Do more benchmark runs make the NPU win? | No | Each run is a separate inference that pays the full trip | ✅ NPU ÷ CPU = 2.20 / 2.19 / 2.19 with 1 000 / 10 000 / 50 000 runs ([5.6](#56-the-benchmark-call-step-by-step)) |
+| At what size does the NPU beat one CPU core? | Between 0.5 and 2 M multiply-adds (W = 512–1 024) | The CPU grows with the work; the NPU's trip is fixed | ✅ even at 0.53 M, NPU 1.7× faster at 2.1 M ([5.6](#56-the-benchmark-call-step-by-step)) |
+| Does the NPU also beat four CPU cores on a big Dense model? | Not asked beforehand: we assumed "past the crossover the NPU wins" | — | ❌ No: 1.10 ms (4 cores) vs 1.68 ms (NPU) at 8.4 M. Batch-1 Dense is limited by memory, not by multipliers ([5.6](#56-the-benchmark-call-step-by-step)) |
+| The driver lists our container's process as an NPU client | Yes | It opened `/dev/galcore` | ✅ `python`, cgroup `docker-9c2e…`, memory on GPU 1 (NPU); empty with `USE_NPU=false` |
+| Can the image carry TFLite, the delegate and TIM-VX itself, borrowing only the driver? | Yes | Above OpenVX the interface is a public standard ([4.7](#47-host-or-container-where-each-moving-part-belongs)) | ⏳ Partly proven: TIM-VX compiles and links against the device's driver release. The full image is not validated on the device yet |
+| Do the newer OpenVX headers (6.4.15, bundled with TIM-VX) work with the device's 6.4.11 driver? | Yes | OpenVX is a public standard | ❌ `LD_BIND_NOW=1` found `vxTensorSelectLayer` and `vxInvalidateHandleVSI` missing; 15 capability switches differ. Headers from the 6.4.11 SDK fixed the link ([4.7](#47-host-or-container-where-each-moving-part-belongs)) |
+
 ---
 
 ## 7. How to Run
 
-### Prerequisites
+Every command below was run as printed, on a Windows PC and on our OptixEdge. Two device paths are the exception: the Portainer clicks of 7.8 and the `tcp://…:2375` connection of 7.9 follow the standard tools rather than a recorded run, because our test device's Docker daemon is rootless and listens only on a local socket. The same image and compose files were deployed on it over SSH (the 7.9 variant). Commands are for **Windows PowerShell**; where Linux or macOS differ, the difference is shown next to it. Replace `<optixedge-ip>` with your device's IP address (ours is `172.16.17.105`).
 
-| Tool | Version | Notes |
+### 7.1 The big picture
+
+```mermaid
+flowchart LR
+  A["7.4 Train the model<br/>(PC, once)"] --> B["7.5 Run on the PC<br/>podman compose up"]
+  B --> C["7.6 Test it"]
+  A --> D["7.7 Build the arm64 image<br/>and save it to a .tar file"]
+  D --> E["7.8 Portainer<br/>or<br/>7.9 command line"]
+  E --> F["7.10 Check the NPU"]
+```
+
+Two paths start from the same trained model:
+
+| Path | Steps | Time, roughly |
 |---|---|---|
-| [Podman](https://podman.io/) | ≥ 5.0 | Container engine (Docker also works — replace `podman` with `docker` in all commands) |
-| Podman Compose / Docker Compose | ≥ 2.0 | Orchestrates the two-container stack |
-| Python | 3.11 | For running the integration test and (optionally) training |
-| paho-mqtt | ≥ 2.0 | Python package for the test script: `pip install "paho-mqtt>=2.0,<3.0"` |
+| **A. On your PC** (amd64, CPU) | 7.2 → 7.3 → 7.4 → 7.5 → 7.6 | 15 minutes, most of it downloads |
+| **B. On the OptixEdge** (arm64, NPU) | Path A up to 7.4, then 7.7 → 7.8 *or* 7.9 → 7.10 | 30–45 minutes more, most of it building and copying the image |
 
-> **Platform note:**
-> The default `docker-compose.yml` is native-platform and can run locally on Windows with Docker Desktop or Podman.
-> Use `docker-compose.edge.yml` only when building/running the ARM64 edge image for the NXP target.
+You can do path B without path A's steps 7.5–7.6, but running on the PC first is the easiest way to see the system work before an NPU is involved.
 
-### Step 1: Generate synthetic data and train the model
+### 7.2 What you need
 
-These steps run **on your machine** (not in Docker) because training is a one-time offline task.
-Skip this step if the `models/` directory already contains `autoencoder.tflite`, `scaler.pkl`, and `threshold.json`.
+| Tool | Version | What it is for | Check it with |
+|---|---|---|---|
+| [Git](https://git-scm.com/) | any | Download the code | `git --version` |
+| [Python](https://www.python.org/) | 3.11 (tested with 3.11.9) | Training, and the test script | `python --version` |
+| [Podman](https://podman.io/) (or Podman Desktop) | ≥ 5.0 | Build and run containers | `podman version` |
+| A compose provider | Docker Compose ≥ 2 | Lets `podman compose` start several containers | `podman compose version` |
+| Disk space | about 4 GB | TensorFlow for training (about 2 GB) and the images | |
+| **For path B only:** | | | |
+| An OptixEdge with the NPU enabled and Docker running | | The target | |
+| Portainer on the device, **or** the Docker API reachable from the PC, **or** SSH | | One road to the device's Docker daemon ([7.8](#78-deploy-on-the-optixedge-with-portainer), [7.9](#79-deploy-on-the-optixedge-from-the-command-line)) | |
 
-1. Create and activate a virtual environment.
+**First time with Podman on Windows or macOS?** Podman needs its Linux virtual machine ([2.4](#24-what-is-docker)):
 
 ```powershell
-cd anomaly_detection
-
-# Create virtual environment
-python -m venv venv
-
-# Activate (PowerShell)
-.\venv\Scripts\Activate.ps1
+podman machine init      # once: creates the virtual machine
+podman machine start     # after every reboot of the PC
 ```
 
-For Command Prompt (`cmd.exe`):
+If `podman compose version` reports that no compose provider was found, install one: Podman Desktop offers it under *Settings → Resources → Compose*, or run `winget install Docker.DockerCompose`. When `podman compose` runs, it prints `>>>> Executing external compose provider ...`: that line is normal. Set `$env:PODMAN_COMPOSE_WARNING_LOGS="false"` to hide it.
 
-```bat
-venv\Scripts\activate.bat
+> **Using Docker Desktop instead of Podman?** Type `docker` wherever this guide says `podman`. Skip `podman machine` and the binfmt step of 7.7 (Docker Desktop emulates ARM by itself), and build the arm64 image with `docker buildx build --platform linux/arm64 -f Dockerfile.npu -t localhost/anomaly_detection-detector:npu --load .`
+
+### 7.3 Get the code
+
+```powershell
+git clone https://github.com/massimovar/machine_learning_simple_anomaly_detection.git
+cd machine_learning_simple_anomaly_detection\anomaly_detection
 ```
 
-For Linux/macOS:
+**Every command from here on is typed in this `anomaly_detection` folder**, unless a step says otherwise. If you open a new terminal, `cd` into it again.
+
+### 7.4 Train the model (once)
+
+The trained model is not in the repository: you make it, on your PC. Both container images copy the `models/` folder in, so **train before you build any image**.
+
+Training happens outside containers, in a **virtual environment** (venv): a private folder of Python packages that keeps TensorFlow out of your system's Python.
+
+```powershell
+python -m venv venv                            # create the private package folder (once)
+.\venv\Scripts\Activate.ps1                    # switch this terminal to it: the prompt now starts with (venv)
+pip install -r requirements.txt tensorflow     # runtime packages + TensorFlow for training (a few minutes)
+python training\generate_synthetic.py          # write fake sensor data to data\
+python training\train.py                       # train, then export both model files
+```
+
+On Linux or macOS, the same steps are:
 
 ```bash
+python3 -m venv venv
 source venv/bin/activate
-```
-
-2. Install dependencies and run training.
-
-```bash
-# requirements.txt covers runtime dependencies; training also needs full TensorFlow
-pip install -r requirements.txt
-pip install tensorflow
-
-# Generate fake sensor data
+pip install -r requirements.txt tensorflow
 python training/generate_synthetic.py
-
-# Train the autoencoder and convert to TFLite
 python training/train.py
 ```
 
-3. (Optional) Deactivate the virtual environment when finished.
+Then look at the result with `Get-ChildItem models` (Linux/macOS: `ls -l models`):
 
-```bash
-deactivate
+```text
+autoencoder.tflite        16544   the float32 model: the graph and its weights
+autoencoder_int8.tflite    7064   its int8 twin, for the NPU (3.4)
+scaler.pkl                  681   the fitted MinMaxScaler (3.2)
+threshold.json              124   the anomaly threshold of the float model
+threshold_int8.json         125   the threshold of the int8 model (3.4.4)
 ```
 
-After training, check the `models/` directory — you should see three files:
+Training starts from random weights, so your thresholds will differ slightly from the numbers in this guide.
 
-```
-models/
-├── autoencoder.tflite  # compiled TFLite flat-buffer (graph + weights, ~50 KB)
-├── scaler.pkl          # fitted MinMaxScaler
-└── threshold.json      # anomaly threshold
-```
-
-### Step 2: Start the containers
-
-#### 2A) Local run on Windows/Linux/macOS
-
-The default Compose file builds the detector image for your current machine architecture. On Windows with Podman, use either `podman compose` or the Docker-compatible `docker compose` command if your Podman installation provides it.
+### 7.5 Run it on your PC
 
 ```powershell
-# still inside anomaly_detection/ from Step 1
-podman compose up --build
-
-# Equivalent when Podman is exposed through Docker-compatible commands
-docker compose up --build
+podman compose up -d --build
 ```
 
-#### 2B) Deploy on edge device with Portainer (stack)
+What this does: `up` starts every service of `docker-compose.yml`; `--build` first builds the detector image from `Dockerfile` (the first time it downloads the Python base image, a few minutes); `-d` (detached) gives you the terminal back while the containers run.
 
-> **Important (architecture):** The edge override is ARM64-only: `docker-compose.edge.yml` sets the service platform, build platform, and `IMAGE_PLATFORM` build argument to `linux/arm64`.
-> On a Windows amd64 Podman machine, `podman build --platform linux/arm64 ...` can fail with
-> `exec container process '/bin/sh': Exec format error` (for example at a `RUN pip install ...` step)
-> if ARM emulation is not enabled.
-> Use one of these paths:
-> - Build on a real ARM64 host (recommended), then export/import with Portainer.
-> - Enable ARM emulation in Podman, then build on x86:
->
-> ```bash
-> podman run --rm --privileged docker.io/tonistiigi/binfmt --install arm64
-> podman run --rm --platform linux/arm64 alpine:3.20 uname -m
-> # expected output: aarch64
-> ```
-> - Build a local amd64 image only for development checks:
->
-> ```bash
-> podman build -t anomaly_detection-detector:amd64-local .
-> ```
->
-> The amd64-local image is for local validation only; deploy `anomaly_detection-detector:edge` on the ARM64 device.
+Check that both containers are running, then read the detector's log:
 
-1. Build and export ARM64 images on your development machine:
-
-```bash
-# from anomaly_detection/
-podman compose -f docker-compose.yml -f docker-compose.edge.yml build
-podman pull --platform linux/arm64 eclipse-mosquitto:2
-podman save -o edge-images.tar anomaly_detection-detector:edge eclipse-mosquitto:2
+```powershell
+podman compose ps
+podman compose logs detector
 ```
 
-2. Copy these files to the edge device:
-- `edge-images.tar`
+You should see (timestamps removed):
 
-3. In Portainer on the edge device:
-- Go to **Images** → **Import** and upload `edge-images.tar`
-- If Portainer shows the detector image as `localhost/anomaly_detection-detector:edge`, this is expected for archives created by Podman. In that case, set the detector image in your stack YAML to `localhost/anomaly_detection-detector:edge` (instead of `anomaly_detection-detector:edge`).
-- Go to **Stacks** → **Add stack**
-- Paste this stack file and deploy:
+```text
+INFO: Created TensorFlow Lite XNNPACK delegate for CPU.
+[INFO] anomaly-detector: Model autoencoder.tflite (float32) on CPU via tflite_runtime 2.14.0, warm-up 0.0 ms
+[INFO] mqtt_client: Connected to MQTT broker at mqtt-broker:1883
+[INFO] mqtt_client: Subscribed to topic: ftoptix/paperclip/sensors
+[INFO] mqtt_client: Subscribed to topic: anomaly/paperclip/cmd
+[INFO] anomaly-detector: Anomaly detector running
+[INFO] mqtt_client: Published status to anomaly/paperclip/status: accelerator=cpu
+```
+
+Read it line by line: the float model was loaded on the CPU, the detector found the broker by its service name `mqtt-broker`, it listens to sensor data and commands, and it announced where it runs. To follow the log live, add `-f` (`podman compose logs -f detector`) and stop following with `Ctrl+C`; the containers keep running.
+
+### 7.6 Test it
+
+Nothing happens until sensor data arrives. Here are three ways to send some, from the easiest.
+
+**A. The automatic test.** With the venv still active (7.4):
+
+```powershell
+$env:PYTHONUTF8="1"                 # lets Python print ✓ in the Windows console
+python tests\test_integration.py
+```
+
+On Linux or macOS: `python tests/test_integration.py`. The script plays FactoryTalk Optix: it publishes 30 normal readings (one window), waits for the alert, then 30 abnormal ones. Expected output:
+
+```text
+[TEST] Normal window
+  [NORMAL] Publishing 30 normal sensor samples ...
+  [NORMAL] PASS — NORMAL ✓  score=0.000269  threshold=0.010150
+
+[TEST] Anomaly window
+  [ANOMALY] Publishing 30 anomalous sensor samples ...
+  [ANOMALY] PASS — ANOMALY DETECTED ✓  score=166.107742  threshold=0.010150
+
+============================================================
+  RESULT: ALL TESTS PASSED ✓
+============================================================
+```
+
+The normal score is far below the threshold, the anomalous one tens of thousands of times above it.
+
+**B. Watch the messages.** Open a **second terminal**, `cd` into `anomaly_detection`, and subscribe to everything the detector publishes:
+
+```powershell
+podman compose exec -T mqtt-broker mosquitto_sub -v -t "anomaly/paperclip/#"
+```
+
+`podman compose exec` runs a program **inside** a running container. The broker's image already contains the MQTT command-line tools, so you install nothing. `-t "anomaly/paperclip/#"` subscribes to every topic under `anomaly/paperclip/` (`#` is the MQTT wildcard), and `-v` prints the topic name before each message. Leave it running, and repeat test A: the alerts appear here. The first line is the retained status message ([5.5.2](#552-retained-status-and-the-last-will)).
+
+**C. Send a window by hand.** In the first terminal:
+
+```powershell
+$normal = '{"wire_feed_speed":10.2,"wire_tension":22.5,"motor_current_feed":2.1,"motor_current_bend":3.3,"bend_angle":180.1,"cycle_time":198,"vibration_rms":1.8,"cut_force":55.0,"temperature_motor":48.3,"reject_count_per_min":1}'
+1..30 | ForEach-Object { $normal } | podman compose exec -T mqtt-broker mosquitto_pub -t ftoptix/paperclip/sensors -l
+```
+
+`1..30 | ForEach-Object { $normal }` writes the same JSON line 30 times; `mosquitto_pub -l` publishes every line it reads as one message. 30 messages fill one window, so the second terminal shows exactly one alert:
+
+```text
+anomaly/paperclip/alerts {"is_anomaly": false, "anomaly_score": 0.000976, "threshold": 0.01015, "accelerator": "cpu", "precision": "float32", "inference_ms": 0.0764}
+```
+
+Now a sick machine: motor currents of 15 A and 12 A instead of 2–4 A, hot motor, strong vibration:
+
+```powershell
+$sick = '{"wire_feed_speed":10.0,"wire_tension":22.0,"motor_current_feed":15.0,"motor_current_bend":12.0,"bend_angle":170.0,"cycle_time":350,"vibration_rms":9.0,"cut_force":120.0,"temperature_motor":90.0,"reject_count_per_min":8}'
+1..30 | ForEach-Object { $sick } | podman compose exec -T mqtt-broker mosquitto_pub -t ftoptix/paperclip/sensors -l
+```
+
+```text
+anomaly/paperclip/alerts {"is_anomaly": true, "anomaly_score": 165.142426, "threshold": 0.01015, "accelerator": "cpu", "precision": "float32", "inference_ms": 0.0754}
+```
+
+On Linux or macOS, the loop is `for i in $(seq 30); do echo "$normal"; done | podman compose exec -T mqtt-broker mosquitto_pub -t ftoptix/paperclip/sensors -l` (define the variable with `normal='...'`).
+
+**D. Ask for a benchmark.** The same command FactoryTalk Optix's Benchmark button sends ([5.6](#56-the-benchmark-call-step-by-step)):
+
+```powershell
+'{"cmd":"benchmark","runs":1000}' | podman compose exec -T mqtt-broker mosquitto_pub -t anomaly/paperclip/cmd -s
+```
+
+`-s` publishes everything it reads as one message. The answer arrives on `anomaly/paperclip/benchmark`. On the PC it times the CPU only, and says why:
+
+```text
+anomaly/paperclip/benchmark {"model": "autoencoder.tflite", "precision": "float32", "runs": 1000, "cpu": {"accelerator": "cpu", "runs": 1000, "p50_ms": 0.0099, "p95_ms": 0.0147, ...}, "npu": null, "npu_unavailable": "NPU not requested (USE_NPU=false)", ...}
+```
+
+**And FactoryTalk Optix?** The FactoryTalk Optix project in `FTOptix/` is the real publisher: its simulator NetLogic publishes the 10 tags every second, and the panel shows the alerts and the NPU evidence. Its MQTT client connects to port 1884 of the broker, which only the NPU override opens ([4.8](#48-what-the-npu-container-receives-from-the-device)).
+
+When you are done, stop everything with `podman compose down` ([7.11](#711-stop-and-remove-everything)).
+
+<a id="2b-deploy-on-edge-device-with-portainer-stack"></a>
+
+### 7.7 Build the image for the OptixEdge
+
+The OptixEdge has an ARM CPU, your PC most likely an x86 one, so the PC image of 7.5 cannot run there ([2.4](#24-what-is-docker)). We build a second image, for arm64, from `Dockerfile.npu`, on the PC. The model files from 7.4 must exist.
+
+**Step 1: let the PC run ARM programs.** The build runs commands inside an ARM Linux, so the Podman machine needs QEMU and binfmt:
+
+```powershell
+podman run --rm --privileged docker.io/tonistiigi/binfmt --install arm64
+podman run --rm --platform linux/arm64 docker.io/library/alpine:3.20 uname -m
+```
+
+The second command starts a tiny ARM Linux and asks it for its CPU type. It must print `aarch64`. Repeat step 1 after every `podman machine start`: the setting does not survive a restart of the virtual machine.
+
+**Step 2: build.**
+
+```powershell
+podman build --platform linux/arm64 -f Dockerfile.npu -t localhost/anomaly_detection-detector:npu .
+```
+
+| Part | Meaning |
+|---|---|
+| `--platform linux/arm64` | Build for ARM, under emulation |
+| `-f Dockerfile.npu` | The recipe to use (the default would be `Dockerfile`, the PC one) |
+| `-t localhost/anomaly_detection-detector:npu` | The name the image gets, the one the compose files expect |
+| `.` | The **build context**: the current folder, whose files the recipe may copy (`src/`, `models/`, `config.yaml`…) |
+
+Emulation is slow: count 10–20 minutes the first time. Use `podman build`, not `podman compose build`, which on our PC ran for a long time without printing anything. Check the result with `podman images localhost/anomaly_detection-detector` (about 440 MB).
+
+**Step 3 (optional): a smoke test on the PC.** The image contains a one-shot check, `tools/npu_check.py`. On the PC there is no NPU, so it must fall back to the CPU and say so:
+
+```powershell
+podman run --rm --platform linux/arm64 localhost/anomaly_detection-detector:npu python tools/npu_check.py --runs 50
+```
+
+The last lines read `RESULT: inference ran on the CPU (NPU error: OSError: /usr/lib/libvx_delegate.so: cannot open shared object file ...)`. That is the expected answer on a PC: the image starts, the ARM program runs, the model computes, and the NPU is honestly reported as missing. A harmless `AttributeError: 'Delegate' object has no attribute '_library'` may follow: LiteRT cleaning up a delegate that never loaded.
+
+**Step 4: save the image to a file.** The image is not in any registry, so it travels as a file:
+
+```powershell
+podman save -o anomaly_detection-npu.tar localhost/anomaly_detection-detector:npu
+```
+
+`podman save` packs the image, with all its layers, into one `.tar` archive (about 440 MB). Keep it outside the Git repository's tracked files (`*.tar` is already ignored).
+
+**Step 5 (only if the OptixEdge has no internet access): the broker image too.** The device normally downloads `eclipse-mosquitto:2` from Docker Hub by itself. Without internet, take the **arm64** copy with you:
+
+```powershell
+podman pull --platform linux/arm64 docker.io/library/eclipse-mosquitto:2
+podman save -o mosquitto-arm64.tar docker.io/library/eclipse-mosquitto:2
+podman pull --platform linux/amd64 docker.io/library/eclipse-mosquitto:2
+```
+
+The last line puts the PC's own (amd64) copy back. Without it, the next `podman compose up` on the PC would start the ARM broker under emulation, or fail with `exec format error`.
+
+### 7.8 Deploy on the OptixEdge with Portainer
+
+**Portainer** is a web page for the device's Docker ([2.4](#24-what-is-docker)). On an OptixEdge it is usually at `https://<optixedge-ip>:9443`; the browser warns about the device's self-signed certificate. Log in and open the **local** environment.
+
+**Step 1: import the image.** *Images → Import*, select `anomaly_detection-npu.tar`, *Upload*. Wait until the upload finishes, then check that the image list shows `localhost/anomaly_detection-detector:npu`. Images saved by Podman keep the `localhost/` prefix, and the stack below uses exactly that name. Without internet on the device, import `mosquitto-arm64.tar` the same way.
+
+**Step 2: create the stack.** *Stacks → Add stack*. Name: `anomaly_detection`. Build method: *Web editor*. Paste this YAML, then click *Deploy the stack*:
 
 ```yaml
+# docker-compose.yml + docker-compose.npu.yml, merged into one file for Portainer
 services:
   mqtt-broker:
     image: eclipse-mosquitto:2
     ports:
-      - "1883:1883"   # MQTT TCP — FTOptix + detector container
-      - "9001:9001"   # Optional: reserved for future browser MQTT-over-WebSocket sync
-    environment:
-      - MOSQUITTO_LISTENER=1883 0.0.0.0
-      - MOSQUITTO_ALLOW_ANONYMOUS=true
+      - "1883:1883"   # MQTT for the detector and other clients
+      - "1884:1883"   # the same broker, for the FactoryTalk Optix project's MQTTClient1
+      - "9001:9001"   # reserved for MQTT over WebSocket
     command:
       - /bin/sh
       - -c
       - |
         cat > /tmp/mosquitto.conf <<EOF
-        listener $${MOSQUITTO_LISTENER}
-        allow_anonymous $${MOSQUITTO_ALLOW_ANONYMOUS}
+        listener 1883 0.0.0.0
+        allow_anonymous true
         listener 9001 0.0.0.0
         protocol websockets
         EOF
@@ -708,29 +1701,272 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
 
   detector:
-    image: localhost/anomaly_detection-detector:edge
-    pull_policy: never
+    image: localhost/anomaly_detection-detector:npu
+    pull_policy: never              # the image was imported: never look for it online
     platform: linux/arm64
+    devices:
+      - /dev/galcore:/dev/galcore   # the door to the NPU's kernel driver
+    volumes:
+      - /usr/lib:/host/usr/lib:ro   # the device's NPU libraries, read-only
+      - npu-graph-cache:/var/cache/npu
     environment:
       - PYTHONUNBUFFERED=1
-      - TF_CPP_MIN_LOG_LEVEL=3
       - TF_ENABLE_ONEDNN_OPTS=0
-    restart: unless-stopped
+      - USE_NPU=${USE_NPU:-true}    # true unless the stack variable USE_NPU says otherwise
+      - TF_CPP_MIN_LOG_LEVEL=0      # keep TFLite's INFO lines: they are evidence
+      - VIV_VX_ENABLE_CACHE_GRAPH_BINARY=1
+      - VIV_VX_CACHE_BINARY_GRAPH_DIR=/var/cache/npu
     depends_on:
       mqtt-broker:
         condition: service_healthy
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+
+volumes:
+  npu-graph-cache:
 ```
 
-5. Open the 3-D digital twin in a browser on the same network:
+Every line of the `detector` section is explained in [4.8](#48-what-the-npu-container-receives-from-the-device). The broker comes up first; the detector waits until the broker's health check passes (`condition: service_healthy`).
 
-```
-file:///.../FTOptix/paper_clip_machine/ProjectFiles/treeJs_scene/paper_clip_machine_world.html
+**Step 3: read the log.** *Containers → `anomaly_detection-detector-1` → Logs*. Compare with [7.10](#710-check-that-it-runs-on-the-npu).
+
+**The negative control.** *Stacks → anomaly_detection → Editor*. Under *Environment variables*, add `USE_NPU` with the value `false`, then *Update the stack*. Portainer recreates the detector, which now runs on the CPU. Remove the variable and update again to return to the NPU.
+
+### 7.9 Deploy on the OptixEdge from the command line
+
+The `docker` command on your PC is only a client ([2.4](#24-what-is-docker)). Set `DOCKER_HOST` to the device's daemon, and every `docker` command you type on the PC acts on the OptixEdge.
+
+**What you need on the PC:** the `docker` command and Compose. Podman cannot do this: it talks only to Podman, not to a remote Docker daemon. Docker Desktop includes both; without it:
+
+```powershell
+winget install Docker.DockerCLI
+winget install Docker.DockerCompose
 ```
 
-Or serve it from any static HTTP server (e.g. VS Code Live Server, Nginx, or FTOptix's own embedded web server). The page currently runs as a standalone 3-D visualisation while MQTT browser sync is disabled. Opened from `file://`, the page cannot `fetch()` the state file and runs on its built-in simulation; served over HTTP, it follows `isanomaly.js` / `isanomaly.json`.
+Open a new terminal afterwards, so that it finds the new commands. The standalone Compose installed this way is typed `docker-compose` (with a dash) instead of `docker compose`; everything else is identical.
+
+**What you need on the device:** its Docker API reachable over the network. On the OptixEdge this is enabled in the System Manager (Docker page): port **2375** without encryption, or **2376** with TLS.
+
+> ⚠️ **Port 2375 has no password.** Anyone who can reach it can start any container with any folder or device of the host mounted, which means full control of the device. Use it only on an isolated lab network, and close it afterwards. Elsewhere, use 2376 with client certificates: `$env:DOCKER_HOST="tcp://<optixedge-ip>:2376"`, `$env:DOCKER_TLS_VERIFY="1"`, `$env:DOCKER_CERT_PATH="<folder with ca.pem, cert.pem, key.pem>"`.
+
+**Step 1: point the client at the device**, and check:
+
+```powershell
+$env:DOCKER_HOST = "tcp://<optixedge-ip>:2375"     # Linux/macOS: export DOCKER_HOST=tcp://<optixedge-ip>:2375
+docker version
+```
+
+The `Server:` part of the answer describes the device: `OS/Arch: linux/arm64`. If it says `linux/amd64`, you are still talking to your PC.
+
+**Step 2: load the image and start the stack** (from the `anomaly_detection` folder, where the compose files are):
+
+```powershell
+docker load -i anomaly_detection-npu.tar
+docker compose -p anomaly_detection -f docker-compose.yml -f docker-compose.npu.yml up -d --no-build
+docker compose -p anomaly_detection -f docker-compose.yml -f docker-compose.npu.yml logs -f detector
+```
+
+| Part | Meaning |
+|---|---|
+| `docker load -i …tar` | Streams the archive from the PC into the device's image store (on `/persistent`) |
+| `-p anomaly_detection` | The project name: the same container and volume names as in Portainer |
+| `-f docker-compose.yml -f docker-compose.npu.yml` | The base file, then the NPU override on top ([2.4](#24-what-is-docker)) |
+| `up -d` | Create and start the containers, in the background |
+| `--no-build` | Use the loaded image; never try to build one (the files also contain a `build:` section for the PC) |
+| `logs -f detector` | Follow the detector's log; `Ctrl+C` stops following, not the container |
+
+Without internet on the device, run `docker load -i mosquitto-arm64.tar` before `up`.
+
+**The detail that surprises everyone.** Compose reads the YAML files on your PC, but every path inside them (`/dev/galcore`, `/usr/lib`, the volume) is handed to the daemon, and the daemon resolves it **on the device**. `/usr/lib` means the OptixEdge's `/usr/lib`, even though you typed the command on Windows. That is exactly what we need here.
+
+**The negative control:**
+
+```powershell
+$env:USE_NPU = "false"
+docker compose -p anomaly_detection -f docker-compose.yml -f docker-compose.npu.yml up -d --no-build
+Remove-Item Env:USE_NPU
+docker compose -p anomaly_detection -f docker-compose.yml -f docker-compose.npu.yml up -d --no-build
+```
+
+The first `up` recreates the detector with `USE_NPU=false` (compose fills `${USE_NPU:-true}` from your terminal); the second puts it back on the NPU. On Linux or macOS: `USE_NPU=false docker compose ... up -d --no-build`, then the same command without the variable.
+
+**Step 3: forget the device**, so later `docker` commands act on your PC again:
+
+```powershell
+Remove-Item Env:DOCKER_HOST       # Linux/macOS: unset DOCKER_HOST
+```
+
+#### Variant: over SSH, on an open Yocto device
+
+Our test device has an open Yocto image with SSH, and its Docker daemon is **rootless**: it listens only on a local socket, `unix:///run/user/985/docker.sock`, not on 2375. There we copy the files and run the same commands on the device:
+
+```powershell
+ssh root@<optixedge-ip> "mkdir -p /persistent/anomaly_detection"
+scp anomaly_detection-npu.tar docker-compose.yml docker-compose.npu.yml root@<optixedge-ip>:/persistent/anomaly_detection/
+ssh root@<optixedge-ip>
+```
+
+Then, in the SSH session on the device:
+
+```sh
+cd /persistent/anomaly_detection
+export DOCKER_HOST=unix:///run/user/985/docker.sock
+docker load -i anomaly_detection-npu.tar && rm anomaly_detection-npu.tar
+docker compose -p anomaly_detection -f docker-compose.yml -f docker-compose.npu.yml up -d --no-build
+docker compose -p anomaly_detection -f docker-compose.yml -f docker-compose.npu.yml logs -f detector
+```
+
+The folder is on `/persistent` because the root partition has only 20 MB free. The archive is deleted once loaded. For the negative control, run `USE_NPU=false docker compose ... up -d --no-build` the same way.
+
+### 7.10 Check that it runs on the NPU
+
+**1. The log.** The detector's first lines come from the entrypoint, before Python starts:
+
+```text
+[npu] linked 20 host libraries from /host/usr/lib into /opt/npu/lib
+[npu] every dependency of /opt/npu/lib/libvx_delegate.so resolves
+[npu] using the host's tflite_runtime (/host/usr/lib/python3.12/site-packages/tflite_runtime)
+[npu] /dev/galcore is present
+[INFO] anomaly-detector: Model autoencoder_int8.tflite (int8) on NPU via tflite_runtime 2.16.2, warm-up 18.8 ms
+[INFO] mqtt_client: Published status to anomaly/paperclip/status: accelerator=npu
+```
+
+Four `[npu]` lines, four facts: the device's NPU libraries were found, nothing they need is missing, the runtime is the device's own, and the door to the kernel driver is open ([4.4](#44-the-entrypoint-borrow-only-the-npu-libraries)). Then the detector reports the engine: the **int8** model, on the **NPU**. A warm-up under 20 ms means the compiled graph came from the cache volume; the very first start takes about 65 ms, to compile it. If a line looks different, look it up in [7.12](#712-troubleshooting).
+
+**2. The status, from your PC.** No MQTT tool to install: run one from the broker image, pointed at the device:
+
+```powershell
+podman run --rm docker.io/library/eclipse-mosquitto:2 mosquitto_sub -h <optixedge-ip> -t anomaly/paperclip/status -C 1
+```
+
+The status message is *retained* ([5.5.2](#552-retained-status-and-the-last-will)), so it arrives at once; `-C 1` stops after one message. Look for `"accelerator": "npu"`, `"precision": "int8"` and `"delegation"`.
+
+**3. Detection and a benchmark, against the device.** The test of 7.6 works against any broker:
+
+```powershell
+$env:MQTT_BROKER_HOST = "<optixedge-ip>"
+$env:PYTHONUTF8 = "1"
+python tests\test_integration.py
+Remove-Item Env:MQTT_BROKER_HOST
+```
+
+For a benchmark, open a subscriber in a second terminal, then send the command from the first:
+
+```powershell
+podman run --rm docker.io/library/eclipse-mosquitto:2 mosquitto_sub -h <optixedge-ip> -t anomaly/paperclip/benchmark -C 1
+```
+
+```powershell
+'{"cmd":"benchmark","runs":1000}' | podman run --rm -i docker.io/library/eclipse-mosquitto:2 mosquitto_pub -h <optixedge-ip> -t anomaly/paperclip/cmd -s
+```
+
+`-i` connects your terminal's input to the container, so the JSON reaches `mosquitto_pub`. On the device the answer has a `cpu` and an `npu` block, and the NPU is slower; [5.6](#56-the-benchmark-call-step-by-step) and [5.7](#57-why-the-npu-is-slower-here) explain how to read it and why.
+
+**4. The one-shot check, without MQTT.** With `DOCKER_HOST` pointing at the device (7.9), or in the SSH session:
+
+```sh
+docker run --rm --device /dev/galcore -v /usr/lib:/host/usr/lib:ro localhost/anomaly_detection-detector:npu python tools/npu_check.py
+```
+
+It uses the production code (`InferenceEngine` and `run_benchmark`), runs 200 inferences on each engine (`--runs N` to change that) and prints a verdict. `RESULT: inference ran on the NPU` means the detector will find the NPU too. It exits with code 1 when the model did not run on the NPU, so it can be used in scripts.
+
+**5. The panel.** In FactoryTalk Optix, the evidence panel shows the badge, the delegation line, the graph-cache file and the benchmark bars ([5.8.3](#583-reading-the-panel)).
+
+**6. The negative control.** Switch `USE_NPU` to `false` (7.8 or 7.9). The badge must turn to CPU, the precision to float32, the NPU delegation line must disappear, and the benchmark must say `NPU not requested`. Then switch back. A panel that changes when the truth changes is a panel that tells the truth.
+
+### 7.11 Stop and remove everything
+
+Every object this project creates can be removed, and the device is then exactly as before.
+
+**On the PC:**
+
+```powershell
+podman compose down                                     # stop and delete the two containers and their network
+podman rmi anomaly_detection-detector:local             # optional: delete the PC image
+podman rmi localhost/anomaly_detection-detector:npu     # optional: delete the arm64 image
+```
+
+`down` keeps the images, so the next `podman compose up -d` starts in seconds. Delete `venv` and `models` too if you want the folder as it was after `git clone`.
+
+**On the OptixEdge, with Portainer:** *Stacks → anomaly_detection → Delete this stack*. Then *Images*: delete `localhost/anomaly_detection-detector:npu`; *Volumes*: delete `anomaly_detection_npu-graph-cache`.
+
+**On the OptixEdge, from the command line** (with `DOCKER_HOST` set as in 7.9, or in the SSH session):
+
+```powershell
+docker compose -p anomaly_detection -f docker-compose.yml -f docker-compose.npu.yml down
+docker rmi localhost/anomaly_detection-detector:npu
+docker volume rm anomaly_detection_npu-graph-cache
+```
+
+Over SSH, also delete the folder: `rm -r /persistent/anomaly_detection`.
+
+> ⚠️ Remove only what this project created. Never run `docker system prune` on the device: it deletes other people's stopped containers and images too.
+
+### 7.12 Troubleshooting
+
+**On the PC:**
+
+| Symptom | What it means, what to do |
+|---|---|
+| `.\venv\Scripts\Activate.ps1 cannot be loaded because running scripts is disabled` | Windows blocks scripts by default. Allow your own: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, then try again |
+| `Cannot connect to Podman` / `unable to connect to Podman socket` | The Podman machine is not running: `podman machine start` |
+| `COPY failed` … `models` during a build | The model has not been trained: do 7.4 first |
+| `bind: address already in use` for port 1883 | Another MQTT broker runs on your PC. Stop it, or change the left number of `"1883:1883"` |
+| `UnicodeEncodeError: 'charmap' codec can't encode character` | The Windows console cannot print ✓: set `$env:PYTHONUTF8="1"` first |
+| `ModuleNotFoundError: No module named 'paho'` | The venv is not active in this terminal: `.\venv\Scripts\Activate.ps1` |
+| The test says `TIMEOUT` … `No detector response` | The stack is not running (`podman compose ps`), or `MQTT_BROKER_HOST` points somewhere else (`Remove-Item Env:MQTT_BROKER_HOST`) |
+| `exec format error` | An image for the wrong CPU. During the arm64 build: repeat 7.7 step 1. When starting the PC stack: the broker image is the ARM copy, pull the PC one with `podman pull --platform linux/amd64 docker.io/library/eclipse-mosquitto:2` |
+| `CERTIFICATE_VERIFY_FAILED` during `pip install` in a build | A company proxy inspects HTTPS traffic. Mount your company's root certificate bundle into the build: add `-v "<bundle.pem>:/etc/ssl/certs/ca-certificates.crt:ro"` to `podman build` (for pip itself, also `-v "<bundle.pem>:/usr/local/lib/python3.12/site-packages/pip/_vendor/certifi/cacert.pem:ro"`) |
+| `podman compose build` prints nothing for a long time | Use `podman build` as in 7.7 step 2 |
+| `AttributeError: 'Delegate' object has no attribute '_library'` | Harmless: LiteRT cleans up a delegate that never loaded, on a PC without NPU |
+
+**Pulling and deploying:**
+
+| Symptom | What it means, what to do |
+|---|---|
+| `pull access denied` / `repository does not exist` for `localhost/anomaly_detection-detector` | The image was not imported on the device: Portainer *Images → Import* (7.8) or `docker load` (7.9). `pull_policy: never` makes Docker say so instead of searching online |
+| `Cannot connect to the Docker daemon at tcp://…` | Wrong `DOCKER_HOST`, or the device's Docker API is not enabled (7.9) |
+| `docker version` shows `OS/Arch: linux/amd64` | `DOCKER_HOST` is not set in this terminal: you are talking to your PC |
+| `no space left on device` while importing | The archive or the image store is on a small partition; keep both on `/persistent` |
+
+**On the OptixEdge** (an `NpuError` in the status, or an `[npu]` log line):
+
+| Symptom | Layer | What it means, what to do |
+|---|---|---|
+| `/host/usr/lib is not mounted` | Container config | Add `-v /usr/lib:/host/usr/lib:ro` |
+| `/dev/galcore is missing` | Container config | Add `--device /dev/galcore` |
+| `linked 0 host libraries` | Device | The device has no NPU libraries in `/usr/lib`: its firmware was built without them, or keeps them elsewhere (set `HOST_LIB_DIR`) |
+| `no delegate at /opt/npu/lib/libvx_delegate.so` | Device | The device has the driver but not the VX delegate (a firmware without the ML packages). The detector runs on the CPU; see [4.7](#47-host-or-container-where-each-moving-part-belongs) |
+| `no host tflite_runtime for python3.12` | Device ↔ image | The device has no `tflite_runtime` for the image's Python version. The image's LiteRT is used instead (runtime B of [4.5](#45-which-tflite-runtime)) |
+| `the delegate needs libraries that are not available` | NPU libs | The listed library is missing or has another name on this device: add its pattern to `NPU_HOST_LIBS`. `NPU_DEBUG=1` prints the full `ldd` |
+| `OSError: ... GLIBC_2.xx not found` | C runtime | The device's glibc is newer than the image's: use a newer base image ([4.6](#46-the-c-runtime-rule)) |
+| `cannot enable executable stack` | C runtime | A library in the image is marked as needing an executable stack; the image clears that mark on LiteRT ([4.6](#46-the-c-runtime-rule)) |
+| `undefined symbol: tflite_plugin_create_delegate` | Delegate | The file is not a TFLite external delegate; check `VX_DELEGATE_PATH` |
+| Delegate loads, crash or error at the first invoke | Runtime ↔ delegate | Switch runtime: `HOST_TFLITE_RUNTIME=0` uses the image's LiteRT instead of the borrowed `tflite_runtime` ([4.5](#45-which-tflite-runtime)) |
+| Delegation `0/5` | Model | The delegate rejected every op: check that the int8 model is used (`precision: int8`) |
+| Badge stays `?` in FactoryTalk Optix | MQTT | Check the plain-text subscription to `anomaly/paperclip/status` and the broker port 1884 ([5.8.2](#582-the-variables-in-modelnpu)) |
+
+### 7.13 The 3-D digital twin
+
+The FactoryTalk Optix project serves a 3-D scene of the machine that turns red on an anomaly ([4.1](#41-the-data-flow), step 9). You can also open it directly:
+
+```text
+FTOptix/paper_clip_machine/ProjectFiles/treeJs_scene/paper_clip_machine_world.html
+```
+
+Opened as a file (`file://`), the page cannot `fetch()` the state file, so it runs on its built-in simulation. Served over HTTP (FactoryTalk Optix's web server on port 8080, VS Code Live Server, Nginx…), it follows `isanomaly.json` / `isanomaly.js`.
 
 Optional URL parameters for demos and debugging (for example `paper_clip_machine_world.html?time=19.2&anomaly=1`):
 
@@ -743,128 +1979,11 @@ Optional URL parameters for demos and debugging (for example `paper_clip_machine
 | `stats` | `1` | Show an overlay with tier, FPS, frame time, draw calls, triangles, pixel ratio and GPU name |
 | `dynres` | `0` | Disable dynamic resolution (useful for benchmarks) |
 
-4. Validate logs in Portainer:
-- `mqtt-broker` shows Mosquitto startup
-- `detector` shows `Model autoencoder.tflite (float32) on CPU ...` and `Anomaly detector running`
-
-To run the detector on the NPU instead, see [Part 3, section 33](#33-deploying-to-the-device).
-
-### Step 3: Run the integration test (automated)
-
-The simplest way to verify the running system is the Python integration test. It publishes 30 normal samples, waits for a detection result, then publishes 30 anomalous samples and verifies an anomaly is detected.
-
-```bash
-# From the anomaly_detection/ directory (stack must be running)
-python tests/test_integration.py
-```
-
-Expected output:
-
-```
-============================================================
-  Anomaly Detection — Integration Test
-  Broker: localhost:1883
-  Sensor topic : ftoptix/paperclip/sensors
-  Alert  topic : anomaly/paperclip/alerts
-  Window size  : 30 messages
-============================================================
-
-[TEST] Normal window
-  [NORMAL] Publishing 30 normal sensor samples ...
-  [NORMAL] PASS — NORMAL ✓  score=0.000215  threshold=0.007683
-
-[TEST] Anomaly window
-  [ANOMALY] Publishing 30 anomalous sensor samples ...
-  [ANOMALY] PASS — ANOMALY DETECTED ✓  score=166.113953  threshold=0.007683
-
-============================================================
-  RESULT: ALL TESTS PASSED ✓
-============================================================
-```
-
-> **Required:** `pip install "paho-mqtt>=2.0,<3.0"` in your local Python environment.
-
----
-
-### Step 4: Simulate sensor data manually (optional)
-
-**Understanding the sensor tags:**
-
-Each JSON message contains 10 sensor readings from the paper-clip machine. Here's what each one measures:
-
-| Tag | What it measures | Unit | What's happening physically |
-|---|---|---|---|
-| **wire_feed_speed** | How fast the steel wire is being pulled into the machine | m/min | A motor-driven roller feeds wire from a spool. Too fast → bad bends; too slow → low throughput |
-| **wire_tension** | How taut the wire is as it enters the machine | N (Newtons) | The wire must be under consistent tension to bend cleanly. Too loose → sloppy clips; too tight → wire snaps |
-| **motor_current_feed** | Electrical current drawn by the **feed motor** (the one pulling wire) | A (Amps) | Higher current = motor working harder. A spike could mean a jam or worn bearings |
-| **motor_current_bend** | Electrical current drawn by the **bending motor** (the one shaping the clip) | A (Amps) | Same idea — if bending becomes harder (e.g. wrong wire gauge, worn tooling), current rises |
-| **bend_angle** | The angle at which the wire is bent to form the clip shape | ° (degrees) | A paper clip has specific bends (~180°). Deviations mean the tooling is misaligned or worn |
-| **cycle_time** | Time to produce one complete paper clip | ms | A healthy machine has a consistent rhythm. Slower cycles could indicate a mechanical issue |
-| **vibration_rms** | Overall vibration intensity (RMS = root mean square, a standard vibration measure) | mm/s | All machines vibrate, but excessive vibration signals loose parts, imbalance, or bearing wear |
-| **cut_force** | The force applied by the blade that cuts the wire after bending | N (Newtons) | Consistent cutting force = sharp blade. Rising force = blade is dulling or wire is harder than expected |
-| **temperature_motor** | Temperature of the main motor | °C | Motors heat up during operation. Overheating means overload, poor cooling, or failing bearings |
-| **reject_count_per_min** | Number of defective clips detected per minute | count | Quality sensors (e.g. vision camera) count bad clips. A sudden rise means something has gone wrong |
-
-Together, these 10 tags cover the key failure modes: **mechanical wear** (vibration, motor current, cut force), **process drift** (bend angle, cycle time, wire tension), **thermal issues** (motor temperature), and **quality impact** (reject count).
-
-In a **separate terminal**, publish a test message:
-
-```bash
-# Install mosquitto-clients (or use any MQTT client)
-
-# Publish a NORMAL reading:
-mosquitto_pub -h localhost -t "ftoptix/paperclip/sensors" -m '{
-  "timestamp": "2026-02-17T10:30:01.000Z",
-  "wire_feed_speed": 10.2,
-  "wire_tension": 22.5,
-  "motor_current_feed": 2.1,
-  "motor_current_bend": 3.3,
-  "bend_angle": 180.1,
-  "cycle_time": 198,
-  "vibration_rms": 1.8,
-  "cut_force": 55.0,
-  "temperature_motor": 48.3,
-  "reject_count_per_min": 1
-}'
-```
-
-Publish 30 messages (one window) to trigger a detection. After the 30th message you'll see either:
-
-```
-detector  | ✅ Normal  score=0.000215  threshold=0.007683
-```
-
-or (if you send abnormal values):
-
-```
-detector  | 🚨 ANOMALY DETECTED  score=166.113953  threshold=0.007683
-```
-
-### Simulating an anomaly
-
-Publish a message with extreme values (e.g., motor current at 15 A instead of the normal 2–4 A):
-
-```bash
-mosquitto_pub -h localhost -t "ftoptix/paperclip/sensors" -m '{
-  "timestamp": "2026-02-17T10:31:01.000Z",
-  "wire_feed_speed": 10.0,
-  "wire_tension": 22.0,
-  "motor_current_feed": 15.0,
-  "motor_current_bend": 12.0,
-  "bend_angle": 170.0,
-  "cycle_time": 350,
-  "vibration_rms": 9.0,
-  "cut_force": 120.0,
-  "temperature_motor": 90.0,
-  "reject_count_per_min": 8
-}'
-```
-
 ---
 
 ## 8. Experimenting & Next Steps
 
-### Parameters to tweak in `config.yaml`
+### 8.1 Parameters to tweak in `config.yaml`
 
 | Parameter | What to try | Effect |
 |---|---|---|
@@ -873,6 +1992,33 @@ mosquitto_pub -h localhost -t "ftoptix/paperclip/sensors" -m '{
 | `threshold_sigma` | 2.0, 3.0, 4.0 | Lower = more alerts (more sensitive); higher = fewer alerts (less sensitive) |
 | `epochs` | 50, 100, 200 | More epochs = better fit but risk of overfitting; watch the training loss plateau |
 | `learning_rate` | 0.0001, 0.001, 0.01 | Too low = slow training; too high = unstable training |
+
+After changing a training parameter, train again (7.4) and rebuild the image (`podman compose up -d --build` on the PC; 7.7 for the OptixEdge): the model is inside the image.
+
+### 8.2 Switches (environment variables)
+
+These change behaviour without rebuilding the image. Set them under `environment:` in a compose file, as a Portainer stack variable, or with `-e NAME=value` on `docker run`.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `USE_NPU` | `false` in `config.yaml`; `true` in `Dockerfile.npu` and the NPU compose file | Try the NPU. If it fails, the detector runs on the CPU and the status says why ([5.3](#53-inferenceengine-try-the-npu-fall-back-remember-why)) |
+| `MODEL_PRECISION` | `auto` | `auto` = int8 when `USE_NPU` is true, float32 otherwise. `float32` or `int8` forces one (`float32` on the NPU runs in float16: [6.3](#63-the-ladder-log-predictions-vs-results)) |
+| `VX_DELEGATE_PATH` | `/opt/npu/lib/libvx_delegate.so` (set by the entrypoint) | Where the NPU delegate is |
+| `MQTT_BROKER_HOST`, `MQTT_BROKER_PORT` | `mqtt-broker`, `1883` | Which broker the detector (or `tests/test_integration.py`, default `localhost`) connects to |
+| `TF_CPP_MIN_LOG_LEVEL` | `3` on the PC, `0` on the NPU | `0` keeps TFLite's INFO lines, which carry the delegation evidence ([5.4](#54-catching-the-c-evidence)) |
+| `VIV_VX_ENABLE_CACHE_GRAPH_BINARY`, `VIV_VX_CACHE_BINARY_GRAPH_DIR` | `1`, `/var/cache/npu` | Store the compiled NPU graph (`.nb`) on the volume: evidence, and a faster start ([5.5.3](#553-the-evidence-ladder)) |
+| `HOST_LIB_DIR` | `/host/usr/lib` | Where the device's libraries are mounted inside the container |
+| `NPU_HOST_LIBS` | the list in `tools/npu_entrypoint.sh` | Which library name patterns the entrypoint links; add one if a device names a library differently |
+| `NPU_DEBUG` | `0` | `1` prints the entrypoint's full `ldd` result ([4.4](#44-the-entrypoint-borrow-only-the-npu-libraries)) |
+| `HOST_TFLITE_RUNTIME` | `1` | `0` uses the image's LiteRT instead of the device's `tflite_runtime` (runtime B of [4.5](#45-which-tflite-runtime)) |
+| `NPU_COUNTERS_PATH` | not set | A driver counter file to read before and after a benchmark (needs a read-only mount of that file; [5.5.3](#553-the-evidence-ladder)) |
+| `LITERT_VERSION` | `1.2.0` | A **build** argument of `Dockerfile.npu`: `podman build --build-arg LITERT_VERSION=… ` |
+
+### 8.3 Next steps
+
+- **Draw the line at OpenVX.** Move TFLite, the VX delegate and TIM-VX into the image, and borrow only the Vivante driver from the device. The image would then also run on closed Yocto images without the machine-learning packages ([4.7](#47-host-or-container-where-each-moving-part-belongs)).
+- **A bigger model.** The NPU wins once a model has enough work per inference ([5.6](#56-the-benchmark-call-step-by-step)): a model with time windows instead of averages (the V2 plan in the root `plan.md`) is the natural next experiment.
+- **Real data.** Retrain on recorded machine data instead of synthetic data, and recalibrate both thresholds.
 
 ---
 
@@ -3752,733 +4898,6 @@ How to add one more rule-based gesture, step by step, is in [16.4](#164-adding-a
 
 ---
 
-# Part 3 — Anomaly Detection on the NPU
-
-> 📝 **Status.** Measured on the OptixEdge (i.MX 8M Plus, Yocto scarthgap, kernel 6.12, galcore 6.4.11) and shown on the FactoryTalk Optix panel. The container runs our int8 model on the NPU, and nothing is installed on the device's operating system: the device **lends** its NPU stack to the container, read-only. The ladder log ([34](#34-the-ladder-log-predictions-vs-results)) puts every prediction next to the measured result. [27.7](#277-host-or-container-where-each-moving-part-belongs) explains which of the lent pieces could move into the image, and what we learned trying.
-
-## 26. Goal and Ground Rules
-
-Part 1 runs the autoencoder on the ARM CPU. Part 3 moves the **same detector** onto the i.MX 8M Plus NPU of an OptixEdge and **proves** it on the HMI. Three rules shaped every decision:
-
-1. **Install nothing on the device's operating system.** The NPU is used *from inside the detector's container*. The device contributes only what it already has: the NPU kernel driver and its NPU libraries, lent read-only.
-2. **Change one thing at a time.** Each step adds exactly one new unknown, so when something fails we know which layer broke ([34](#34-the-ladder-log-predictions-vs-results)).
-3. **Prove, don't claim.** A label saying "NPU" is not evidence. We collect evidence from four independent sources ([30.3](#303-the-evidence-ladder)).
-
-What changed, file by file:
-
-| File | What it does |
-|---|---|
-| `training/quantize.py` | Makes the int8 twin of the trained model, calibrates its threshold, compares float vs int8 |
-| `src/model.py` | `InferenceEngine`: chooses the runtime, loads the NPU delegate, falls back to the CPU, records evidence |
-| `src/detector.py` | Converts float ↔ int8 at the model's edges, so scores are always computed in float |
-| `src/benchmark.py` | Times the same model on CPU and NPU with the same input |
-| `src/npu_evidence.py` | Reads the driver version, the NPU graph-cache files and (optionally) driver counters |
-| `src/main.py`, `src/mqtt_client.py` | Status, command and benchmark topics; Last Will |
-| `Dockerfile.npu` | The NPU image: Python 3.12 on Debian trixie, our application, and LiteRT as a fallback runtime |
-| `tools/npu_entrypoint.sh` | At every start, links the device's NPU libraries into the container and checks that nothing is missing ([27.4](#274-the-entrypoint-borrow-only-the-npu-libraries)) |
-| `docker-compose.npu.yml` | Override that gives the container the NPU (device node, read-only libs, cache volume) |
-| `tools/npu_check.py` | One-shot proof: "can this container run our model on the NPU?" |
-| `FTOptix/.../NpuStatusManager.cs`, `NpuModelBuilder.cs` | HMI side: evidence variables and the Benchmark button ([32](#32-the-factorytalk-optix-proof-panel)) |
-
-## 27. What an NPU Needs
-
-### 27.1 The NPU in one paragraph
-
-[10.7](#107-cpu-npu-runtime-and-delegates) introduced the idea: the CPU is a Swiss-army knife, the NPU a power drill. The drill has two quirks that drive everything in this part:
-
-- **It works in 8-bit integers.** It multiplies small whole numbers very fast. A float32 model must first be translated into integers ([28](#28-quantization-on-our-own-model)).
-- **It sits behind a driver.** Our program cannot touch the hardware. It asks a chain of libraries, which ask a kernel driver, which programs the NPU.
-
-### 27.2 The chain, from Python to silicon
-
-One `interpreter.invoke()` in our detector travels through this chain. The boxes say who provides each piece:
-
-```mermaid
-flowchart TB
-  subgraph IMG["In our image"]
-    A["detector: Python 3.12 + numpy + paho-mqtt"]
-    L["ai-edge-litert 1.2.0 (fallback runtime)"]
-  end
-  subgraph LENT["Lent by the device, read-only (from its /usr/lib)"]
-    R["tflite_runtime 2.16.2 (Python module)"] --> T["libtensorflow-lite.so.2.16.2 (TFLite runtime + XNNPACK)"]
-    T -. "load_delegate()" .-> B["libvx_delegate.so (VX delegate)"]
-    B --> T
-    B --> V["libtim-vx.so (TIM-VX + OVXLIB)"]
-    V -- "OpenVX API (public standard)" --> O["libOpenVX.so.1 (+ OpenVXU)"]
-    O --> G["libGAL.so"]
-    O --> S["libVSC, libCLC, libArchModelSw, libNNArchPerf, kernel binaries"]
-  end
-  subgraph KERNEL["The device's kernel (shared by every container)"]
-    D["galcore driver, reached through /dev/galcore"]
-  end
-  A --> R
-  G -- "ioctl (private protocol)" --> D --> E["NPU hardware (VIP8000)"]
-```
-
-Only the top box is ours. Everything that touches the NPU, from the Python module down, comes from the device. The two labeled arrows are where the pieces speak a *public* and a *private* language; [27.7](#277-host-or-container-where-each-moving-part-belongs) shows why that difference decides what could ever move into the image.
-
-### 27.3 Every module, library and driver
-
-Read the table top-down: each row uses the row below it.
-
-| Piece | What it is | What it does for us | Where it comes from |
-|---|---|---|---|
-| **Our detector** (`src/`) | Python application | Reads sensor windows from MQTT, calls the model, publishes alerts and evidence | Image |
-| **paho-mqtt, PyYAML, scikit-learn** | Python packages | MQTT client; reads `config.yaml`; the MinMaxScaler that maps sensor values to [0, 1] | Image (pip) |
-| **numpy** 1.26 | Python package | Holds every tensor we pass in and out. TFLite's Python bridge is compiled against numpy's C interface, so the major version is pinned (`<2.0`) | Image (pip) |
-| **`tflite_runtime`** 2.16.2 | Python package: `interpreter.py` (the `Interpreter` and `load_delegate` API) plus `_pywrap_tensorflow_interpreter_wrapper.so`, a compiled bridge | Turns Python calls into calls on the C++ runtime. The bridge is machine code built for CPython **3.12**, so the image's Python must be 3.12 ([27.5](#275-which-tflite-runtime)) | **Device**, lent read-only from `/usr/lib/python3.12/site-packages` |
-| **`ai-edge-litert`** 1.2.0 | Google's newer packaging of the same runtime (LiteRT), with its own TFLite copy inside | The fallback: runs the model on the CPU when the device has no `tflite_runtime`, and is runtime B of [27.5](#275-which-tflite-runtime) | Image (pip) |
-| **`libtensorflow-lite.so.2.16.2`** | The TensorFlow Lite C++ runtime | Loads the `.tflite` file, plans memory, runs each op. Any op not taken by a delegate runs here, on the CPU | **Device**, lent read-only |
-| **XNNPACK, ruy** | CPU math libraries inside TFLite | Hand-tuned ARM NEON kernels and matrix multiplication. They are why our model takes only 10 µs on the CPU ([31](#31-why-the-npu-may-be-slower-here)) | Inside `libtensorflow-lite` |
-| **`libvx_delegate.so`** | A TFLite **external delegate**: a plug-in loaded at run time through the C function `tflite_plugin_create_delegate` | Looks at the model's graph, claims the ops the NPU supports, and rewrites them as TIM-VX operations. It reports "5 of 5 nodes" to TFLite ([29.2](#292-catching-the-c-evidence)). It is linked against the device's `libtensorflow-lite.so.2.16.2` | **Device**, lent read-only |
-| **`libtim-vx.so`** | TIM-VX ("Tensor Interface Module for OpenVX"), VeriSilicon's C++ library, with **OVXLIB** inside | Translates neural-network operations (fully connected, ReLU, sigmoid…) into an OpenVX graph. The `OVXLIB_VERSION 1.2.14` lines in [29.2](#292-catching-the-c-evidence) come from here | **Device**, lent read-only |
-| **`libOpenVX.so.1`**, `libOpenVXU.so` | VeriSilicon's implementation of **OpenVX**, a public standard API (from the Khronos Group) for graphs of image and neural-network operations | `vxVerifyGraph` compiles the whole graph into NPU instructions (the 65 ms warm-up); `vxProcessGraph` runs it (each `invoke`). It also writes and reads the `.nb` graph cache ([30.3](#303-the-evidence-ladder)) | **Device**, lent read-only |
-| **`libGAL.so`** | The Graphics Abstraction Layer: the user-space half of the Vivante driver | Allocates memory the NPU can read, fills command buffers, submits them, waits. It speaks to the kernel driver with `ioctl` calls whose data layout is private to one driver release. Its version string is our `GalcoreVersion` ([32.2](#322-the-variables-in-modelnpu)) | **Device**, lent read-only |
-| **`libVSC.so`**, `libCLC.so` | VeriSilicon shader compiler and its OpenCL C front end | Compile small programs for the NPU's programmable cores, used for operations the fixed neural-network engine does not do itself | **Device**, lent read-only |
-| **`libArchModelSw.so`**, `libNNArchPerf.so` | A software model of the NPU's architecture | Used while compiling the graph to estimate the cost of each layout and choose how to split work | **Device**, lent read-only |
-| `libNNVXCBinary*`, `libOvx12VXCBinary*`, `libNNGPUBinary*`, `libOvxGPUVXCBinary*` | Libraries of pre-compiled kernels for this chip | Save compiling common kernels at run time. Not every device has all of them; the entrypoint links whichever exist | **Device**, lent read-only |
-| **`galcore`** | The Vivante GPU/NPU **kernel driver** (version 6.4.11 on our device) | Owns the hardware: power, interrupts, memory mapping, scheduling the GPU core (GC7000) and the NPU core (VIP8000) between processes. Its `/sys/kernel/debug/gc/clients` list is our hardware evidence ([30.3](#303-the-evidence-ladder)) | **Device kernel** |
-| **`/dev/galcore`** | A device file: the door into the kernel driver | Every user-space request enters the kernel here. A container sees it only if it is passed with `--device` | **Device**, passed in |
-| **`&ml_vipsi` in the device tree** | The hardware description the kernel reads at boot | `status = "okay"` switches the NPU block on, so `galcore` finds it. Without it there is no NPU for any program | **Device firmware** |
-| **Python 3.12, glibc 2.41, libstdc++** | The base image (Debian *trixie*) | Run everything above, including the lent libraries ([27.6](#276-the-c-runtime-rule)) | Image |
-
-Two packages of NXP's Yocto build supply the lent rows. **`imx-gpu-viv`** is the Vivante user-space driver: OpenVX, GAL, VSC, CLC, the architecture models and the kernel binaries. It is released together with the `galcore` kernel driver, one version for both (6.4.11 here). The machine-learning packages (`tensorflow-lite`, `tensorflow-lite-vx-delegate`, `tim-vx`) sit on top of it. Our device's firmware includes both groups. That is why borrowing works here, and why it is the first thing to check on another device.
-
-### 27.4 The entrypoint: borrow only the NPU libraries
-
-The simple idea, "point the container at the device's whole `/usr/lib`", fails. That folder also contains the device's C library (glibc), C++ library (libstdc++), Python… Our image has its own copies. Two copies of glibc in one process crash in confusing ways.
-
-So `tools/npu_entrypoint.sh` does surgery at every start. The whole `/usr/lib` is mounted at `/host/usr/lib` (read-only: nothing can be changed), but only the NPU libraries are linked into `/opt/npu/lib`, and only that folder is put first on the library search path:
-
-```sh
-NPU_HOST_LIBS="libvx_delegate.so* libtim-vx.so* libOpenVX.so* libOpenVXU.so* libGAL.so* libVSC.so* ... libtensorflow-lite.so*"
-for pattern in $NPU_HOST_LIBS; do
-    for lib in "$HOST_LIB_DIR"/$pattern; do
-        ln -sf "$lib" "$NPU_LIB_DIR/$(basename "$lib")"
-```
-
-Then it runs `ldd` on the delegate. `ldd` lists every library the delegate needs, directly or through TIM-VX, and where the loader finds it. A line ending in `not found` names exactly what is still missing, *before* Python starts. That turns a cryptic crash into a one-line diagnosis. With `NPU_DEBUG=1` it prints the full list, which shows the split of [27.2](#272-the-chain-from-python-to-silicon) on the real system:
-
-```text
-[npu] linked 20 host libraries from /host/usr/lib into /opt/npu/lib
-[npu] every dependency of /opt/npu/lib/libvx_delegate.so resolves
-	libtensorflow-lite.so.2.16.2 => /opt/npu/lib/libtensorflow-lite.so.2.16.2
-	libtim-vx.so => /opt/npu/lib/libtim-vx.so
-	libstdc++.so.6 => /lib/aarch64-linux-gnu/libstdc++.so.6
-	libgcc_s.so.1 => /lib/aarch64-linux-gnu/libgcc_s.so.1
-	libc.so.6 => /lib/aarch64-linux-gnu/libc.so.6
-	libm.so.6 => /lib/aarch64-linux-gnu/libm.so.6
-	libOpenVX.so.1 => /opt/npu/lib/libOpenVX.so.1
-	libVSC.so => /opt/npu/lib/libVSC.so
-	libGAL.so => /opt/npu/lib/libGAL.so
-	libArchModelSw.so => /opt/npu/lib/libArchModelSw.so
-	libNNArchPerf.so => /opt/npu/lib/libNNArchPerf.so
-[npu] using the host's tflite_runtime (/host/usr/lib/python3.12/site-packages/tflite_runtime)
-[npu] /dev/galcore is present
-```
-
-Read the right-hand side. Every NPU library resolves to `/opt/npu/lib`, which means it was lent by the device. The C and C++ runtime (`libc`, `libstdc++`, `libm`, `libgcc_s`) resolves to `/lib/aarch64-linux-gnu`, which means it is the image's own. That is the split of the table above, and the reason the C-runtime rule ([27.6](#276-the-c-runtime-rule)) exists: the device's libraries run on the image's glibc.
-
-Last, it borrows the device's Python runtime package the same way: `/host/usr/lib/python3.12/site-packages/tflite_runtime` is linked into `/opt/npu/lib/python`, which goes first on `PYTHONPATH`. `src/model.py` tries `tflite_runtime` before `ai_edge_litert`, so this borrowed runtime wins whenever it is present ([27.5](#275-which-tflite-runtime)).
-
-### 27.5 Which TFLite runtime
-
-**What we assumed, and what the device said.** The plan assumed TFLite 2.19, from a folder name seen earlier. The read-only probe found `/usr/bin/tensorflow-lite-2.16.2/` instead, and `ldd /usr/lib/libvx_delegate.so` settled it:
-
-```text
-libtensorflow-lite.so.2.16.2 => /usr/lib/libtensorflow-lite.so.2.16.2
-libtim-vx.so => /usr/lib/libtim-vx.so
-libOpenVX.so.1 => /usr/lib/libOpenVX.so.1
-...
-```
-
-The delegate is not a stand-alone plug-in: it is **linked against the device's own TFLite library**. That gives two ways to pair it with a runtime:
-
-| Option | Runtime in the process | Risk |
-|---|---|---|
-| **A** (default) | The device's `tflite_runtime` 2.16.2, borrowed read-only. It uses the *same* `libtensorflow-lite.so.2.16.2` as the delegate | None known: this is the pairing NXP builds and tests. Needs the image's Python = the device's Python (3.12) |
-| **B** (`HOST_TFLITE_RUNTIME=0`) | The image's `ai-edge-litert` 1.2.0, which contains its own TFLite copy | Two TFLite copies in one process. They meet only through the delegate's C interface, which is stable, so it *can* work, but nobody tests that combination |
-
-We measured both on the device ([34](#34-the-ladder-log-predictions-vs-results)): **both ran the model on the NPU, with outputs identical to the CPU**. We keep A as the default because it is the tested pairing. B stays in the image for two reasons: it is the CPU runtime when the device has no `tflite_runtime`, and it is a live experiment that teaches why ABI pairing matters.
-
-**Why "linked against the same library" matters.** A delegate receives pointers to TFLite's internal structures (tensors, nodes, the context). If the runtime that owns those structures is a different TFLite version, a field may sit at a different offset, and the delegate reads garbage. Same library, same layout, no doubt.
-
-`ai-edge-litert` 1.2.0 was originally picked by date (published one day after TensorFlow 2.19.0), to match the 2.19 we expected. The image's `LITERT_VERSION` build argument selects another one.
-
-### 27.6 The C-runtime rule
-
-The lent libraries were compiled by NXP against the device's glibc. glibc is **backward compatible only**: a program built against an older glibc runs on a newer one, never the reverse. So the image's glibc must be **at least as new as the device's**. Measured with `ldd --version`: the device has glibc **2.39**; `Dockerfile.npu` uses Debian *trixie* (glibc 2.41), while Part 1's image uses *bookworm* (glibc 2.36, too old for the lent libraries).
-
-Newer glibc brought one surprise. glibc 2.41 refuses to load a library marked as needing an *executable stack* (a memory area that is both writable and executable, an old security weakness). The LiteRT wheel carries that mark by accident, and its import failed with `cannot enable executable stack`. The image clears the flag with `patchelf --clear-execstack` when it is built. The library does not actually need it, and the image is safer without it.
-
-### 27.7 Host or container: where each moving part belongs
-
-Today the device lends everything from `tflite_runtime` down. It works, and it is the simplest design that keeps rule 1. But it asks a lot of the device: TensorFlow Lite, the VX delegate, TIM-VX, and a `tflite_runtime` compiled for **exactly** our Python version. On an open Yocto image like ours, they are there. A closed product image, built without the machine-learning packages, would leave the detector on the CPU, and our image's Python version would always be chained to the firmware's.
-
-So where should the line between host and container be? There are three places where pieces meet, and they differ in one thing: **is the language spoken there public or private?**
-
-**Below OpenVX, the conversation is private.** `libGAL` and `galcore` talk through `ioctl` calls: binary structures whose fields can change between driver releases. NXP builds both halves from the same source tree and tests them only as a pair. And the kernel driver **cannot** come from an image: a container has no kernel of its own, it uses the host's. So the user-space driver must follow the kernel driver, which means it must come from the device. When a firmware update changes the driver, the lent libraries change with it, automatically.
-
-**Above OpenVX, the conversation is public.** TIM-VX calls OpenVX functions such as `vxCreateGraph`, `vxVerifyGraph` and `vxProcessGraph`. OpenVX is a published standard. Everything above it (TIM-VX, the delegate, TFLite, the Python module) can travel inside the image.
-
-**Analogy: a wall socket.** The wiring inside the wall and the socket belong to the building (kernel driver and user-space driver: the electrician installs them together). The socket's shape is a standard (OpenVX). The appliance (our image) can bring its own cable and plug, and work in any building with that socket. Today we borrow the building's extension cord as well; it fits, but not every building has one.
-
-| | Borrow everything from `tflite_runtime` down (**current**) | Line at OpenVX (**recommended next step**) | Everything in the image |
-|---|---|---|---|
-| The device must have | `galcore`, the Vivante driver libs, **plus** TFLite, the VX delegate, TIM-VX and a `tflite_runtime` for our Python | `galcore` and the Vivante driver libs (`imx-gpu-viv`) only | Only `galcore`, but… |
-| Works on a closed Yocto image without the ML packages | No: CPU fallback | Yes | In theory |
-| Our Python version | Chained to the device's (3.12) | Our choice | Our choice |
-| TFLite version | Whatever the firmware ships; follows firmware updates | Pinned in the image, the same on every device | Pinned |
-| Breaks when | The firmware drops the ML packages or changes Python | The driver release changes, and the image was compiled for another one | Any driver update: the image's `libGAL` would speak an old `ioctl` dialect to a new kernel driver |
-| Build effort | `pip install` only | Cross-compiling TFLite, the delegate and TIM-VX (about 25 min) | Same, plus NXP's licensed driver binaries inside the image |
-
-**The recommendation:** the host provides the kernel driver and the Vivante user-space driver, nothing more; the container carries everything above OpenVX. The last column is a trap: it looks the most independent, but it welds the image to one kernel driver release while making the mismatch invisible until run time.
-
-**What we learned trying it.** We built that image: TFLite 2.16.2, the VX delegate and TIM-VX compiled from NXP's sources at the commits of the device's BSP release, with only the Vivante driver lent. It taught the fine print of "OpenVX is a public standard".
-
-TIM-VX uses OpenVX's standard functions *and* VeriSilicon's neural-network extensions (`vxFullyConnectedLayer`, `vxTensorSelectLayer`…). Extensions are vendor-defined, and each driver release adds some. One header says what a release can do: `VX/vx_khr_compatible.h`, a list of switches like `#define VX_TENSOR_SELECT_VX_SUPPORT 1`. TIM-VX reads the switches and compiles each feature in or out.
-
-The first attempt was compiled against the headers bundled with TIM-VX, from driver **6.4.15**; the device runs **6.4.11**. We started it with `LD_BIND_NOW=1`, which makes the loader look up *every* function at start-up instead of at first use, so a missing one shows at once instead of crashing some day in the middle of a run. It failed immediately:
-
-```text
-NPU requested but unusable (OSError: /opt/npu/lib/libtim-vx.so: undefined symbol: vxTensorSelectLayer); running on CPU
-```
-
-The detector fell back to the CPU, as designed ([29.1](#291-inferenceengine-try-the-npu-fall-back-remember-why)). Then a diff of two lists showed the whole gap: the 109 OpenVX functions that `libtim-vx.so` imports, against the 2 426 symbols the device's `libOpenVX.so.1` exports (both read with `nm -D`). Exactly two were missing: `vxTensorSelectLayer` and `vxInvalidateHandleVSI`. Comparing the two releases' `vx_khr_compatible.h` showed more: 6.4.15 switches on 15 features that 6.4.11 does not have, a few of which change *how* existing functions are called. Turning off only the two missing functions would have hidden the problem, not solved it.
-
-The fix is headers from the matching release. VeriSilicon's public TIM-VX repository kept, at tag `v1.1.57`, the SDK of driver **6.4.11**. With those headers, and with TIM-VX linked using `-z defs` (every function must be found at link time, so a future mismatch fails on the build machine, not on the device), TIM-VX compiled and linked cleanly. NXP's own driver package (`imx-gpu-viv-6.4.11`) contains the real ARM headers too, but downloading it requires accepting NXP's license agreement.
-
-**Status.** That version is not finished: the full image was not completed and validated on the device, so this part keeps the borrowed design, which is measured end to end. The prototype left three rules for whoever finishes it:
-
-1. **Compile for the driver release you will meet.** One image per driver release, with the release written in the Dockerfile. Check the device's release first (`GalcoreVersion` on the panel shows it).
-2. **Find missing functions before the device does.** Link with `-z defs`, and start a check container with `LD_BIND_NOW=1`.
-3. **Ask the firmware for the driver, not for TensorFlow.** On a closed Yocto image, the requirement for the NPU is `galcore` with `&ml_vipsi` enabled, plus `imx-gpu-viv`. Everything else is the application's business.
-
-## 28. Quantization on Our Own Model
-
-[10.6](#106-quantization) explained scale and zero point with a ruler. Here is the ruler of **our** model.
-
-### 28.1 From float to int8, without retraining
-
-`training/quantize.py` reads the weights out of `models/autoencoder.tflite`, rebuilds the identical Keras network (largest difference 2.98 × 10⁻⁷, a rounding error) and converts it to full int8. It changes only one thing, how the numbers are stored. So any difference between the two files is caused by quantization alone.
-
-The converter needs a **representative dataset**: real inputs, to measure the range of every intermediate value. We pass the scaled training windows, exactly what the model sees in production. Ranges measured on unrealistic data would put the ruler's marks in the wrong place.
-
-### 28.2 The ruler of our input
-
-Measured with the interpreter:
-
-```text
-input  int8  scale=0.003922  zero_point=-128  covers [0.000, 1.000]
-output int8  scale=0.003906  zero_point=-128  covers [0.000, 0.996]
-weights (64, 10)  int8  per-tensor
-weights (16, 64)  int8  per-tensor
-weights (64, 16)  int8  per-tensor
-weights (10, 64)  int8  per-tensor
-```
-
-The scale is 0.003922 = 1/255, and the zero point −128 sits at 0.0. So the 256 marks cover exactly [0, 1], the output range of the MinMaxScaler. The converter found this by itself from the representative data.
-
-Worked examples, with `q = round(x / scale) + zero_point` and `back = (q − zero_point) × scale`:
-
-| Real value x | Stored q | Read back | Error |
-|---|---|---|---|
-| 0.0 | −128 | 0.000000 | 0 |
-| 0.25 | −64 | 0.250980 | 0.00098 |
-| 0.5 | −1 | 0.498039 | 0.00196 |
-| 0.731 | 58 | 0.729412 | 0.00159 |
-| 1.0 | 127 | 1.000000 | 0 |
-| 1.2 | 127 (clipped) | 1.000000 | 0.2 |
-
-The error is at most half a mark (0.00196). The last row matters: a sensor value **outside** the training range saturates at the edge of the ruler. The float model would have seen 1.2; the int8 model sees 1.0. Detection still works, because the score is computed against the original float input (below), so a saturated input still differs from the reconstruction.
-
-### 28.3 Where the conversion happens
-
-The int8 model takes and returns int8 numbers. `src/detector.py` translates at the edges, using the scale and zero point stored in the model file:
-
-```python
-q = np.clip(np.round(x / scale) + zero_point, -128, 127)   # float -> int8, before invoke()
-y = (q_out.astype(np.float32) - zero_point) * scale         # int8 -> float, after
-score = mean((x - y) ** 2)                                  # always in float, for both models
-```
-
-The same code serves both files. For the float model there is no scale, and the translation is skipped.
-
-### 28.4 Per-tensor, and a separate threshold
-
-TFLite quantizes `Dense` weights **per-channel** by default (one ruler per output neuron). Reports for this chip say the NPU prefers **per-tensor** (one ruler per matrix) ([19.4](#194-how-the-npu-will-be-used), Step 3). `quantize.py` asks the converter for per-tensor through a flag whose name begins with `_experimental`, so a future TensorFlow may change it. For MoveNet, per-tensor destroyed accuracy. So we measured instead of assuming:
-
-| | float32 | int8 per-tensor | int8 per-channel |
-|---|---|---|---|
-| File size | 16 544 B | 7 064 B | 10 648 B |
-| Threshold | 0.010150 | 0.010236 | (own) |
-| Faults caught (100 sustained-fault windows) | 100 | 100 | 100 |
-| False alarms (200 normal windows) | 10 | 10 | 10 |
-| Decisions different from float32 | — | **0** | **0** |
-
-Why its own threshold? Rounding adds a small error to every reconstruction, so "normal" scores are slightly larger (0.010236 vs 0.010150). The float threshold would raise false alarms slowly over time. `quantize.py` therefore recalibrates the three-sigma threshold ([3.2](#32-the-math)) on the int8 model's own scores and writes `models/threshold_int8.json`. `config.yaml` keeps each model with its threshold:
-
-```yaml
-variants:
-  float32: { model_path: models/autoencoder.tflite,      threshold_path: models/threshold.json }
-  int8:    { model_path: models/autoencoder_int8.tflite, threshold_path: models/threshold_int8.json }
-precision: auto   # int8 when use_npu is true, float32 otherwise
-```
-
-The gate passed with zero decision changes, so per-tensor is the default.
-
-## 29. The NPU-Aware Detector
-
-### 29.1 `InferenceEngine`: try the NPU, fall back, remember why
-
-`src/model.py` wraps one TFLite interpreter plus the facts that prove where it runs:
-
-```python
-if use_npu:
-    try:
-        delegate = load_delegate(vx_delegate_path)
-        self.interpreter = Interpreter(model_path=model_path, experimental_delegates=[delegate])
-        self.interpreter.allocate_tensors()
-        self.warmup_ms = self._timed_zero_run()   # first invoke: the NPU compiles the graph here
-        self.accelerator = "npu"
-    except Exception as exc:
-        self.npu_error = f"{type(exc).__name__}: {exc}"
-        self.interpreter = None
-if self.interpreter is None:
-    self.interpreter = Interpreter(model_path=model_path)   # CPU, same model file
-```
-
-Three details, each for a reason:
-
-- **The warm-up `invoke()` is inside the `try`.** The NPU compiles the graph at the first inference, and a mismatched driver fails exactly there. Outside the `try`, that failure would crash the detector instead of falling back.
-- **`accelerator` becomes `"npu"` only after a successful inference.** Loading the delegate is not enough proof.
-- **The fallback uses the same int8 file.** The threshold therefore still matches the model.
-
-The runtime is chosen in the order `tflite_runtime` → `ai_edge_litert` → `tensorflow`: whichever imports first. In the NPU container that is the device's `tflite_runtime` 2.16.2, borrowed by the entrypoint, because it shares its TFLite library with the delegate ([27.5](#275-which-tflite-runtime)). With `HOST_TFLITE_RUNTIME=0`, or on a laptop, LiteRT runs the same model.
-
-### 29.2 Catching the C++ evidence
-
-When a delegate takes over part of a graph, many TFLite builds print a line like:
-
-```text
-INFO: Replacing 5 out of 5 node(s) with delegate (Vx Delegate) node, yielding 1 partitions.
-```
-
-That is evidence, but it is printed by C++ code directly to a file descriptor, below Python's `sys.stdout`/`sys.stderr`. `capture_native_output()` temporarily redirects descriptors 1 and 2 into a file, keeps the lines, and echoes them to the real log. `delegation_summary()` turns them into `{"delegate": "Vx Delegate", "nodes": 5, "of": 5}`. Our graph has 5 nodes: 4 `FULLY_CONNECTED` and 1 `LOGISTIC` (the sigmoid). "5 out of 5" would mean the whole model runs on the NPU; "4 out of 5" would mean the sigmoid stays on the CPU, and data travels CPU → NPU → CPU every inference.
-
-**Two surprises from the device**, both found by measuring:
-
-1. **The device's TFLite 2.16.2 does not print the "Replacing" line at all.** So the code also reads the graph itself (`graph_delegation()`). After a delegate is applied, the interpreter lists the original ops *plus* one `DELEGATE` node per partition:
-
-   ```text
-   ['FULLY_CONNECTED', 'FULLY_CONNECTED', 'FULLY_CONNECTED', 'FULLY_CONNECTED', 'LOGISTIC', 'DELEGATE']
-   ```
-
-   An original op belongs to the partition if it lies on a path from the `DELEGATE` node's inputs to its outputs. On the device: `Vx Delegate: 5/5 nodes`.
-2. **The VX delegate writes its own lines (`INFO: Vx delegate: ...`) to stdout, not stderr.** We found it by running the check twice, once with `2>/dev/null` and once with `>/dev/null`. That is why the capture covers both descriptors, and calls C's `fflush()` before restoring them: when stdout is not a terminal, C keeps it in a buffer that would otherwise be written after the capture ends.
-
-`TF_CPP_MIN_LOG_LEVEL=3` in Part 1's compose file hides INFO lines. The NPU override sets it to `0`.
-
-**Going one level deeper (lab only).** The NPU's own graph compiler, OVXLIB, can describe what it built. With `VSI_NN_LOG_LEVEL=4` on the device it prints every NPU node:
-
-```text
-I [vsi_nn_CreateGraph:1327]OVXLIB_VERSION==1.2.14
-D [setup_node:535]Setup node id[8] uid[30000] op[DATACONVERT]
-D [print_tensor:166]in(0) : ... fmt[i8 ] qnt[ASM zp=-128, scale=0.003922]
-D [print_tensor:166]out(0): ... fmt[u8 ] qnt[ASM zp=  0, scale=0.003922]
-D [setup_node:535]Setup node id[0] uid[1] op[FCL2]
-D [setup_node:535]Setup node id[1] uid[2] op[RELU]
-...
-D [setup_node:535]Setup node id[7] uid[8] op[SIGMOID]
-D [setup_node:535]Setup node id[9] uid[30001] op[DATACONVERT]
-```
-
-Read it like a recipe. Our 5 TFLite ops became 4 `FCL2` (fully connected), 3 `RELU` (TFLite had fused the ReLU into each FULLY_CONNECTED; the NPU wants it as a separate step) and 1 `SIGMOID`. And two `DATACONVERT` nodes appear at the edges: this NPU prefers **uint8** (0…255) over int8 (−128…127). Same ruler, shifted: int8 with zero point −128 and uint8 with zero point 0 describe exactly the same real numbers, so the conversion just adds 128 to every byte. The weights were converted the same way (`fmt[u8] zp=128`).
-
-## 30. Evidence over MQTT
-
-### 30.1 Topics
-
-| Topic | Direction | Retained | Content |
-|---|---|---|---|
-| `anomaly/paperclip/alerts` | detector → HMI | no | As in Part 1, plus `accelerator`, `precision`, `inference_ms` for every window |
-| `anomaly/paperclip/status` | detector → HMI | **yes** | Where the model runs and why: accelerator, NPU error, runtime, delegate, delegation, warm-up, driver version, graph-cache files |
-| `anomaly/paperclip/cmd` | HMI → detector | no | `{"cmd": "benchmark", "runs": 1000}` (capped at 5000) |
-| `anomaly/paperclip/benchmark` | detector → HMI | no | CPU vs active engine: p50, p95, largest output difference |
-
-The full payloads are documented in the `src/mqtt_client.py` docstring. The alert payload only **adds** fields, so the existing `AnomalyFeedbackManager`, which reads `is_anomaly`, keeps working.
-
-### 30.2 Retained status and the Last Will
-
-The status is **retained**: the broker keeps the last copy and gives it to anyone who subscribes later. FactoryTalk Optix can start after the detector and still see the badge at once. The same idea as the gesture service ([15.4](#154-retained-status-and-the-last-will)).
-
-A retained "online, NPU" would lie forever if the detector crashed. So the detector registers a **Last Will** at connect time: `{"state": "offline"}`, retained, same topic. If the connection dies without a goodbye, the broker publishes the will itself, and the HMI badge turns to *offline*.
-
-### 30.3 The evidence ladder
-
-Each rung is harder to fake than the one below. A strong proof uses several.
-
-| Rung | Evidence | Who produces it | Fooled by |
-|---|---|---|---|
-| 1 | `"accelerator": "npu"` | Our code | A bug in our code |
-| 2 | `Vx Delegate: 5/5 nodes`: TFLite's "Replacing N out of M" line, or the `DELEGATE` node in the interpreter's own graph | TFLite itself | Nothing in our code, but it says only that the delegate *accepted* the nodes |
-| 3 | A `*.nb` file in the graph cache | The NPU driver stack | Nothing: OpenVX writes it only after compiling the graph *for the NPU*. Measured: 54 976 bytes, and the next start's warm-up drops from about 65 ms to 16 ms because the compilation is skipped |
-| 4 | The kernel driver's own bookkeeping lists our process as an NPU client, with memory on the NPU core | The kernel driver | Nothing. Measured: `/sys/kernel/debug/gc/clients` lists `python`; `/proc/<pid>/cgroup` puts it in `docker-9c2e699aadaa…`, the detector container; `/proc/<pid>/fd` shows `/dev/galcore` open; and `/sys/kernel/debug/gc/database` lists that process with `VideoMemory` records on **GPU 1**, which `gc/info` names as the VIP8000 NPU (GPU 0 is the GC7000 graphics core). Root-only, so a host lab check from an SSH shell |
-| 5 | **Negative control:** with `USE_NPU=false` rungs 1–4 disappear | The experiment | — Measured: status `cpu` / `float32`, no delegate, benchmark `NPU not requested`, and `gc/clients` **empty** |
-
-**Why rung 4 is only a lab check.** `/sys/kernel/debug` is readable only by the host's root. Our rootless container runs as uid 985, so it gets *Permission denied*. Opening debugfs to the container would need `--privileged` or a rootful daemon, and we refuse both. So the panel shows rungs 1–3, and rung 4 is checked from an SSH shell.
-
-**A counter that lied (to us).** We planned rung 4 as "the NPU's **On** time grows during a benchmark", from `/sys/kernel/debug/gc/idle`. We measured it three times around the same 5 000-run benchmark: it grew by **601 ms** once, and by **0 ms** twice, even when read again 1 s later. The file has one set of numbers for the whole GPU+NPU block, not one per core, and the driver seems to update it only at some power-state changes (`poweroff_timeout` is 300 ms). The lesson: **evidence you cannot explain is not evidence.** We replaced it with the process list above, which says *who* uses the NPU, without timing problems.
-
-The graph cache is enabled by NXP's variables `VIV_VX_ENABLE_CACHE_GRAPH_BINARY=1` and `VIV_VX_CACHE_BINARY_GRAPH_DIR` ([19.4](#194-how-the-npu-will-be-used)). `docker-compose.npu.yml` points the folder to a named volume, so the file survives restarts and later starts skip the compilation.
-
-The **negative control** is what makes the badge trustworthy. A panel that shows "NPU" whatever happens proves nothing. A panel that changes to "CPU", loses the delegation line and the `.nb` file when we switch the NPU off, proves it is reading reality.
-
-## 31. Why the NPU May Be Slower Here
-
-**Prediction: for our model, the NPU will be slower than the CPU. Result: confirmed, 15 times slower per inference.** This is not a failure; it is the most important lesson of this part.
-
-Count the work. Our network is 10 → 64 → 16 → 64 → 10:
-
-```
-10×64 + 64×16 + 16×64 + 64×10 = 640 + 1024 + 1024 + 640 = 3 328 multiply-adds per inference
-```
-
-The NPU is rated at 2.3 TOPS: it could do our math thousands of times in a microsecond. But each inference also costs a fixed **trip**: copy the input into memory the NPU can read, ask the driver through `/dev/galcore`, wait for the NPU, copy the output back. That trip costs a fixed amount of time, however small the math.
-
-**Analogy: a moving truck for one box.** Moving one box across town, you carry it in your hands (CPU). Hiring a truck (NPU) is faster *per box* but costs an hour of booking and loading. For one box the hands win; for a house the truck wins.
-
-The laptop gave the scale: one int8 inference on the CPU takes **0.029 ms**. We predicted 0.05–0.2 ms on the Cortex-A53 and 0.2–1 ms for one trip to the NPU. Measured on the OptixEdge (1 000 runs, same input, only `invoke()` timed, `tflite_runtime` 2.16.2):
-
-| Model | CPU p50 | NPU p50 | NPU first run (compiles the graph) |
-|---|---|---|---|
-| int8 | **0.0106 ms** | **0.157 ms** (15× slower) | 72 ms |
-| float32 | 0.0129 ms | 0.248 ms | 67 ms |
-
-Both predictions were too pessimistic for the CPU: the A53 with XNNPACK does our 3 328 multiply-adds in about 10 µs. The NPU trip, about 0.15 ms, landed inside the predicted range. **The truck for one box, measured.**
-
-Now the detector's real path, `engine.reconstruct()`, which also converts float → int8, copies the input in, copies the output out and converts back (200 runs, inside the container):
-
-| Path | CPU p50 | NPU p50 | NPU ÷ CPU |
-|---|---|---|---|
-| `reconstruct()`, `npu_check.py` (200 runs) | 0.347 ms | 0.766 ms | 2.2× |
-| `reconstruct()`, the running detector's benchmark from MQTT (5 000 runs) | 0.347 ms | 0.870 ms | 2.5× |
-| The same, a later run after a restart | 0.350 ms | 0.656 ms | 1.9× |
-
-The rows differ because the running detector shares the CPU with its MQTT thread, and because the NPU trip varies between runs (0.656 to 0.870 ms for the same benchmark): a single number would hide that spread, which is why the panel shows p95 too. In both cases the largest output difference between CPU and NPU was **0.0**: the same integers came out of both engines.
-
-The alerts report one inference each: 1.3–1.9 ms on the NPU, more than the benchmark's p50. A single call after a pause starts with cold CPU caches and may find the NPU powered down (`poweroff_timeout`: 300 ms). It is still far below the 30 s between windows.
-
-A second lesson hides here: **the Python around the model costs 30 times more than the model itself** on the CPU (0.347 vs 0.0106 ms). Whoever optimizes the "AI" part first is optimizing the wrong thing. Either way, one inference every 30 s costs less than a millisecond: both engines are far more than fast enough.
-
-And a surprise: the delegate also accepted the **float32** model, which we expected it to reject. The VIP8000 can compute in 16-bit floating point, and the driver converts on the fly. It is slower than int8 (0.248 vs 0.157 ms), and its outputs differ slightly from the CPU's (0.5045132 vs 0.50451314: float16 rounding). Quantization is still the right choice for an NPU, but "float does not run at all" was wrong.
-
-So why use the NPU at all? Three reasons:
-
-1. **Proof of the pipeline.** Quantization, delegate, container and evidence are the same for a model 1 000× larger, like MoveNet ([19](#19-performance-and-the-npu-plan)), where the NPU wins clearly.
-2. **CPU left for the HMI.** On the OptixEdge, FactoryTalk Optix shares the CPU. Work moved to the NPU is work the HMI does not wait for.
-3. **Room to grow.** A bigger model (more tags, longer windows, the V2 model in the root `plan.md`) moves toward the truck's side of the trade-off.
-
-## 32. The FactoryTalk Optix Proof Panel
-
-### 32.1 What the NetLogic does
-
-- **`NpuModelBuilder.cs`** (design-time) creates the folder `Model/NPU` with 35 typed variables, once. It never overwrites: running it twice is safe.
-- **`NpuStatusManager.cs`** (runtime) listens to three variables written by MQTT subscriptions, parses the JSON and fills the `Model/NPU` variables the UI binds to. It also exports `RequestBenchmark()`, which publishes `{"cmd":"benchmark","runs":N}` through `MQTTClient.Publish` (QoS 1, never retained, or the detector would re-run the benchmark at every reconnect).
-
-If the status says `offline` (the Last Will), it clears `IsOnNpu`, so a stale NPU badge cannot survive.
-
-### 32.2 The variables in `Model/NPU`
-
-**Why two steps, text then typed variables?** An MQTT subscription can write a whole message into one variable, but only as one string. A badge color needs a Boolean, a bar needs a number. So the subscriptions write the raw JSON into `StatusJson` and `BenchmarkJson`, and `NpuStatusManager` reacts to every change of those strings, reads the fields and writes them into typed variables. The panel binds only to the typed ones. A third input is Part 1's `Model/anomaly_detector_feedback`, which already receives every alert.
-
-```mermaid
-flowchart LR
-  S["anomaly/paperclip/status"] --> SJ["StatusJson"]
-  B["anomaly/paperclip/benchmark"] --> BJ["BenchmarkJson"]
-  A["anomaly/paperclip/alerts"] --> AF["Model/anomaly_detector_feedback"]
-  SJ --> M["NpuStatusManager (parses JSON)"]
-  BJ --> M
-  AF --> M
-  M --> V["typed variables in Model/NPU"] --> UI["panel widgets"]
-  UI -- "Benchmark button: RequestBenchmark()" --> C["anomaly/paperclip/cmd"]
-```
-
-The tables give each variable, the JSON field it comes from, and the value on our device with the NPU running.
-
-**Inputs and settings**
-
-| Variable | Type | Written by | Meaning |
-|---|---|---|---|
-| `StatusJson` | String | MQTT subscription to `anomaly/paperclip/status` | The raw retained status message. Starts as `waiting for detector status ...` |
-| `BenchmarkJson` | String | MQTT subscription to `anomaly/paperclip/benchmark` | The raw result of the last benchmark |
-| `MqttClientPath` | String | Design time (`MQTT/MQTTClient1`) | Which MQTT client node `RequestBenchmark()` publishes with |
-| `CommandTopic` | String | Design time (`anomaly/paperclip/cmd`) | Where the benchmark request is published |
-| `BenchmarkRuns` | Int32 | The operator (default 1000) | How many inferences per engine. `RequestBenchmark()` clamps it to 1–5 000, the same cap the detector applies |
-
-**Where the model runs** (from `anomaly/paperclip/status`, refreshed at every detector start and after each benchmark)
-
-| Variable | Type | JSON field | Meaning | On our device |
-|---|---|---|---|---|
-| `DetectorState` | String | `state` | `online` while the detector is connected; `offline` comes from the Last Will ([30.2](#302-retained-status-and-the-last-will)) | `online` |
-| `Accelerator` | String | `accelerator` | The engine that **actually** ran the warm-up inference: `npu` or `cpu`; set to `offline` when the detector is gone | `npu` |
-| `IsOnNpu` | Boolean | `accelerator == "npu"` | The badge's color. Forced to false when offline | true |
-| `NpuRequested` | Boolean | `npu_requested` | Whether `USE_NPU` asked for the NPU. With `Accelerator`, separates "NPU failed" from "NPU not asked" | true |
-| `NpuError` | String | `npu_error` | Empty when the NPU works. Otherwise the exception text, naming the failing layer ([33.6](#336-troubleshooting)) | empty |
-| `ModelName` | String | `model` | The model file in use | `autoencoder_int8.tflite` |
-| `Precision` | String | `precision` | `int8` or `float32` ([28.4](#284-per-tensor-and-a-separate-threshold)) | `int8` |
-| `Runtime` | String | `runtime` | The TFLite Python package that was imported, and its version ([29.1](#291-inferenceengine-try-the-npu-fall-back-remember-why)) | `tflite_runtime 2.16.2` |
-| `Delegate` | String | `delegate` | Path of the delegate library loaded inside the container; `none (CPU)` when none | `/opt/npu/lib/libvx_delegate.so` |
-| `Delegation` | String | `delegation` | How many of the model's nodes each delegate took ([29.2](#292-catching-the-c-evidence)); `no delegate took any node` on the CPU | `Vx Delegate: 5/5 nodes` |
-| `WarmupMs` | Double | `warmup_ms` | Duration of the first inference, where the NPU compiles the graph | about 66 ms; 16 ms with the graph cache |
-| `Threshold` | Double | `threshold` | The anomaly threshold of the loaded model variant | 0.010236 |
-| `GalcoreVersion` | String | `galcore_version` | The NPU driver's version. The kernel driver's own version file is in sysfs on some devices; on ours it is only in debugfs, readable by root. So the detector falls back to the version string compiled into the lent `libGAL.so` (the user-space half of the same driver release). The prefix says which source was read | `libGAL 6.4.11:745085` |
-| `GraphCacheFiles` | Int32 | `graph_cache.files` | Number of compiled NPU graphs (`*.nb`) in the cache volume ([30.3](#303-the-evidence-ladder)) | 1 |
-| `GraphCacheBytes` | Int32 | `graph_cache.bytes` | Their total size | 54 976 |
-| `GraphCacheNames` | String | `graph_cache.names` | Their file names; `cache disabled` when the cache variables are not set | one `<hash>.nb` |
-| `StartedAt` | String | `started_at` | When the detector process started (UTC) | an ISO time stamp |
-
-**Every window** (from the alerts, about every 30 s)
-
-| Variable | Type | JSON field | Meaning |
-|---|---|---|---|
-| `LastInferenceMs` | Double | `inference_ms` | Time of the last real inference: 1.3–1.9 ms on the NPU, more than the benchmark's p50 because the caches are cold after 30 s ([31](#31-why-the-npu-may-be-slower-here)) |
-| `LastAlertAccelerator` | String | `accelerator` | The engine that computed that window. It proves the NPU is used for *production* windows, not only for the warm-up |
-
-**Benchmark** (from `anomaly/paperclip/benchmark`, after the button)
-
-| Variable | Type | JSON field | Meaning | Measured (5 000 runs) |
-|---|---|---|---|---|
-| `BenchmarkRunning` | Boolean | — | Set true by `RequestBenchmark()`, false when a result arrives. A second click while true is refused | |
-| `BenchRuns` | Int32 | `runs` | Inferences per engine | 5 000 |
-| `BenchCpuP50Ms`, `BenchCpuP95Ms` | Double | `cpu.p50_ms`, `cpu.p95_ms` | Median and 95th-percentile time of `reconstruct()` on the CPU | 0.350, 0.547 ms |
-| `BenchNpuP50Ms`, `BenchNpuP95Ms` | Double | `npu.p50_ms`, `npu.p95_ms` | The same on the active engine; 0 when the NPU is not in use | 0.656, 0.754 ms |
-| `BenchNpuVsCpu` | Double | `npu_vs_cpu_p50` | NPU p50 ÷ CPU p50. Above 1 means the NPU is slower ([31](#31-why-the-npu-may-be-slower-here)) | 1.87 (2.5 in an earlier run) |
-| `BenchMaxOutputDiff` | Double | `max_output_difference` | Largest difference between the CPU and NPU outputs for the same input | 0.0 |
-| `BenchMessage` | String | built by the NetLogic | A sentence for the operator: the ratio explained, `No NPU run: <reason>` (from `npu_unavailable`), or an error | |
-| `BenchFinishedAt` | String | `finished_at` | When the benchmark ended | |
-| `NpuCounterDelta` | String | `counters_before`, `counters_after` | Change of driver counters during the benchmark. Here always `n/a (driver counters not exposed to the container)`: the rootless container cannot read debugfs ([30.3](#303-the-evidence-ladder)) | n/a |
-
-Percentiles, briefly: run the same inference 5 000 times and sort the times. p50 is the one in the middle (the typical case), p95 the one at position 4 750 (a bad but common case). A mean would be dragged up by a few slow runs, when the operating system paused our process.
-
-### 32.3 Reading the panel
-
-| You see | It means |
-|---|---|
-| Badge NPU, delegation `Vx Delegate: 5/5`, a `.nb` file | The whole model runs on the NPU, proven by three independent sources |
-| Badge NPU, delegation `4/5` | The sigmoid stays on the CPU; each inference crosses CPU ↔ NPU twice |
-| Badge CPU, `NpuError` filled | The NPU was requested but failed; the text says at which layer ([33.6](#336-troubleshooting)) |
-| Badge CPU, `NpuError` empty, precision `float32` | The NPU was not requested (`USE_NPU=false`): the negative control |
-| `BenchNpuVsCpu` > 1 | The NPU is slower for this model: expected ([31](#31-why-the-npu-may-be-slower-here)) |
-| `BenchMaxOutputDiff` about 0.004 or less | CPU and NPU compute the same int8 model; differences are at most about one quantization mark. Measured: 0.0 |
-| Badge `?` | No status message has arrived: check the subscription to `anomaly/paperclip/status` and the broker port |
-
-## 33. Deploying to the Device
-
-> ⚠️ The OptixEdge is a production-style device. A deployment creates only Docker objects named `anomaly_detection-*`, which can be removed. Never use `--privileged`, never install packages on the host, never `docker system prune`.
-
-### 33.1 What the container must receive
-
-Whatever tool deploys it, the detector container needs exactly these things from the device, and nothing more:
-
-| What | In the compose file | Why |
-|---|---|---|
-| The image `localhost/anomaly_detection-detector:npu` (arm64) | `image:` with `pull_policy: never` | It is not in a public registry, so it is imported as a file. `never` stops Docker from looking for it online |
-| The NPU's door | `devices: - /dev/galcore:/dev/galcore` | The only way into the kernel driver ([27.3](#273-every-module-library-and-driver)). On our device it is mode 0666, so no extra permission is needed |
-| The device's NPU libraries, read-only | `volumes: - /usr/lib:/host/usr/lib:ro` | The entrypoint links only the NPU libraries and the `tflite_runtime` package from it ([27.4](#274-the-entrypoint-borrow-only-the-npu-libraries)). `:ro` makes the device's files unchangeable from inside |
-| A volume for compiled NPU graphs | `npu-graph-cache:/var/cache/npu` and `VIV_VX_ENABLE_CACHE_GRAPH_BINARY=1`, `VIV_VX_CACHE_BINARY_GRAPH_DIR=/var/cache/npu` | Evidence (the `.nb` file) and a faster restart ([30.3](#303-the-evidence-ladder)) |
-| The switch | `USE_NPU=true` (`false` for the negative control) | Read by `InferenceEngine` ([29.1](#291-inferenceengine-try-the-npu-fall-back-remember-why)) |
-| Native log lines | `TF_CPP_MIN_LOG_LEVEL=0` | Keeps TFLite's INFO lines, which carry delegation evidence ([29.2](#292-catching-the-c-evidence)) |
-| The broker on port 1884 as well as 1883 | `mqtt-broker` `ports: - "1884:1883"` | The FactoryTalk Optix project's `MQTTClient1` connects to `127.0.0.1:1884` |
-
-`docker-compose.npu.yml` adds exactly these lines to Part 1's `docker-compose.yml`. Nothing else is needed: no extra capabilities, no host network, nothing installed. The device must already *have* its NPU stack in `/usr/lib` (the **Device** rows of [27.3](#273-every-module-library-and-driver)); on our OptixEdge it does.
-
-**The image travels as a file.** `docker save` (or `podman save`) writes an image with all its layers into one `.tar` archive, and `docker load` (or Portainer's import) unpacks it into the device's image store. On our OptixEdge that store is on `/persistent`; the root file system had only 20 MB free, so never copy the archive to `/`.
-
-There are two ways to deploy: Portainer in a browser, or the `docker` command on your PC talking to the device.
-
-### 33.2 Option A: Portainer
-
-Portainer is a web interface for a Docker daemon. A Portainer **stack** is a compose file pasted into a form. Portainer accepts only one file, so the stack below is Part 1's `docker-compose.yml` and `docker-compose.npu.yml` already merged.
-
-1. **Images → Import**: upload the image archive. Images saved by Podman keep the `localhost/` prefix: `localhost/anomaly_detection-detector:npu`. Import `eclipse-mosquitto:2` the same way if the device cannot reach Docker Hub.
-2. **Stacks → Add stack**: name it `anomaly_detection`, choose *Web editor*, paste the YAML below, then **Deploy the stack**.
-3. **Containers → the detector → Logs**: check the lines of [33.4](#334-checking-the-deployment).
-
-```yaml
-services:
-  mqtt-broker:
-    image: eclipse-mosquitto:2
-    ports:
-      - "1883:1883"   # MQTT for the detector and other clients
-      - "1884:1883"   # the same broker, for the FactoryTalk Optix project's MQTTClient1
-      - "9001:9001"   # reserved for MQTT over WebSocket
-    command:
-      - /bin/sh
-      - -c
-      - |
-        cat > /tmp/mosquitto.conf <<EOF
-        listener 1883 0.0.0.0
-        allow_anonymous true
-        listener 9001 0.0.0.0
-        protocol websockets
-        EOF
-        exec mosquitto -c /tmp/mosquitto.conf
-    healthcheck:
-      test: ["CMD-SHELL", "mosquitto_sub -h 127.0.0.1 -p 1883 -t '$$SYS/broker/version' -C 1 -W 3 >/dev/null 2>&1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    restart: unless-stopped
-
-  detector:
-    image: localhost/anomaly_detection-detector:npu
-    pull_policy: never
-    platform: linux/arm64
-    devices:
-      - /dev/galcore:/dev/galcore
-    volumes:
-      - /usr/lib:/host/usr/lib:ro
-      - npu-graph-cache:/var/cache/npu
-    environment:
-      - USE_NPU=true
-      - TF_CPP_MIN_LOG_LEVEL=0
-      - VIV_VX_ENABLE_CACHE_GRAPH_BINARY=1
-      - VIV_VX_CACHE_BINARY_GRAPH_DIR=/var/cache/npu
-    restart: unless-stopped
-    depends_on:
-      mqtt-broker:
-        condition: service_healthy
-
-volumes:
-  npu-graph-cache:
-```
-
-For the negative control, edit the stack, set `USE_NPU=false` and click *Update the stack*. Portainer recreates the detector with the new value.
-
-### 33.3 Option B: the Docker CLI from your PC
-
-The `docker` command is only a **client**. Every command (`load`, `compose up`, `logs`) is turned into a request to a **daemon**, the program that actually runs containers. The environment variable `DOCKER_HOST` says which daemon to talk to. Point it at the device, and every command on your PC acts on the device:
-
-```bash
-# Linux / macOS / WSL
-export DOCKER_HOST=tcp://optix_edge_ip:2375
-```
-
-```powershell
-# Windows PowerShell
-$env:DOCKER_HOST = "tcp://optix_edge_ip:2375"
-```
-
-Then, from `anomaly_detection/`:
-
-```bash
-docker load -i anomaly_detection-npu.tar        # streams the archive from the PC into the device's image store
-docker compose -p anomaly_detection -f docker-compose.yml -f docker-compose.npu.yml up -d --no-build
-docker compose -p anomaly_detection -f docker-compose.yml -f docker-compose.npu.yml logs -f detector
-```
-
-**The detail that surprises everyone.** Compose reads the two YAML files on your PC, but every path inside them (`/dev/galcore`, `/usr/lib`, the volume) is handed to the daemon, and the daemon resolves it **on the device**. `/usr/lib` means the OptixEdge's `/usr/lib`, even when you typed the command on Windows. That is exactly what we want here, but it also means a path to a file on your PC would not work.
-
-`--no-build` tells compose to use the imported image and never try to build one (the files also contain a `build:` section, used only on a build machine).
-
-**Security, before you open the port.** Port 2375 is plain HTTP with no password. Anyone who can reach it can start any container with any device or folder of the host mounted, which on a normal (rootful) daemon means full control of the device. Use 2375 only on an isolated lab network, and close it afterwards. For anything else, use the encrypted port **2376** with client certificates (`DOCKER_HOST=tcp://optix_edge_ip:2376`, `DOCKER_TLS_VERIFY=1`, `DOCKER_CERT_PATH=<folder with ca.pem, cert.pem, key.pem>`). On the OptixEdge, the remote Docker API and its TLS settings are managed by the device's System Manager (Docker page).
-
-**On our test device**, the daemon is *rootless* (it runs as the user `docker`, uid 985) and listens only on a local socket (`unix:///run/user/985/docker.sock`), not on 2375 or 2376. So for the measurements in this part we ran the same `docker load` and `docker compose` commands in an SSH session on the device, with `DOCKER_HOST` set to that socket. The commands and the result are the same; only the road to the daemon differs.
-
-### 33.4 Checking the deployment
-
-The detector's first log lines come from the entrypoint, before Python starts:
-
-```text
-[npu] linked 20 host libraries from /host/usr/lib into /opt/npu/lib
-[npu] every dependency of /opt/npu/lib/libvx_delegate.so resolves
-[npu] using the host's tflite_runtime (/host/usr/lib/python3.12/site-packages/tflite_runtime)
-[npu] /dev/galcore is present
-[INFO] anomaly-detector: Model autoencoder_int8.tflite (int8) on NPU via tflite_runtime 2.16.2, warm-up 18.8 ms
-[INFO] mqtt_client: Published status to anomaly/paperclip/status: accelerator=npu
-```
-
-Four `[npu]` lines, four facts: the NPU libraries were found, nothing they need is missing, the runtime is the device's own, and the door to the kernel driver is open. A warm-up under 20 ms means the compiled graph was read from the cache volume instead of being compiled again.
-
-Then the detector itself reports the engine. After that, the proof moves to the HMI: the badge, the delegation line, the `.nb` file and a benchmark ([32.3](#323-reading-the-panel)). Then the negative control: with `USE_NPU=false` the badge must turn CPU, the delegation line must disappear and the benchmark must say `NPU not requested`.
-
-For a one-shot check without MQTT, the image contains `tools/npu_check.py`. It uses the production code (`InferenceEngine` + `run_benchmark`), loads the model, runs 200 inferences on each engine and prints a verdict:
-
-```bash
-docker run --rm --device /dev/galcore -v /usr/lib:/host/usr/lib:ro localhost/anomaly_detection-detector:npu python tools/npu_check.py
-```
-
-If it prints `RESULT: inference ran on the NPU`, the detector will find the NPU too.
-
-### 33.5 Rollback
-
-Every object can be removed, and the device is then exactly as before:
-
-- Portainer: *Stacks → anomaly_detection → Delete*, then *Images* and *Volumes* to remove `localhost/anomaly_detection-detector:npu` and `anomaly_detection_npu-graph-cache`.
-- CLI: `docker compose -p anomaly_detection -f docker-compose.yml -f docker-compose.npu.yml down`, then `docker rmi localhost/anomaly_detection-detector:npu` and `docker volume rm anomaly_detection_npu-graph-cache`.
-
-### 33.6 Troubleshooting
-
-| Symptom (`NpuError`, or an `[npu]` log line) | Layer | What it means, what to do |
-|---|---|---|
-| `/host/usr/lib is not mounted` | Container config | Add `-v /usr/lib:/host/usr/lib:ro` |
-| `/dev/galcore is missing` | Container config | Add `--device /dev/galcore` |
-| `linked 0 host libraries` | Device | The device has no NPU libraries in `/usr/lib`: its firmware was built without them, or keeps them elsewhere (set `HOST_LIB_DIR`) |
-| `no delegate at /opt/npu/lib/libvx_delegate.so` | Device | The device has the driver but not the VX delegate (a firmware without the ML packages). The detector runs on the CPU; see [27.7](#277-host-or-container-where-each-moving-part-belongs) |
-| `no host tflite_runtime for python3.12` | Device ? image | The device has no `tflite_runtime` for the image's Python version. The image's LiteRT is used instead (runtime B of [27.5](#275-which-tflite-runtime)) |
-| `the delegate needs libraries that are not available` | NPU libs | The listed library is missing or has another name on this device: add its pattern to `NPU_HOST_LIBS`. `NPU_DEBUG=1` prints the full `ldd` |
-| `OSError: ... GLIBC_2.xx not found` | C runtime | The device's glibc is newer than the image's: use a newer base image ([27.6](#276-the-c-runtime-rule)) |
-| `cannot enable executable stack` | C runtime | A library in the image is marked as needing an executable stack; the image clears that mark on LiteRT ([27.6](#276-the-c-runtime-rule)) |
-| `undefined symbol: tflite_plugin_create_delegate` | Delegate | The file is not a TFLite external delegate; check `VX_DELEGATE_PATH` |
-| Delegate loads, crash or error at the first invoke | Runtime ? delegate | Switch runtime: `HOST_TFLITE_RUNTIME=0` uses the image's LiteRT instead of the borrowed `tflite_runtime` ([27.5](#275-which-tflite-runtime)) |
-| `Cannot connect to the Docker daemon` | Remote access | Wrong `DOCKER_HOST`, or the device does not expose the Docker API ([33.3](#333-option-b-the-docker-cli-from-your-pc)) |
-| `no space left on device` during the import | Device storage | The archive or the image store is on a small partition; keep both on `/persistent` |
-| Delegation `0/5` | Model | The delegate rejected every op: check that the int8 model is used (`precision: int8`) |
-| Badge stays `?` in FactoryTalk Optix | MQTT | Check the plain-text subscription to `anomaly/paperclip/status` and the broker port 1884 ([32.2](#322-the-variables-in-modelnpu)) |
-
-## 34. The Ladder Log: Predictions vs Results
-
-The core learning loop: predict, measure, compare, explain the gap. Results from the OptixEdge unless marked.
-
-| Question | Prediction | Reason | Result |
-|---|---|---|---|
-| Does int8 change any detection? | No | Error ≤ half a mark (0.002) on [0,1] inputs | ✅ 0 of 300 windows changed (laptop) |
-| Does the image load on ARM with the CPU? | Yes | Same code as the amd64 test image | ✅ under QEMU on the laptop, and on the device |
-| Does the delegate load inside the container? | Yes, if `ldd` resolves | Libraries lent from the same release as the driver | ✅ with the device's `tflite_runtime` (runtime A) and with the image's LiteRT 1.2.0 (runtime B) |
-| Is the device's TFLite 2.19, as first reported? | Yes | The examples path given at the start | ❌ **2.16.2**: this device has `/usr/bin/tensorflow-lite-2.16.2/`, and `ldd` on the delegate and the device's `tflite_runtime` agree. Ask the device, not memory. The image therefore borrows the device's 2.16.2 runtime ([27.5](#275-which-tflite-runtime)) |
-| How many nodes go to the NPU? | 5 of 5 | FULLY_CONNECTED and LOGISTIC are common int8 ops | ✅ 5 of 5 (`DELEGATE` node in the graph; OVXLIB log: 4 FCL2, 3 RELU, 1 SIGMOID) |
-| Does the float32 model run on the NPU? | No, falls back | The NPU is an integer engine | ❌ Yes, in float16: 0.248 ms, outputs differ in the 7th decimal ([31](#31-why-the-npu-may-be-slower-here)) |
-| Warm-up on the NPU | 100–1 000 ms | Graph compilation at the first invoke | ✅ better: 63–72 ms; 16 ms with the graph cache |
-| p50 on the CPU (A53), `invoke()` only | 0.05–0.2 ms | Laptop 0.029 ms, A53 several times slower | ❌ better: **0.0106 ms** (XNNPACK) |
-| p50 on the NPU, `invoke()` only | 0.2–1 ms | Fixed trip cost dominates 3 328 multiply-adds | ✅ **0.157 ms**, just below the range |
-| Largest CPU vs NPU output difference | ≤ 0.004 | One output mark is 0.0039 | ✅ **0.0**: identical integers |
-| The NPU On-time counter moves during a benchmark | Yes | The driver counts powered-on time | ❌ 601 ms once, 0 ms twice: not usable ([30.3](#303-the-evidence-ladder)) |
-| The driver lists our container's process as an NPU client | Yes | It opened `/dev/galcore` | ✅ `python`, cgroup `docker-9c2e…`, memory on GPU 1 (NPU); empty with `USE_NPU=false` |
-| Can the image carry TFLite, the delegate and TIM-VX itself, borrowing only the driver? | Yes | Above OpenVX the interface is a public standard ([27.7](#277-host-or-container-where-each-moving-part-belongs)) | ⏳ Partly proven: TIM-VX compiles and links against the device's driver release. The full image is not validated on the device yet |
-| Do the newer OpenVX headers (6.4.15, bundled with TIM-VX) work with the device's 6.4.11 driver? | Yes | OpenVX is a public standard | ❌ `LD_BIND_NOW=1` found `vxTensorSelectLayer` and `vxInvalidateHandleVSI` missing; 15 capability switches differ. Headers from the 6.4.11 SDK fixed the link ([27.7](#277-host-or-container-where-each-moving-part-belongs)) |
-
-## 35. Decision Log
-
-| Decision | Alternatives | Why |
-|---|---|---|
-| Borrow the NPU stack from the device, read-only: Vivante driver, TIM-VX, VX delegate, TFLite and `tflite_runtime` | Image that carries everything above OpenVX ([27.7](#277-host-or-container-where-each-moving-part-belongs)); image built from the NXP BSP (path N2 of [19.4](#194-how-the-npu-will-be-used)); install packages on the device | Rule 1: nothing installed on the host. The device's libraries always match its kernel driver, and the design is measured end to end. The line at OpenVX is the recommended next step, once validated |
-| Link only the NPU libraries, not the whole `/usr/lib` | `LD_LIBRARY_PATH=/host/usr/lib` | Two glibc or libstdc++ copies in one process crash in confusing ways ([27.4](#274-the-entrypoint-borrow-only-the-npu-libraries)) |
-| The device's `tflite_runtime` as default runtime (A), LiteRT in the image as fallback (B) | LiteRT only | A uses the same `libtensorflow-lite.so.2.16.2` as the delegate: the pairing NXP tests ([27.5](#275-which-tflite-runtime)). B keeps a CPU runtime when the device has none |
-| Debian trixie base, Python 3.12 | bookworm (Part 1), Python 3.11 | glibc must be ≥ the device's 2.39 ([27.6](#276-the-c-runtime-rule)); the borrowed `tflite_runtime` is compiled for CPython 3.12 |
-| Clear the executable-stack mark on LiteRT | An older base image | glibc 2.41 refuses the mark; the library does not need it, and the image is safer without it |
-| Keep the self-contained prototype out of the image | Ship it | Not validated end to end on the device. Its lesson, compile for the device's driver release, is recorded in [27.7](#277-host-or-container-where-each-moving-part-belongs) |
-| Work with the device's rootless Docker | Switch to a rootful daemon | Nothing changed on the host. It also keeps debugfs closed to containers, so the driver evidence stays a root lab check |
-| Driver client list as hardware evidence | The `gc/idle` On-time counter | The counter gave 601 ms once and 0 ms twice for the same benchmark; the client list was right every time ([30.3](#303-the-evidence-ladder)) |
-| `GalcoreVersion` read from the lent `libGAL.so` when the kernel's version file is unreadable | Show `unknown` | On our device the kernel driver's version is only in debugfs (root-only). `libGAL` is built from the same driver release and carries its version string |
-| A separate int8 file next to the float one | Replace float with int8 | The float model stays the CPU reference; `precision: auto` picks |
-| Per-tensor weights | Per-channel (TFLite default) | NPU-friendly, and measured: zero decision changes |
-| Fallback to the CPU on any NPU error | Fail hard | The detector must keep protecting the machine; the status explains why |
-| Benchmark in a worker thread, on request | Benchmark at start-up | Never blocks the 1 Hz sensor path; the operator sees it happen |
-
----
-
 # Reference
 
 ## Glossary
@@ -4516,6 +4935,16 @@ The core learning loop: predict, measure, compare, explain the gap. Results from
 | **NetLogic** | An FTOptix concept: a C# class that inherits from `BaseNetLogic` and runs inside the FTOptix runtime. It has access to the project's OPC UA information model and can read/write variables, subscribe to events, and spin up tasks. |
 | **PeriodicTask** | An FTOptix API class that executes a callback on a fixed time interval inside a NetLogic. Equivalent to a background timer thread but managed by the FTOptix runtime lifecycle. |
 | **Digital Twin** | A virtual, real-time model of a physical object or process. In this project, the Three.js 3-D scene is a digital twin of the paper-clip machine: it reflects the machine's anomaly state visually. |
+| **ABI** | Application Binary Interface: the binary agreement between compiled pieces (function names, argument order, structure layout). Pieces built for different versions can disagree silently. See [2.5](#25-linux-basics-for-the-npu-part). |
+| **Bind mount** | A folder of the host shown inside a container, e.g. `/usr/lib:/host/usr/lib:ro`; `:ro` makes it read-only. See [2.4](#24-what-is-docker). |
+| **Daemon** | A background service. The Docker daemon stores the images and runs the containers; the `docker` command is only its client. See [2.4](#24-what-is-docker). |
+| **`DOCKER_HOST`** | An environment variable that tells the `docker` command which daemon to talk to, e.g. `tcp://<optixedge-ip>:2375`. See [7.9](#79-deploy-on-the-optixedge-from-the-command-line). |
+| **glibc** | The GNU C library, the base under almost every Linux program. Backward compatible only: the image's glibc must be at least as new as the device's. See [4.6](#46-the-c-runtime-rule). |
+| **`ldd`** | Lists the shared libraries (`.so`) a program needs and where the loader finds them; `not found` names a missing one. See [4.4](#44-the-entrypoint-borrow-only-the-npu-libraries). |
+| **QEMU, binfmt** | QEMU imitates an ARM CPU in software; binfmt is the Linux feature that hands ARM programs to it. Together they let a PC build an arm64 image. See [7.7](#77-build-the-image-for-the-optixedge). |
+| **Rootless** | A container engine whose daemon runs as a normal user instead of `root`; its containers cannot get more rights than that user. See [2.4](#24-what-is-docker). |
+| **Shared library (`.so`)** | Compiled code that a program loads while it runs (on Windows: a `.dll`). Every NPU piece is one. See [4.3](#43-every-module-library-and-driver). |
+| **Volume** | Storage managed by the container engine that survives a container's removal; here it keeps the compiled NPU graph. See [2.4](#24-what-is-docker). |
 
 ### Gesture-control terms
 

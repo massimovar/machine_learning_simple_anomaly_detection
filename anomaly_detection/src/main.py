@@ -38,7 +38,12 @@ def main():
     buffer = SampleBuffer(prep_cfg["window_size"], prep_cfg["tag_names"])
     started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-    # Benchmark state: the CPU engine is created on first use (same model file).
+    # Benchmark state, shared by the MQTT thread and the benchmark thread:
+    #   cpu_engine  - a second interpreter on the SAME model file, forced to CPU;
+    #                 created on the first benchmark (costs RAM only if used).
+    #   running     - True while a benchmark thread is alive; one at a time.
+    #   last_vector - the last real, normalised window: benchmarking real data.
+    # bench_lock protects "running" (check-and-set must be one atomic step).
     bench = {"cpu_engine": None, "running": False, "last_vector": None}
     bench_lock = threading.Lock()
 
@@ -76,6 +81,7 @@ def main():
         publish_alert(mqtt_client, mqtt_cfg["alert_topic"], result.to_alert_json(evidence))
 
     def benchmark_worker(runs: int) -> None:
+        """Runs in its own thread: time CPU vs main engine, publish the result, free the slot."""
         try:
             if bench["cpu_engine"] is None:
                 bench["cpu_engine"] = InferenceEngine(settings["model_path"], use_npu=False)
@@ -83,6 +89,8 @@ def main():
             if vector is None:
                 # No window seen yet: the middle of the normal range.
                 vector = np.full(model_cfg["input_size"], 0.5, dtype=np.float32)
+            # Meanwhile the sensor handler keeps running: each reconstruct() takes
+            # the engine lock, so a window arriving mid-benchmark waits < 1 ms.
             result = run_benchmark(engine, bench["cpu_engine"], vector, runs, npu_evidence.read_counters)
             result["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             logger.info("Benchmark: cpu p50 %.4f ms, npu %s", result["cpu"]["p50_ms"],
@@ -91,6 +99,7 @@ def main():
             logger.error("Benchmark failed: %s", exc)
             result = {"error": str(exc)}
         finally:
+            # Always free the slot, even after an error, or no benchmark could run again.
             with bench_lock:
                 bench["running"] = False
         publish_json(mqtt_client, mqtt_cfg["benchmark_topic"], result)
@@ -98,15 +107,20 @@ def main():
         publish_status(mqtt_client, mqtt_cfg["status_topic"], status_payload())
 
     def handle_command(command: dict) -> None:
+        """Called by the MQTT client for every JSON message on the cmd topic."""
         if command.get("cmd") != "benchmark":
             logger.warning("Unknown command ignored: %s", command)
             return
+        # Check-and-set under the lock: two quick clicks must not start two
+        # benchmarks that would compete for the CPU and distort each other.
         with bench_lock:
             if bench["running"]:
                 publish_json(mqtt_client, mqtt_cfg["benchmark_topic"], {"error": "benchmark already running"})
                 return
             bench["running"] = True
         # WHY a thread: the MQTT loop must keep receiving the 1 Hz sensor data.
+        # daemon=True: a running benchmark never blocks the container from stopping.
+        # "runs" is clamped later by run_benchmark (1..MAX_RUNS).
         threading.Thread(target=benchmark_worker, args=(command.get("runs", 1000),), daemon=True).start()
 
     mqtt_client = create_client(

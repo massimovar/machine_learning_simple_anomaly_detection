@@ -11,11 +11,12 @@
 # TFLite / TensorFlow is NOT listed here because the correct package differs
 # per environment:
 #
-#   Edge device (ARM64, Docker image):  tflite-runtime  (inference only, ~few MB)
-#     → installed by Dockerfile
+#   PC image (Dockerfile, amd64, CPU):  tflite-runtime 2.14  (inference only, a few MB)
+#   NPU image (Dockerfile.npu, arm64):   ai-edge-litert, plus the device's own
+#                                        tflite_runtime, lent read-only at run time
 #
 #   Training (local, outside Docker):  tensorflow
-#     pip install tensorflow
+#     pip install -r requirements.txt tensorflow
 # ============================================================================
 
 paho-mqtt>=2.0,<3.0

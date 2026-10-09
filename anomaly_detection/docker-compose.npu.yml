@@ -43,7 +43,9 @@ services:
       - /usr/lib:/host/usr/lib:ro
       - npu-graph-cache:/var/cache/npu
     environment:
-      - USE_NPU=true
+      # Default true. Negative control without editing this file:
+      # USE_NPU=false docker compose ... up -d  (Portainer: stack env var USE_NPU=false)
+      - USE_NPU=${USE_NPU:-true}
       # 0 = keep INFO logs: "Replacing N out of M node(s) with delegate" is evidence.
       - TF_CPP_MIN_LOG_LEVEL=0
       - VIV_VX_ENABLE_CACHE_GRAPH_BINARY=1
