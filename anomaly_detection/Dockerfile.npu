@@ -1,0 +1,56 @@
+# ============================================================================
+# Dockerfile.npu — anomaly detector for the i.MX 8M Plus NPU (OptixEdge)
+# ============================================================================
+# The image carries the Python application.  The NPU stack is LENT by the
+# device at run time, read-only (nothing is installed on the host):
+#
+#     detector (Python 3.12, this image)
+#       -> tflite_runtime 2.16.2 -> libtensorflow-lite.so.2.16.2   <- device
+#       -> libvx_delegate.so -> libtim-vx.so                        <- device
+#       -> libOpenVX/libGAL/... (Vivante user-space driver)         <- device
+#       -> /dev/galcore (galcore kernel driver)                     <- device kernel
+#
+# tools/npu_entrypoint.sh links only those libraries (and the device's
+# tflite_runtime Python package) from the read-only /usr/lib mount.
+#
+# WHY Debian trixie + Python 3.12:
+#   - the lent libraries were built against the device's glibc 2.39; glibc is
+#     backward compatible only, so the image needs glibc >= 2.39 (trixie: 2.41);
+#   - the lent tflite_runtime is a compiled CPython 3.12 module, so the image's
+#     Python must be 3.12 too.
+#
+# ai-edge-litert: the image's own runtime.  Used for the CPU when the device
+# has no tflite_runtime, and as runtime B (HOST_TFLITE_RUNTIME=0).
+# ============================================================================
+ARG IMAGE_PLATFORM=linux/arm64
+FROM --platform=${IMAGE_PLATFORM} python:3.12-slim-trixie
+
+ARG LITERT_VERSION=1.2.0
+
+WORKDIR /app
+
+COPY requirements.txt .
+# WHY patchelf: glibc >= 2.41 refuses to load a library marked as needing an
+# executable stack ("cannot enable executable stack").  The LiteRT wheel has
+# that mark by accident; clearing it is safe and makes the image safer.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends patchelf \
+ && pip install --no-cache-dir "ai-edge-litert==${LITERT_VERSION}" -r requirements.txt \
+ && find /usr/local/lib/python3*/site-packages/ai_edge_litert -name "*.so*" -type f \
+        -exec patchelf --clear-execstack {} + \
+ && apt-get purge -y patchelf && apt-get autoremove -y \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY config.yaml .
+COPY src/ src/
+COPY models/ models/
+COPY tools/npu_entrypoint.sh tools/npu_check.py tools/
+# WHY sed: a Windows checkout may add CR line endings, which /bin/sh rejects.
+RUN sed -i 's/\r$//' tools/npu_entrypoint.sh
+
+ENV USE_NPU=true \
+    PYTHONUNBUFFERED=1 \
+    TF_CPP_MIN_LOG_LEVEL=0
+
+ENTRYPOINT ["sh", "tools/npu_entrypoint.sh"]
+CMD ["python", "src/main.py"]

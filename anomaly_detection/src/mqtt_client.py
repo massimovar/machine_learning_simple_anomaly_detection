@@ -4,11 +4,14 @@ mqtt_client.py — MQTT subscribe and publish helpers
 
 WHY THIS FILE EXISTS:
     MQTT is a lightweight publish/subscribe messaging protocol widely used in
-    industrial IoT.  This file wraps the `paho-mqtt` library into two simple
+    industrial IoT.  This file wraps the `paho-mqtt` library into a few small
     helpers:
 
-    - create_client()  → connects to the broker and subscribes to sensor data
-    - publish_alert()  → sends an anomaly alert back to the broker
+    - create_client()   → connects, subscribes to sensor data (and the command
+                          topic), sets the Last Will, publishes the status
+    - publish_alert()   → sends an anomaly alert back to the broker
+    - publish_status()  → (re)publishes the retained engine status
+    - publish_json()    → publishes any dict, e.g. a benchmark result
 
 WHAT IS MQTT? (quick primer)
     Think of it like a post office:
@@ -91,7 +94,10 @@ OUTGOING ALERT PAYLOAD (detection result)
     {
         "is_anomaly":    true,
         "anomaly_score": 0.042871,
-        "threshold":     0.003412
+        "threshold":     0.010236,
+        "accelerator":   "npu",
+        "precision":     "int8",
+        "inference_ms":  0.4123
     }
 
     Field reference (NOT part of the JSON — for developers only):
@@ -100,7 +106,13 @@ OUTGOING ALERT PAYLOAD (detection result)
     ─────────────── ─────── ──────────────────────────────────────────────
     is_anomaly      bool    true if anomaly_score > threshold
     anomaly_score   float   MSE between input and reconstruction (6 d.p.)
-    threshold       float   Three-sigma decision boundary (6 d.p.)
+    threshold       float   Three-sigma boundary of the active model variant (6 d.p.)
+    accelerator     string  "npu" or "cpu": where this inference really ran
+    precision       string  "int8" or "float32": which model variant ran
+    inference_ms    float   Duration of this single invoke() call
+
+    The first three fields are unchanged since V1; the evidence fields are
+    appended, so older consumers that read only "is_anomaly" keep working.
 
     INTERPRETING THE RESULT:
     - is_anomaly == false, score << threshold  → machine is operating normally
@@ -111,11 +123,54 @@ OUTGOING ALERT PAYLOAD (detection result)
     - An alert is published for EVERY detection window, not only for anomalies.
       Consumers can filter on the "is_anomaly" field.
     - QoS 1 (at least once delivery) is used to avoid losing anomaly alerts.
+
+==============================================================================
+STATUS, COMMAND AND BENCHMARK TOPICS (NPU evidence)
+==============================================================================
+
+    Status — mqtt.status_topic (default "anomaly/paperclip/status"), RETAINED,
+    published on every (re)connect and after each benchmark. A late subscriber
+    (e.g. FTOptix starting after the detector) gets it immediately.
+
+    {
+        "state": "online", "started_at": "2026-10-08T10:00:00+00:00",
+        "accelerator": "npu", "npu_requested": true, "npu_error": null,
+        "model": "autoencoder_int8.tflite", "precision": "int8",
+        "runtime": "tflite_runtime 2.16.2", "delegate": "/opt/npu/lib/libvx_delegate.so",
+        "delegation": [{"delegate": "Vx Delegate", "nodes": 5, "of": 5}],
+        "warmup_ms": 66.0, "threshold": 0.010236,
+        "galcore_version": "libGAL 6.4.11:745085",
+        "graph_cache": {"enabled": true, "dir": "/var/cache/npu", "files": 1,
+                        "bytes": 54976, "names": ["<hash>.nb"]}
+    }
+
+    If the process dies, the broker publishes the Last Will {"state": "offline"}
+    (retained) on the same topic, so a stale "online" badge cannot survive.
+
+    Command — mqtt.command_topic (default "anomaly/paperclip/cmd"), consumed:
+        {"cmd": "benchmark", "runs": 200}       runs is capped at 5000
+
+    Benchmark — mqtt.benchmark_topic (default "anomaly/paperclip/benchmark"):
+    the same model and the same input, timed on the CPU and then on the active engine.
+
+    {
+        "model": "autoencoder_int8.tflite", "precision": "int8", "runs": 5000,
+        "cpu": {"accelerator": "cpu", "runs": 5000, "p50_ms": 0.3503, "p95_ms": 0.5473, ...},
+        "npu": {"accelerator": "npu", "runs": 5000, "p50_ms": 0.6555, "p95_ms": 0.754, ...},
+        "npu_unavailable": null,
+        "max_output_difference": 0.0,
+        "counters_before": null, "counters_after": null,
+        "npu_vs_cpu_p50": 1.87
+    }
+
+    "npu" is null and "npu_unavailable" holds the reason when the NPU is not
+    in use. "counters_*" are null unless NPU_COUNTERS_PATH points to readable
+    driver counters. All numbers above are illustrative, not measured.
 """
 
 import json
 import logging
-from typing import Callable
+from typing import Callable, Optional
 
 import paho.mqtt.client as mqtt
 
@@ -147,6 +202,10 @@ def create_client(
     client_id: str,
     sensor_topic: str,
     on_sensor_message: Callable[[dict], None],
+    status_topic: Optional[str] = None,
+    status_payload: Optional[Callable[[], dict]] = None,
+    command_topic: Optional[str] = None,
+    on_command: Optional[Callable[[dict], None]] = None,
 ) -> mqtt.Client:
     """
     Create an MQTT client, connect to the broker, and subscribe to sensor data.
@@ -164,6 +223,13 @@ def create_client(
     on_sensor_message : callable
         A function that will be called with the parsed JSON dict every time
         a sensor message arrives.
+    status_topic, status_payload : optional
+        Retained "who am I and where do I run" message. status_payload() is
+        called on every (re)connect, so a restarted broker gets it again.
+        The broker publishes {"state": "offline"} there if we vanish
+        (MQTT Last Will).
+    command_topic, on_command : optional
+        Requests from the HMI (e.g. {"cmd": "benchmark", "runs": 1000}).
 
     Returns
     -------
@@ -178,6 +244,10 @@ def create_client(
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
         client_id=client_id,
     )
+    if status_topic:
+        # WHY retained + Last Will: an HMI that connects later still sees the
+        # current status, and sees "offline" if the detector dies.
+        client.will_set(status_topic, json.dumps({"state": "offline"}), qos=1, retain=True)
 
     # --- Define callbacks (what happens on certain MQTT events) ---------------
 
@@ -190,6 +260,11 @@ def create_client(
             # reconnects, the subscription is automatically renewed.
             client.subscribe(sensor_topic)
             logger.info(f"Subscribed to topic: {sensor_topic}")
+            if command_topic and on_command:
+                client.subscribe(command_topic)
+                logger.info(f"Subscribed to topic: {command_topic}")
+            if status_topic and status_payload:
+                publish_status(client, status_topic, status_payload())
         else:
             logger.error(f"Connection failed with code: {reason_code}")
 
@@ -197,11 +272,13 @@ def create_client(
         """Called every time a message arrives on a subscribed topic."""
         try:
             # msg.payload is raw bytes → decode to string → parse as JSON
-            payload_str = msg.payload.decode("utf-8")
-            sensor_data = _flatten_ftoptix_records(json.loads(payload_str))
+            payload = json.loads(msg.payload.decode("utf-8"))
+            if command_topic and msg.topic == command_topic:
+                on_command(payload)
+                return
 
             # Hand the flat dict to the callback provided by main.py
-            on_sensor_message(sensor_data)
+            on_sensor_message(_flatten_ftoptix_records(payload))
         except json.JSONDecodeError:
             logger.warning(f"Received non-JSON message on {msg.topic}: {msg.payload[:100]}")
         except Exception as e:
@@ -236,3 +313,14 @@ def publish_alert(client: mqtt.Client, alert_topic: str, alert_json: str) -> Non
     # ("exactly once") adds overhead we don't need for this use case.
     client.publish(alert_topic, alert_json, qos=1)
     logger.info(f"Published alert to {alert_topic}: {alert_json}")
+
+
+def publish_status(client: mqtt.Client, topic: str, payload: dict) -> None:
+    """Retained status: the broker keeps the last one for late subscribers."""
+    client.publish(topic, json.dumps(payload), qos=1, retain=True)
+    logger.info(f"Published status to {topic}: accelerator={payload.get('accelerator')}")
+
+
+def publish_json(client: mqtt.Client, topic: str, payload: dict) -> None:
+    client.publish(topic, json.dumps(payload), qos=1)
+    logger.info(f"Published to {topic}")

@@ -1,0 +1,55 @@
+# ============================================================================
+# docker-compose.npu.yml — run the detector on the NPU (override file)
+# ============================================================================
+# Use together with the base file (it adds/overrides only the detector):
+#   laptop build:  podman build --platform linux/arm64 -f Dockerfile.npu -t localhost/anomaly_detection-detector:npu .
+#                  (podman compose -f docker-compose.yml -f docker-compose.npu.yml build detector also works,
+#                   but showed no progress output for a long time on our laptop)
+#   device run:    docker compose -p anomaly_detection -f docker-compose.yml -f docker-compose.npu.yml up -d
+#                  (OptixEdge: Docker is rootless, first: export DOCKER_HOST=unix:///run/user/985/docker.sock)
+#
+# What the container gets from the host, and why (nothing is installed there):
+#   /dev/galcore        the NPU driver's door.  Containers share the host kernel,
+#                       so this device node is the only way in.
+#   /usr/lib (ro)       the NPU user-space libs that match that driver; the
+#                       entrypoint links only the NPU ones (see tools/npu_entrypoint.sh)
+#   npu-graph-cache     a named volume where OpenVX stores the compiled NPU graph
+#                       (*.nb).  It only appears if the graph was compiled for the
+#                       NPU, so it is evidence, and it makes later starts faster.
+# ============================================================================
+services:
+  mqtt-broker:
+    ports:
+      # Added to the base file's 1883/9001: the FTOptix project's MQTTClient1
+      # connects to 127.0.0.1:1884, so the same broker answers there too.
+      - "1884:1883"
+
+  detector:
+    build:
+      context: .
+      dockerfile: Dockerfile.npu
+      args:
+        IMAGE_PLATFORM: linux/arm64
+      platforms:
+        - linux/arm64
+    # localhost/ prefix: Podman names local builds this way, and `docker load`
+    # keeps the name, so the same reference works on the laptop and the device.
+    image: localhost/anomaly_detection-detector:npu
+    pull_policy: never
+    platform: linux/arm64
+    devices:
+      - /dev/galcore:/dev/galcore
+    volumes:
+      - /usr/lib:/host/usr/lib:ro
+      - npu-graph-cache:/var/cache/npu
+    environment:
+      - USE_NPU=true
+      # 0 = keep INFO logs: "Replacing N out of M node(s) with delegate" is evidence.
+      - TF_CPP_MIN_LOG_LEVEL=0
+      - VIV_VX_ENABLE_CACHE_GRAPH_BINARY=1
+      - VIV_VX_CACHE_BINARY_GRAPH_DIR=/var/cache/npu
+      # Optional hardware evidence, only if Phase 0 finds readable driver counters:
+      # - NPU_COUNTERS_PATH=/host/gc/idle      (+ a read-only bind mount of that file)
+
+volumes:
+  npu-graph-cache:

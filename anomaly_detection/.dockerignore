@@ -29,6 +29,9 @@ training/
 # Data files (not needed inside the container)
 data/
 
+# Exported image archives (hundreds of MB; never part of an image)
+*.tar
+
 # Editor / OS noise
 .venv/
 *.env

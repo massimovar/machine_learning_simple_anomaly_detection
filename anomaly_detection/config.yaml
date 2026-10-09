@@ -7,10 +7,13 @@
 
 # --- MQTT connection ----------------------------------------------------------
 mqtt:
-  broker_host: "mqtt-broker"        # hostname of the Mosquitto container (Docker Compose service name)
-  broker_port: 1883                 # default MQTT port (unencrypted)
+  broker_host: "mqtt-broker"        # hostname of the Mosquitto container (Docker Compose service name); env MQTT_BROKER_HOST
+  broker_port: 1883                 # default MQTT port (unencrypted); env MQTT_BROKER_PORT
   sensor_topic: "ftoptix/paperclip/sensors"   # topic where FTOptix publishes sensor data
   alert_topic:  "anomaly/paperclip/alerts"    # topic where this app publishes anomaly alerts
+  status_topic: "anomaly/paperclip/status"    # retained: where inference runs (CPU/NPU) + evidence
+  command_topic: "anomaly/paperclip/cmd"      # HMI requests, e.g. {"cmd":"benchmark","runs":1000}
+  benchmark_topic: "anomaly/paperclip/benchmark"  # CPU-vs-NPU benchmark results
   client_id: "anomaly-detector"     # MQTT client identifier
 
 # --- Preprocessing ------------------------------------------------------------
@@ -35,13 +38,26 @@ model:
   input_size: 10        # number of sensor tags (must match tag_names length)
   hidden_size: 64       # neurons in the first/last hidden layers
   bottleneck_size: 16   # neurons in the compressed middle layer
-  model_path: "models/autoencoder.tflite"    # TFLite flat-buffer model (replaces .pth)
   scaler_path: "models/scaler.pkl"           # where the fitted MinMaxScaler is saved
-  threshold_path: "models/threshold.json"    # where the anomaly threshold is saved
-  # NPU acceleration (NXP i.MX 8M Plus eIQ VSI delegate):
-  # Set to true once the NXP eIQ runtime (libvx_delegate.so) is deployed on
-  # the edge device.  Falls back to CPU automatically if the delegate is absent.
+  # Two files of the SAME network (training/quantize.py makes int8 from float32).
+  # Each has its own threshold: int8 rounding slightly raises normal errors.
+  variants:
+    float32:
+      model_path: "models/autoencoder.tflite"
+      threshold_path: "models/threshold.json"
+    int8:
+      model_path: "models/autoencoder_int8.tflite"
+      threshold_path: "models/threshold_int8.json"
+  # auto = int8 when use_npu is true (the NPU computes in integers), else float32.
+  # Env override: MODEL_PRECISION=auto|float32|int8
+  precision: auto
+  # NPU acceleration (NXP i.MX 8M Plus, VeriSilicon VX delegate).
+  # Falls back to the CPU (same model) if the delegate cannot load or run.
+  # Env overrides: USE_NPU=true|false, VX_DELEGATE_PATH=...
+  # In Dockerfile.npu the entrypoint sets VX_DELEGATE_PATH=/opt/npu/lib/libvx_delegate.so
+  # (a link to the device's delegate); the default below is where NXP's Yocto image installs it.
   use_npu: false
+  vx_delegate_path: "/usr/lib/libvx_delegate.so"
 
 # --- Training (used by training/train.py) ------------------------------------
 training:

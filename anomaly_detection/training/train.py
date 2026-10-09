@@ -27,6 +27,12 @@ def simulate_windowing(data: np.ndarray, window_size: int) -> np.ndarray:
     return trimmed.reshape(n_windows, window_size, -1).mean(axis=1)
 
 
+def compute_threshold(mse_per_sample: np.ndarray, sigma: float) -> dict:
+    mse_mean = float(np.mean(mse_per_sample))
+    mse_std = float(np.std(mse_per_sample))
+    return {"threshold": mse_mean + sigma * mse_std, "mean": mse_mean, "std": mse_std, "sigma": sigma}
+
+
 def main():
     config_path = os.path.join(BASE_DIR, "config.yaml")
     with open(config_path, "r", encoding="utf-8") as f:
@@ -71,10 +77,7 @@ def main():
 
     all_reconstructed = model.predict(scaled_data, verbose=0)
     mse_per_sample = np.mean((scaled_data - all_reconstructed) ** 2, axis=1)
-    mse_mean = float(mse_per_sample.mean())
-    mse_std = float(mse_per_sample.std())
-    sigma = train_cfg["threshold_sigma"]
-    threshold = mse_mean + sigma * mse_std
+    threshold = compute_threshold(mse_per_sample, train_cfg["threshold_sigma"])
 
     models_dir = os.path.join(BASE_DIR, "models")
     os.makedirs(models_dir, exist_ok=True)
@@ -88,11 +91,17 @@ def main():
 
     threshold_path = os.path.join(models_dir, "threshold.json")
     with open(threshold_path, "w", encoding="utf-8") as f:
-        json.dump({"threshold": threshold, "mean": mse_mean, "std": mse_std, "sigma": sigma}, f, indent=2)
+        json.dump(threshold, f, indent=2)
+
+    # The int8 twin (for the NPU) must always come from the same weights.
+    from quantize import INT8_MODEL, INT8_THRESHOLD, export_int8
+
+    export_int8(model, scaled_data, train_cfg["threshold_sigma"])
 
     print(f"Saved model to {tflite_path}")
     print(f"Saved scaler to {scaler_path}")
     print(f"Saved threshold to {threshold_path}")
+    print(f"Saved int8 model to {INT8_MODEL} and threshold to {INT8_THRESHOLD}")
 
 
 if __name__ == "__main__":
