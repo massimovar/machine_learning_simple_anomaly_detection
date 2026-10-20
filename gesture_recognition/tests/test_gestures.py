@@ -31,7 +31,7 @@ ABOVE_HEAD = (0.4, 1.4)
 
 def make_pose(right=REST_R, left=REST_L, right_elbow=None, left_elbow=None,
               wrist_score=0.9, body_score=0.9, center=(0.5, 0.45), sw=0.25, mirror=True):
-    """Body coordinates -> (17, 3) array of (y, x, score) in the square crop."""
+    """Body coordinates -> (17, 3) array of (y, x, score) in the model's square input."""
     cx, cy = center
     sign = -1.0 if mirror else 1.0   # a camera sees the user's right on the image left
 
@@ -65,6 +65,14 @@ def right_hand(positions, **pose_kwargs):
     return [make_pose(right=p, **pose_kwargs) for p in positions]
 
 
+def raise_and_hold(seconds=1.2):
+    return move(REST_R, PALM, 0.3) + stay(PALM, seconds)
+
+
+def lower(start=PALM):
+    return move(start, REST_R, 0.2) + stay(REST_R, 0.3)
+
+
 def swipe_right_motion():
     return move(REST_R, CHEST_L, 0.4) + stay(CHEST_L, 0.3) + move(CHEST_L, CHEST_R, 0.4)
 
@@ -81,9 +89,9 @@ class Session:
         self.t = 100.0
         self.events = []
 
-    def play(self, poses):
+    def play(self, poses, dt=DT):
         for kps in poses:
-            self.t += DT
+            self.t += dt
             event = self.engine.update(self.t, kps)
             if event is not None:
                 self.events.append(event)
@@ -99,21 +107,72 @@ class Session:
 
 class TestRecognition(unittest.TestCase):
 
-    def test_open_palm_fires_after_hold_time(self):
-        s = Session().rest()
-        s.play(right_hand(move(REST_R, PALM, 0.3) + stay(PALM, 0.9)))
-        self.assertEqual(s.names, [], "must not fire before palm_hold_s")
-        s.play(right_hand(stay(PALM, 0.4)))
+    def test_open_palm_fires_when_lowered_after_the_hold(self):
+        s = Session().rest().play(right_hand(raise_and_hold()))
+        self.assertEqual(s.names, [], "must not fire while the hand is still up")
+        s.play(right_hand(lower()))
         self.assertEqual(s.names, ["open_palm"])
 
-    def test_open_palm_hold_restarts_after_a_missed_frame(self):
-        # The hand must stay visible for palm_hold_s.
-        s = Session().rest().play(right_hand(move(REST_R, PALM, 0.3) + stay(PALM, 0.7)))
+    def test_hold_shorter_than_palm_hold_s_is_not_open_palm(self):
+        s = Session().rest().play(right_hand(raise_and_hold(0.8) + lower()))
+        self.assertEqual(s.names, [])
+
+    def test_hand_lowered_long_after_the_hold_is_not_open_palm(self):
+        # The hold ends when the hand starts moving; reaching release_y
+        # takes longer than palm_lower_s.
+        s = Session().rest().play(right_hand(raise_and_hold() + move(PALM, REST_R, 1.5)))
+        self.assertEqual(s.names, [])
+
+    def test_open_palm_hold_survives_one_missed_frame(self):
+        s = Session().rest().play(right_hand(raise_and_hold(0.6)))
         s.play(right_hand(stay(PALM, 0.05), wrist_score=0.1))
-        s.play(right_hand(stay(PALM, 0.7)))
-        self.assertEqual(s.names, [], "the hold must restart after the missed frame")
-        s.play(right_hand(stay(PALM, 0.5)))
+        s.play(right_hand(stay(PALM, 0.5) + lower()))
         self.assertEqual(s.names, ["open_palm"])
+
+    def test_open_palm_hold_restarts_after_two_missed_frames(self):
+        # The hand must stay visible for palm_hold_s.
+        s = Session().rest().play(right_hand(raise_and_hold(0.6)))
+        s.play(right_hand(stay(PALM, 0.1), wrist_score=0.1))
+        s.play(right_hand(stay(PALM, 0.6) + lower()))
+        self.assertEqual(s.names, [], "the hold must restart after the missed frames")
+        s.play(right_hand(raise_and_hold() + lower()))
+        self.assertEqual(s.names, ["open_palm"])
+
+    def test_swipe_from_a_held_hand_is_only_a_swipe(self):
+        # Raising the hand and pausing before a swipe looks exactly like a
+        # stop sign; the swipe that follows must win.
+        s = Session().rest().play(right_hand(move(REST_R, CHEST_L, 0.4) + stay(CHEST_L, 1.5)
+                                             + move(CHEST_L, CHEST_R, 0.4) + lower(CHEST_R)))
+        self.assertEqual(s.names, ["swipe_right"])
+
+    def test_palm_up_from_a_held_hand_is_only_palm_up(self):
+        s = Session().rest().play(right_hand(raise_and_hold(1.5) + move(PALM, ABOVE_HEAD, 0.4)
+                                             + stay(ABOVE_HEAD, 0.5) + lower(ABOVE_HEAD)))
+        self.assertEqual(s.names, ["palm_up"])
+
+    def test_arm_held_out_after_a_swipe_is_not_open_palm(self):
+        s = Session().rest().play(right_hand(swipe_right_motion() + stay(CHEST_R, 3.0) + lower(CHEST_R)))
+        self.assertEqual(s.names, ["swipe_right"])
+
+    def test_swipe_across_one_missed_frame_fires(self):
+        # A single blurred frame during a fast move is normal on the device.
+        stroke = right_hand(move(CHEST_L, CHEST_R, 0.4))
+        stroke[3] = make_pose(right=CHEST_R, wrist_score=0.1)
+        s = Session().rest().play(right_hand(move(REST_R, CHEST_L, 0.4) + stay(CHEST_L, 0.3)) + stroke)
+        self.assertEqual(s.names, ["swipe_right"])
+
+    def test_palm_up_across_one_missed_frame_fires(self):
+        rise = right_hand(move(REST_R, ABOVE_HEAD, 0.5) + stay(ABOVE_HEAD, 0.3))
+        rise[5] = make_pose(right=ABOVE_HEAD, wrist_score=0.1)
+        s = Session().rest().play(rise)
+        self.assertEqual(s.names, ["palm_up"])
+
+    def test_fast_swipe_in_frames_arriving_in_a_burst_fires(self):
+        # Frames 20 ms apart (camera burst): the wrist jumps 0.57 SW per
+        # frame, about 28 SW/s, yet it is real motion.
+        s = Session().rest().play(right_hand(move(REST_R, CHEST_L, 0.4) + stay(CHEST_L, 0.3)))
+        s.play(right_hand(move(CHEST_L, CHEST_R, 0.15)), dt=0.02)
+        self.assertEqual(s.names, ["swipe_right"])
 
     def test_palm_up(self):
         s = Session().rest()
@@ -143,25 +202,25 @@ class TestRecognition(unittest.TestCase):
 class TestNoRepeatActivation(unittest.TestCase):
 
     def test_palm_held_ten_seconds_fires_once(self):
-        s = Session().rest().play(right_hand(move(REST_R, PALM, 0.3) + stay(PALM, 10.0)))
+        s = Session().rest().play(right_hand(raise_and_hold(10.0) + lower()))
         self.assertEqual(s.names, ["open_palm"])
 
     def test_palm_held_through_a_short_dropout_fires_once(self):
         # A hand unseen for a moment is not a lowered hand.
-        s = Session().rest().play(right_hand(move(REST_R, PALM, 0.3) + stay(PALM, 2.0)))
+        s = Session().rest().play(right_hand(raise_and_hold(2.0)))
         s.play(right_hand(stay(PALM, 0.15), wrist_score=0.1))
-        s.play(right_hand(stay(PALM, 3.0)))
+        s.play(right_hand(stay(PALM, 3.0) + lower()))
         self.assertEqual(s.names, ["open_palm"])
 
-    def test_palm_moving_while_raised_does_not_refire(self):
-        s = Session().rest().play(right_hand(move(REST_R, PALM, 0.3) + stay(PALM, 2.0)))
-        s.play(right_hand(move(PALM, (0.0, 0.4), 0.3) + stay((0.0, 0.4), 3.0)))
+    def test_palm_moving_while_raised_does_not_fire_twice(self):
+        s = Session().rest().play(right_hand(raise_and_hold(2.0)))
+        s.play(right_hand(move(PALM, (0.0, 0.4), 0.3) + stay((0.0, 0.4), 3.0) + lower((0.0, 0.4))))
         self.assertEqual(s.names, ["open_palm"])
 
     def test_palm_refires_after_lowering(self):
-        s = Session().rest().play(right_hand(move(REST_R, PALM, 0.3) + stay(PALM, 2.0)))
-        s.play(right_hand(move(PALM, REST_R, 0.4) + stay(REST_R, 0.5)))
-        s.play(right_hand(move(REST_R, PALM, 0.3) + stay(PALM, 1.5)))
+        s = Session().rest().play(right_hand(raise_and_hold(2.0) + lower()))
+        s.rest(1.0)                                   # past cooldown_s
+        s.play(right_hand(raise_and_hold(1.5) + lower()))
         self.assertEqual(s.names, ["open_palm", "open_palm"])
 
     def test_raising_hand_to_hold_is_not_palm_up(self):
@@ -287,18 +346,20 @@ class TestFalsePositives(unittest.TestCase):
         self.assertEqual(s.names, [])
 
     def test_swipe_across_a_few_missed_frames_is_ignored(self):
-        # Three unsure frames (0.15 s): shorter than max_gap_s, and the jump is
-        # slow enough for max_wrist_speed, yet the movement was never seen (it
-        # may be MoveNet swapping left and right).
+        # Three unsure frames (0.15 s): shorter than max_gap_s, and the jump
+        # is small enough for max_wrist_jump, yet the movement was never seen
+        # (it may be MoveNet swapping left and right).
+        near_right = (0.9, -0.2)
         s = Session().rest().play(right_hand(move(REST_R, CHEST_L, 0.4) + stay(CHEST_L, 0.3)))
         s.play(right_hand(stay(CHEST_L, 0.15), wrist_score=0.1))
-        s.play(right_hand(stay(CHEST_R, 0.5)))
+        s.play(right_hand(stay(near_right, 0.5)))
         self.assertEqual(s.names, [])
 
     def test_swipe_across_frames_without_a_gated_person_is_ignored(self):
+        near_right = (0.9, -0.2)
         s = Session().rest().play(right_hand(move(REST_R, CHEST_L, 0.4) + stay(CHEST_L, 0.3)))
         s.play(right_hand(stay(CHEST_L, 0.15), body_score=0.1))   # shoulders unsure
-        s.play(right_hand(stay(CHEST_R, 0.5)))
+        s.play(right_hand(stay(near_right, 0.5)))
         self.assertEqual(s.names, [])
 
     def test_rise_not_seen_between_two_sure_samples_is_not_palm_up(self):
@@ -335,14 +396,14 @@ class TestFalsePositives(unittest.TestCase):
         rng = random.Random(42)
         jitter = [(PALM[0] + rng.uniform(-0.05, 0.05), PALM[1] + rng.uniform(-0.05, 0.05))
                   for _ in range(60)]
-        s = Session().rest().play(right_hand(move(REST_R, PALM, 0.3) + jitter))
+        s = Session().rest().play(right_hand(move(REST_R, PALM, 0.3) + jitter + lower()))
         self.assertEqual(s.names, ["open_palm"])
 
 
 class TestPresence(unittest.TestCase):
 
     def test_far_person_is_gated(self):
-        s = Session().play(right_hand(stay(REST_R, 0.5) + swipe_right_motion(), sw=0.08))
+        s = Session().play(right_hand(stay(REST_R, 0.5) + swipe_right_motion(), sw=0.05))
         self.assertEqual(s.names, [])
         self.assertFalse(s.engine.person_present)
 
@@ -351,20 +412,21 @@ class TestPresence(unittest.TestCase):
         self.assertEqual(s.names, [])
 
     def test_person_swap_restarts_the_hold(self):
-        s = Session().rest().play(right_hand(move(REST_R, PALM, 0.3) + stay(PALM, 0.7)))
-        s.play(right_hand(stay(PALM, 0.5), center=(0.8, 0.45)))   # shoulders jump 1.2 SW
+        other = {"center": (0.8, 0.45)}                     # shoulders jump 1.2 SW
+        s = Session().rest().play(right_hand(raise_and_hold(0.7)))
+        s.play(right_hand(stay(PALM, 0.5) + lower(), **other))
         self.assertEqual(s.names, [], "a different person must start a new hold")
-        s.play(right_hand(stay(PALM, 0.6), center=(0.8, 0.45)))
+        s.play(right_hand(raise_and_hold() + lower(), **other))
         self.assertEqual(s.names, ["open_palm"])
 
     def test_person_lost_mid_gesture_restarts_the_hold(self):
-        s = Session().rest().play(right_hand(move(REST_R, PALM, 0.3) + stay(PALM, 0.6)))
+        s = Session().rest().play(right_hand(raise_and_hold(0.6)))
         self.assertTrue(s.engine.person_present)
         s.play(right_hand(stay(PALM, 0.6), body_score=0.1))   # shoulders not visible
         self.assertFalse(s.engine.person_present)
-        s.play(right_hand(stay(PALM, 0.6)))
+        s.play(right_hand(stay(PALM, 0.6) + lower()))
         self.assertEqual(s.names, [], "the hold must restart after the person was lost")
-        s.play(right_hand(stay(PALM, 0.6)))
+        s.play(right_hand(raise_and_hold() + lower()))
         self.assertEqual(s.names, ["open_palm"])
 
 

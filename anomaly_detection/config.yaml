@@ -35,24 +35,18 @@ preprocessing:
 
 # --- Model (Autoencoder) -----------------------------------------------------
 model:
-  input_size: 10        # number of sensor tags (must match tag_names length)
-  hidden_size: 64       # neurons in the first/last hidden layers
-  bottleneck_size: 16   # neurons in the compressed middle layer
-  scaler_path: "models/scaler.pkl"           # where the fitted MinMaxScaler is saved
-  # Two files of the SAME network (training/quantize.py makes int8 from float32).
+  scaler_path: "models/scaler.json"          # per-tag min/max of the training windows
+  # Two files of the SAME network (training/train.py writes both).
+  # The CPU runs float32; the NPU runs int8 (it computes in integers).
   # Each has its own threshold: int8 rounding slightly raises normal errors.
-  variants:
-    float32:
-      model_path: "models/autoencoder.tflite"
-      threshold_path: "models/threshold.json"
-    int8:
-      model_path: "models/autoencoder_int8.tflite"
-      threshold_path: "models/threshold_int8.json"
-  # auto = int8 when use_npu is true (the NPU computes in integers), else float32.
-  # Env override: MODEL_PRECISION=auto|float32|int8
-  precision: auto
+  float32:
+    model_path: "models/autoencoder.tflite"
+    threshold_path: "models/threshold.json"
+  int8:
+    model_path: "models/autoencoder_int8.tflite"
+    threshold_path: "models/threshold_int8.json"
   # NPU acceleration (NXP i.MX 8M Plus, VeriSilicon VX delegate).
-  # Falls back to the CPU (same model) if the delegate cannot load or run.
+  # Falls back to the CPU (same int8 model) if the delegate cannot load or run.
   # Env overrides: USE_NPU=true|false, VX_DELEGATE_PATH=...
   # In Dockerfile.npu the entrypoint sets VX_DELEGATE_PATH=/opt/npu/lib/libvx_delegate.so
   # (a link to the device's delegate); the default below is where NXP's Yocto image installs it.
@@ -61,6 +55,9 @@ model:
 
 # --- Training (used by training/train.py) ------------------------------------
 training:
+  hidden_size: 64       # neurons in the first/last hidden layers
+  bottleneck_size: 16   # neurons in the compressed middle layer
+                        # (input and output size = the number of tag_names)
   epochs: 100           # number of full passes over the training data
   learning_rate: 0.001  # Adam optimizer step size
   batch_size: 32        # samples per training batch

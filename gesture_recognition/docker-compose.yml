@@ -17,6 +17,10 @@
 #     $wsl = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias "vEthernet (WSL*").IPAddress
 #     $env:CAMERA_URL = "http://${wsl}:8090/stream.mjpg"
 #     podman compose -f gesture_recognition\docker-compose.yml up --build
+#   Annotated stream (skeleton + gesture): http://localhost:8081/
+#
+# Note: gesture_recognition\.env (the OptixEdge camera, docker-compose.edge.yml)
+# is read here too; the $env:CAMERA_URL set above wins over it.
 #
 # Different broker port, e.g.:  $env:MQTT_PORT = "1884"   (before "up")
 services:
@@ -28,6 +32,8 @@ services:
     # with isolate=true, and two isolated networks cannot reach each other, so
     # a broker started by another stack (e.g. anomaly_detection) would time out.
     network_mode: bridge
+    ports:
+      - "8081:8081"     # MJPEG with the skeleton drawn on it
     environment:
       - PYTHONUNBUFFERED=1
       - TF_CPP_MIN_LOG_LEVEL=3

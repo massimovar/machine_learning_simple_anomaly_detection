@@ -12,21 +12,12 @@ sys.path.insert(0, SRC)
 
 import npu_evidence  # noqa: E402
 from benchmark import MAX_RUNS, run_benchmark  # noqa: E402
-from detector import DetectionResult, compute_anomaly_score, dequantize, detect, quantize  # noqa: E402
-from model import InferenceEngine, delegation_summary, graph_delegation, resolve_model_settings  # noqa: E402
+from main import alert_payload  # noqa: E402
+from model import InferenceEngine, dequantize, graph_delegation, quantize  # noqa: E402
 
 INT8_DETAIL = {"dtype": np.int8, "quantization": (1 / 255, -128)}
 FLOAT_MODEL = os.path.join(MODELS, "autoencoder.tflite")
 INT8_MODEL = os.path.join(MODELS, "autoencoder_int8.tflite")
-MODEL_CFG = {
-    "variants": {
-        "float32": {"model_path": "f.tflite", "threshold_path": "f.json"},
-        "int8": {"model_path": "q.tflite", "threshold_path": "q.json"},
-    },
-    "precision": "auto",
-    "use_npu": False,
-    "vx_delegate_path": "/usr/lib/libvx_delegate.so",
-}
 
 
 class QuantizationTests(unittest.TestCase):
@@ -43,25 +34,6 @@ class QuantizationTests(unittest.TestCase):
         detail = {"dtype": np.float32, "quantization": (0.0, 0)}
         values = np.array([0.25, 2.0], dtype=np.float32)
         np.testing.assert_array_equal(dequantize(quantize(values, detail), detail), values)
-
-
-class ModelSettingsTests(unittest.TestCase):
-    def test_auto_picks_float32_on_cpu_and_int8_on_npu(self):
-        self.assertEqual(resolve_model_settings(MODEL_CFG, {})["precision"], "float32")
-        npu = resolve_model_settings(MODEL_CFG, {"USE_NPU": "true"})
-        self.assertTrue(npu["use_npu"])
-        self.assertEqual((npu["precision"], npu["model_path"], npu["threshold_path"]), ("int8", "q.tflite", "q.json"))
-
-    def test_env_overrides_config(self):
-        cfg = dict(MODEL_CFG, use_npu=True)
-        settings = resolve_model_settings(cfg, {"USE_NPU": "0", "MODEL_PRECISION": "int8", "VX_DELEGATE_PATH": "/x.so"})
-        self.assertFalse(settings["use_npu"])
-        self.assertEqual(settings["precision"], "int8")
-        self.assertEqual(settings["vx_delegate_path"], "/x.so")
-
-    def test_unknown_precision_is_rejected(self):
-        with self.assertRaises(ValueError):
-            resolve_model_settings(MODEL_CFG, {"MODEL_PRECISION": "int4"})
 
 
 class EngineTests(unittest.TestCase):
@@ -81,21 +53,15 @@ class EngineTests(unittest.TestCase):
         self.assertIsNotNone(info["npu_error"])
         self.assertIsNone(info["delegate"])
 
-    def test_detect_scores_against_the_float_input(self):
+    def test_score_is_measured_against_the_float_input(self):
         engine = InferenceEngine(INT8_MODEL)
         vector = np.array([1.5] + [0.5] * 9, dtype=np.float32)  # 1.5 saturates in int8
-        result = detect(engine, vector, threshold=0.01)
-        expected = compute_anomaly_score(vector, engine.reconstruct(vector))
-        self.assertAlmostEqual(result.score, expected, places=6)
-        self.assertTrue(result.is_anomaly)
+        expected = float(np.mean((vector - engine.reconstruct(vector)) ** 2))
+        self.assertAlmostEqual(engine.score(vector), expected, places=6)
+        self.assertGreater(engine.score(vector), 0.01)
 
 
 class EvidenceTests(unittest.TestCase):
-    def test_delegation_lines_are_parsed(self):
-        log = ["INFO: Created TensorFlow Lite XNNPACK delegate for CPU.",
-               "INFO: Replacing 5 out of 5 node(s) with delegate (Vx Delegate) node, yielding 1 partitions."]
-        self.assertEqual(delegation_summary(log), [{"delegate": "Vx Delegate", "nodes": 5, "of": 5}])
-
     def test_graph_delegation_counts_nodes_inside_each_partition(self):
         # Our model's shape: t0 -> FC -> FC -> FC -> FC -> LOGISTIC -> t5 (weights omitted)
         chain = [{"op_name": "FULLY_CONNECTED", "inputs": [i], "outputs": [i + 1]} for i in range(4)]
@@ -112,16 +78,6 @@ class EvidenceTests(unittest.TestCase):
         for entry in delegation:  # runtimes without XNNPACK have no DELEGATE node: empty is fine
             self.assertEqual(entry["of"], 5)
 
-    def test_counters_parse_name_number_lines(self):
-        text = "Start:   10 ns\nOn:      2500 ns\ngarbage line\nIdle = 7\n"
-        self.assertEqual(npu_evidence.parse_counters(text), {"Start": 10, "On": 2500, "Idle": 7})
-
-    def test_counters_parse_galcore_idle_file(self):
-        # Real /sys/kernel/debug/gc/idle from the OptixEdge: thousands separators
-        text = "On:                    8,711,857,271 ns\nOff:              20,209,908,361,955 ns\nIdle:                              0 ns\n"
-        self.assertEqual(npu_evidence.parse_counters(text),
-                         {"On": 8711857271, "Off": 20209908361955, "Idle": 0})
-
     def test_graph_cache_lists_nb_files_only_when_enabled(self):
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, "abc.nb"), "wb") as f:
@@ -131,9 +87,6 @@ class EvidenceTests(unittest.TestCase):
             info = npu_evidence.graph_cache(env)
             self.assertEqual((info["files"], info["bytes"], info["names"]), (1, 42, ["abc.nb"]))
             self.assertEqual(npu_evidence.graph_cache({})["files"], 0)
-
-    def test_counters_absent_without_path(self):
-        self.assertIsNone(npu_evidence.read_counters({}))
 
     def test_driver_version_from_sysfs_first_token(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -159,6 +112,7 @@ class BenchmarkTests(unittest.TestCase):
         result = run_benchmark(main, cpu, np.full(10, 0.5, dtype=np.float32), runs=20)
         self.assertIsNone(result["npu"])
         self.assertIn("USE_NPU", result["npu_unavailable"])
+        self.assertEqual(result["model"], "autoencoder_int8.tflite")
         self.assertEqual(result["cpu"]["runs"], 20)
         self.assertEqual(result["max_output_difference"], 0.0)
         json.dumps(result)  # must be publishable as-is
@@ -170,12 +124,14 @@ class BenchmarkTests(unittest.TestCase):
 
 
 class AlertTests(unittest.TestCase):
-    def test_core_fields_unchanged_and_evidence_appended(self):
-        payload = json.loads(DetectionResult(True, 0.5, 0.01).to_alert_json({"accelerator": "npu"}))
-        self.assertEqual(list(payload)[:3], ["is_anomaly", "anomaly_score", "threshold"])
-        self.assertEqual(payload["accelerator"], "npu")
-        self.assertEqual(json.loads(DetectionResult(False, 0.0, 0.01).to_alert_json()),
-                         {"is_anomaly": False, "anomaly_score": 0.0, "threshold": 0.01})
+    def test_core_fields_first_then_evidence(self):
+        engine = InferenceEngine(INT8_MODEL)
+        engine.reconstruct(np.zeros(10, dtype=np.float32))
+        payload = json.loads(json.dumps(alert_payload(0.5, 0.01, engine)))
+        self.assertEqual(list(payload), ["is_anomaly", "anomaly_score", "threshold",
+                                         "accelerator", "precision", "inference_ms"])
+        self.assertEqual((payload["is_anomaly"], payload["accelerator"], payload["precision"]), (True, "cpu", "int8"))
+        self.assertFalse(alert_payload(0.001, 0.01, engine)["is_anomaly"])
 
 
 if __name__ == "__main__":

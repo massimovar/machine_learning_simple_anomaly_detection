@@ -1,0 +1,35 @@
+# ============================================================================
+# docker-compose.npu.yml — run MoveNet on the i.MX 8M Plus NPU (override file)
+# ============================================================================
+# Use on top of docker-compose.edge.yml, on a device whose firmware has the
+# NPU enabled (/dev/galcore present):
+#   docker-compose -p gesture_recognition -f docker-compose.edge.yml -f docker-compose.npu.yml up -d
+# (deploy_tools/deploy_edge.ps1 -Npu does the same.)
+#
+# What the container gets from the device, and why (nothing is installed there),
+# the same recipe as anomaly_detection/docker-compose.npu.yml:
+#   /dev/galcore        the NPU driver's door; containers share the host kernel.
+#                       Without it Docker refuses to create the container, so
+#                       never use this file on a device without the NPU.
+#   /usr/lib (ro)       the NPU libraries that match that driver; the image's
+#                       tools/npu_entrypoint.sh links only the NPU ones.
+#   npu-graph-cache     OpenVX stores the compiled NPU graph (*.nb) here: it only
+#                       appears if MoveNet was compiled for the NPU (evidence),
+#                       and it makes later starts faster.
+# If anything is missing the service still runs, on the CPU, and says so in its
+# log and in the MQTT status ("accelerator": "cpu").
+# ============================================================================
+services:
+  gesture:
+    devices:
+      - /dev/galcore:/dev/galcore
+    volumes:
+      - /usr/lib:/host/usr/lib:ro
+      - npu-graph-cache:/var/cache/npu
+    environment:
+      - USE_NPU=true
+      - VIV_VX_ENABLE_CACHE_GRAPH_BINARY=1
+      - VIV_VX_CACHE_BINARY_GRAPH_DIR=/var/cache/npu
+
+volumes:
+  npu-graph-cache:

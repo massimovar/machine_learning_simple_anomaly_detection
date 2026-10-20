@@ -1,0 +1,1065 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OptixEdge: Anomaly Detection on the Edge</title>
+  <style>
+    :root {
+      --bg-deep: #061422;
+      --bg-mid: #0e2439;
+      --bg-soft: #143556;
+      --line: rgba(110, 198, 255, 0.26);
+      --line-strong: rgba(120, 210, 255, 0.58);
+      --text-main: #e7f3ff;
+      --text-soft: #9bc3df;
+      --accent: #53bef7;
+      --accent-2: #7df4d6;
+      --warn: #ffd36a;
+      --danger: #ff8a7a;
+      --card-a: rgba(10, 30, 49, 0.91);
+      --card-b: rgba(5, 18, 32, 0.95);
+    }
+
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      font-family: "Segoe UI", sans-serif;
+      background: radial-gradient(120% 110% at 25% 10%, #163c5f 0%, #0c2034 40%, #061422 100%);
+      color: var(--text-main);
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: -30% -20%;
+      background:
+        radial-gradient(circle at 20% 35%, rgba(83, 190, 247, 0.14), transparent 30%),
+        radial-gradient(circle at 80% 25%, rgba(125, 244, 214, 0.10), transparent 28%),
+        radial-gradient(circle at 55% 80%, rgba(83, 190, 247, 0.12), transparent 34%);
+      animation: nebulaShift 18s ease-in-out infinite alternate;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    body::after {
+      content: "";
+      position: fixed;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(120, 210, 255, 0.06) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(120, 210, 255, 0.06) 1px, transparent 1px);
+      background-size: 44px 44px;
+      mask-image: radial-gradient(circle at 50% 50%, black 22%, transparent 76%);
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    @keyframes nebulaShift {
+      0% { transform: translate3d(-2%, -2%, 0) scale(1); }
+      100% { transform: translate3d(2%, 2%, 0) scale(1.08); }
+    }
+
+    #deck {
+      position: relative;
+      z-index: 1;
+      width: 100%;
+      height: 100%;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 10px;
+      padding: 12px;
+    }
+
+    #header {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: start;
+      gap: 12px;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: linear-gradient(180deg, rgba(9, 29, 48, 0.92), rgba(6, 20, 35, 0.94));
+      box-shadow: 0 10px 28px rgba(4, 14, 24, 0.42);
+    }
+
+    #header-copy {
+      min-width: 0;
+    }
+
+    #header-title {
+      margin: 0;
+      font-size: clamp(22px, 2.6vw, 36px);
+      letter-spacing: 0.02em;
+      font-weight: 900;
+      color: #ffffff;
+      text-transform: uppercase;
+    }
+
+    #header-sub {
+      margin-top: 3px;
+      font-size: clamp(14px, 1.4vw, 19px);
+      color: var(--text-soft);
+      font-weight: 600;
+    }
+
+    #lang-switch {
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+      justify-self: end;
+      align-self: start;
+      padding: 4px;
+      border: 1px solid rgba(110, 198, 255, 0.26);
+      border-radius: 999px;
+      background: rgba(8, 26, 44, 0.82);
+      box-shadow: inset 0 1px 0 rgba(120, 210, 255, 0.08);
+    }
+
+    .lang-btn {
+      min-width: 56px;
+      min-height: 38px;
+      border: 1px solid transparent;
+      border-radius: 999px;
+      background: transparent;
+      color: #b9dff5;
+      font: 800 13px/1 "Segoe UI", sans-serif;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      cursor: pointer;
+      transition: background 130ms ease, border-color 130ms ease, color 130ms ease, transform 110ms ease;
+      touch-action: manipulation;
+    }
+
+    .lang-btn:hover:not(.active) {
+      border-color: rgba(125, 244, 214, 0.28);
+      background: rgba(30, 67, 98, 0.58);
+      color: #ecfbff;
+      transform: translateY(-1px);
+    }
+
+    .lang-btn:focus-visible {
+      outline: 3px solid rgba(125, 244, 214, 0.95);
+      outline-offset: 2px;
+      box-shadow: 0 0 0 2px rgba(6, 20, 35, 0.95);
+    }
+
+    .lang-btn.active {
+      border-color: rgba(125, 244, 214, 0.58);
+      background: linear-gradient(120deg, rgba(40, 108, 118, 0.84), rgba(27, 72, 104, 0.88));
+      color: #ffffff;
+      box-shadow: 0 8px 16px rgba(4, 18, 28, 0.34);
+    }
+
+    #stage {
+      min-height: 0;
+      min-width: 0;
+      display: grid;
+      grid-template-columns: minmax(170px, 18vw) minmax(0, 1fr);
+      gap: 10px;
+    }
+
+    #step-rail {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: linear-gradient(180deg, rgba(9, 29, 48, 0.92), rgba(6, 20, 35, 0.96));
+      padding: 8px;
+      min-width: 0;
+      display: grid;
+      gap: 6px;
+      align-content: start;
+      box-shadow: 0 10px 22px rgba(2, 11, 20, 0.42);
+    }
+
+    .step-chip {
+      width: 100%;
+      border: 1px solid rgba(85, 170, 226, 0.30);
+      background: rgba(22, 50, 77, 0.45);
+      color: #afd6ef;
+      border-radius: 10px;
+      padding: 12px 11px;
+      text-align: left;
+      font: 700 15px/1.2 "Segoe UI", sans-serif;
+      letter-spacing: 0.01em;
+      cursor: pointer;
+      transition: transform 120ms ease, background 140ms ease, border-color 140ms ease, color 140ms ease;
+      min-height: 48px;
+      touch-action: manipulation;
+    }
+
+    .step-chip strong {
+      display: inline-block;
+      min-width: 28px;
+      margin-right: 6px;
+      color: #c6e8ff;
+      font-weight: 900;
+    }
+
+    .step-chip:hover {
+      transform: translateX(3px);
+      border-color: rgba(126, 214, 255, 0.52);
+      background: rgba(36, 78, 116, 0.52);
+      color: #d7efff;
+    }
+
+    .step-chip:focus-visible {
+      outline: 3px solid rgba(125, 244, 214, 0.95);
+      outline-offset: 2px;
+      box-shadow: 0 0 0 2px rgba(6, 20, 35, 0.95);
+    }
+
+    .step-chip.active {
+      border-color: rgba(125, 244, 214, 0.64);
+      background: linear-gradient(120deg, rgba(35, 92, 108, 0.72), rgba(25, 64, 98, 0.74));
+      color: #ecfff8;
+      box-shadow: 0 8px 18px rgba(6, 25, 38, 0.38);
+      transform: translateX(4px);
+    }
+
+    #slide-card {
+      min-height: 0;
+      border: 1px solid var(--line-strong);
+      border-radius: 16px;
+      background: linear-gradient(180deg, var(--card-a), var(--card-b));
+      box-shadow: 0 16px 34px rgba(3, 12, 24, 0.48);
+      display: grid;
+      grid-template-rows: auto auto 1fr;
+      overflow: hidden;
+      position: relative;
+    }
+
+    #slide-card::before {
+      content: "";
+      position: absolute;
+      left: -60%;
+      top: 0;
+      width: 60%;
+      height: 100%;
+      background: linear-gradient(90deg, transparent, rgba(125, 244, 214, 0.07), transparent);
+      transform: skewX(-18deg);
+      animation: scan 8s linear infinite;
+      pointer-events: none;
+    }
+
+    @keyframes scan {
+      0% { left: -60%; }
+      100% { left: 130%; }
+    }
+
+    #slide-head {
+      padding: 14px 18px 6px;
+      border-bottom: 1px solid rgba(120, 210, 255, 0.2);
+    }
+
+    #slide-kicker {
+      font-size: 14px;
+      color: #87c8ec;
+      letter-spacing: 0.13em;
+      text-transform: uppercase;
+      font-weight: 800;
+    }
+
+    #slide-title {
+      margin: 7px 0 4px;
+      font-size: clamp(24px, 2.6vw, 40px);
+      line-height: 1.16;
+      color: #ffffff;
+      font-weight: 900;
+    }
+
+    #slide-summary {
+      padding: 12px 18px 6px;
+      color: #d8edfb;
+      font-size: clamp(17px, 1.6vw, 24px);
+      line-height: 1.42;
+      font-weight: 600;
+    }
+
+    #slide-body {
+      min-height: 0;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      padding: 8px 18px 12px;
+      align-items: stretch;
+    }
+
+    #slide-card.single-col #slide-body {
+      grid-template-columns: 1fr;
+    }
+
+    #slide-points,
+    #slide-facts {
+      min-height: 0;
+      border: 1px solid rgba(102, 188, 242, 0.25);
+      border-radius: 12px;
+      background: rgba(15, 36, 56, 0.53);
+      padding: 10px 12px;
+    }
+
+    #slide-points-title,
+    #slide-facts-title {
+      color: #9cd4f4;
+      font-size: 14px;
+      letter-spacing: 0.11em;
+      text-transform: uppercase;
+      margin-bottom: 10px;
+      font-weight: 800;
+    }
+
+    #points-list {
+      margin: 0;
+      padding-left: 20px;
+      color: #e7f3ff;
+      font-size: clamp(15px, 1.3vw, 21px);
+      line-height: 1.46;
+      display: grid;
+      gap: 10px;
+    }
+
+    #facts-grid {
+      margin: 0;
+      display: grid;
+      gap: 8px;
+      grid-template-columns: 1fr;
+    }
+
+    .fact-tile {
+      border: 1px solid rgba(122, 205, 255, 0.27);
+      border-radius: 10px;
+      background: rgba(18, 47, 74, 0.54);
+      padding: 8px 10px;
+      transform: translateY(8px);
+      opacity: 0;
+      animation: riseIn 330ms ease forwards;
+    }
+
+    .fact-label {
+      color: #8ec3e2;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-bottom: 3px;
+      font-weight: 800;
+    }
+
+    .fact-value {
+      color: #f3fbff;
+      font-size: clamp(14px, 1.2vw, 19px);
+      line-height: 1.30;
+      font-weight: 700;
+      word-break: break-word;
+    }
+
+    @keyframes riseIn {
+      to {
+        transform: translateY(0);
+        opacity: 1;
+      }
+    }
+
+    .slide-anim {
+      animation: cardShift 220ms ease;
+    }
+
+    @keyframes cardShift {
+      from { opacity: 0.36; transform: translateX(14px) scale(0.995); }
+      to { opacity: 1; transform: translateX(0) scale(1); }
+    }
+
+    #footer {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: linear-gradient(180deg, rgba(10, 30, 49, 0.92), rgba(6, 20, 35, 0.95));
+      box-shadow: 0 8px 22px rgba(3, 12, 24, 0.38);
+      padding: 8px 12px;
+      display: grid;
+      grid-template-columns: auto minmax(120px, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+    }
+
+    #nav {
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .nav-btn {
+      min-width: 100px;
+      min-height: 46px;
+      border: 1px solid rgba(110, 198, 255, 0.35);
+      border-radius: 10px;
+      background: rgba(27, 61, 92, 0.56);
+      color: #e5f4ff;
+      font: 800 15px/1 "Segoe UI", sans-serif;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      cursor: pointer;
+      transition: background 130ms ease, border-color 130ms ease, transform 110ms ease;
+      touch-action: manipulation;
+    }
+
+    .nav-btn:hover:not(:disabled) {
+      border-color: rgba(125, 244, 214, 0.54);
+      background: rgba(39, 92, 122, 0.63);
+      transform: translateY(-1px);
+    }
+
+    .nav-btn:focus-visible {
+      outline: 3px solid rgba(125, 244, 214, 0.95);
+      outline-offset: 2px;
+      box-shadow: 0 0 0 2px rgba(6, 20, 35, 0.95);
+    }
+
+    .nav-btn:disabled {
+      opacity: 0.36;
+      cursor: default;
+    }
+
+    #progress-wrap {
+      width: 100%;
+      height: 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(120, 210, 255, 0.26);
+      background: rgba(8, 26, 44, 0.74);
+      overflow: hidden;
+      position: relative;
+    }
+
+    #progress-bar {
+      width: 0;
+      height: 100%;
+      background: linear-gradient(90deg, #53bef7, #7df4d6);
+      box-shadow: 0 0 14px rgba(125, 244, 214, 0.45);
+      transition: width 260ms ease;
+    }
+
+    #footer-note {
+      text-align: right;
+      color: #9ec8e4;
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      white-space: nowrap;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      body::before,
+      #slide-card::before,
+      .fact-tile,
+      .slide-anim {
+        animation: none !important;
+      }
+
+      .step-chip,
+      .nav-btn,
+      #progress-bar,
+      #slide-card {
+        transition: none !important;
+      }
+    }
+
+    @media (max-width: 1060px) {
+      #stage {
+        grid-template-columns: 1fr;
+        grid-template-rows: auto minmax(0, 1fr);
+      }
+
+      #step-rail {
+        display: flex;
+        gap: 8px;
+        min-width: 0;
+        width: 100%;
+        max-width: 100%;
+        overflow-x: auto;
+        overflow-y: hidden;
+        overscroll-behavior-x: contain;
+        scroll-snap-type: x proximity;
+        scrollbar-width: none;
+        -ms-overflow-style: none;
+        -webkit-overflow-scrolling: touch;
+        box-sizing: border-box;
+        padding-bottom: 6px;
+        box-shadow:
+          inset 18px 0 14px -14px rgba(6, 20, 35, 0.92),
+          inset -18px 0 14px -14px rgba(6, 20, 35, 0.92),
+          0 10px 22px rgba(2, 11, 20, 0.42);
+      }
+
+      #step-rail::-webkit-scrollbar {
+        display: none;
+      }
+
+      .step-chip {
+        flex: 0 0 auto;
+        width: auto;
+        min-width: clamp(120px, 28vw, 160px);
+        max-width: 65vw;
+        min-height: 48px;
+        padding: 10px;
+        scroll-snap-align: start;
+      }
+
+      .step-chip:hover,
+      .step-chip.active {
+        transform: none;
+      }
+
+      #slide-body {
+        grid-template-columns: 1fr;
+        gap: 10px;
+      }
+
+      #footer {
+        grid-template-columns: auto minmax(100px, 1fr);
+        grid-template-rows: auto auto;
+      }
+
+      #footer-note {
+        grid-column: 1 / -1;
+        text-align: left;
+      }
+    }
+
+    @media (max-width: 640px) {
+      #deck { padding: 10px; gap: 10px; }
+      #header { padding: 10px; }
+      #lang-switch { gap: 6px; }
+      .lang-btn { min-width: 50px; min-height: 34px; font-size: 12px; }
+      .step-chip { min-width: 116px; max-width: 74vw; font-size: 13px; }
+      #slide-head { padding: 12px 12px 7px; }
+      #slide-summary { padding: 10px 12px 4px; }
+      #slide-body { padding: 8px 12px 12px; gap: 8px; }
+      #points-list { gap: 6px; }
+      #footer { padding: 8px 9px; gap: 8px; }
+      .nav-btn { min-width: 78px; min-height: 40px; font-size: 12px; }
+      #footer-note { font-size: 11px; }
+    }
+  </style>
+</head>
+<body>
+  <main id="deck" aria-label="OptixEdge presentation">
+    <header id="header">
+      <div id="header-copy">
+        <h1 id="header-title">OptixEdge: Anomaly Detection on the Edge</h1>
+        <div id="header-sub"></div>
+      </div>
+      <div id="lang-switch" role="group" aria-label="Change language">
+        <button id="lang-en-btn" class="lang-btn active" type="button" aria-label="Switch to English" aria-pressed="true">EN</button>
+        <button id="lang-it-btn" class="lang-btn" type="button" aria-label="Switch to Italian" aria-pressed="false">IT</button>
+      </div>
+    </header>
+
+    <section id="stage">
+      <nav id="step-rail" aria-label="Presentation sections"></nav>
+
+      <article id="slide-card" aria-live="polite">
+        <div id="slide-head">
+          <div id="slide-kicker"></div>
+          <h2 id="slide-title"></h2>
+        </div>
+        <div id="slide-summary"></div>
+        <div id="slide-body">
+          <section id="slide-points">
+            <div id="slide-points-title">Key Points</div>
+            <ul id="points-list"></ul>
+          </section>
+          <section id="slide-facts">
+            <div id="slide-facts-title">Project Facts</div>
+            <div id="facts-grid"></div>
+          </section>
+        </div>
+      </article>
+    </section>
+
+    <footer id="footer">
+      <div id="nav">
+        <button id="prev-btn" class="nav-btn" type="button" aria-label="Previous section">Previous</button>
+        <button id="next-btn" class="nav-btn" type="button" aria-label="Next section">Next</button>
+      </div>
+      <div id="progress-wrap" aria-label="Progress">
+        <div id="progress-bar"></div>
+      </div>
+      <div id="footer-note"></div>
+    </footer>
+  </main>
+
+  <script>
+  (function () {
+    "use strict";
+
+    var translations = {
+      en: {
+        documentTitle: "OptixEdge: Anomaly Detection on the Edge",
+        deckAriaLabel: "OptixEdge presentation",
+        railAriaLabel: "Presentation sections",
+        progressAriaLabel: "Progress",
+        languageSwitchAriaLabel: "Change language",
+        languageButtonAriaLabels: { en: "Switch to English", it: "Switch to Italian" },
+        headerTitle: "OptixEdge: Anomaly Detection on the Edge",
+        headerSub: "FactoryTalk Optix + an AI model that learns what \"normal\" looks like, all on one device",
+        pointsTitle: "Key Points",
+        factsTitle: "Project Facts",
+        prevLabel: "Previous",
+        prevAriaLabel: "Previous section",
+        nextLabel: "Next",
+        nextAriaLabel: "Next section",
+        footerNote: "Keyboard left/right to navigate",
+        steps: [
+          {
+            label: "Overview",
+            title: "What This Project Is",
+            summary: "A digital twin of a paper-clip machine, watched by a small AI model that runs directly on OptixEdge and says, every 30 seconds, whether the machine behaves normally.",
+            points: [
+              "FactoryTalk Optix simulates the machine: 10 sensors, read every second.",
+              "One button injects a fault; one indicator shows the AI's verdict.",
+              "A 3-D scene of the machine turns to alarm when the AI sees an anomaly.",
+              "Everything runs on the OptixEdge next to the machine: no cloud, no PC."
+            ],
+            facts: [
+              { k: "The machine", v: "Paper-clip line: feed wire, bend, cut, package" },
+              { k: "What is measured", v: "10 sensors: motor currents, temperature, vibration, rejects..." },
+              { k: "The answer", v: "One bit: normal or anomaly" }
+            ]
+          },
+          {
+            label: "The problem",
+            title: "Why Classic Alarms Miss It",
+            summary: "Machines rarely fail with one value out of range. More often every sensor still looks fine, but the way they move together has changed. A classic alarm, one threshold per sensor, cannot see that.",
+            points: [
+              "Each sensor can stay inside its limits while the machine is already wearing out.",
+              "The warning sign is in the relationships: more current for the same speed, for example.",
+              "Writing rules for every combination of 10 sensors by hand is not realistic.",
+              "The data to see it is often already collected, and rarely used."
+            ],
+            facts: [
+              { k: "Classic alarm", v: "One sensor, one fixed threshold" },
+              { k: "This project", v: "All 10 sensors judged together, as one pattern" },
+              { k: "Who sets the limits", v: "The machine's own data, not hand-written rules" }
+            ]
+          },
+          {
+            label: "Architecture",
+            title: "Three Pieces, One Box",
+            summary: "FactoryTalk Optix collects the data, a messenger delivers it, the AI model judges it and sends back its verdict. All three live on the same OptixEdge.",
+            points: [
+              "FactoryTalk Optix publishes the 10 sensor readings every second.",
+              "A messenger (an MQTT broker) delivers them, like a post office with mailboxes.",
+              "The AI model collects 30 seconds of readings, judges them and replies.",
+              "The verdict goes back to the HMI panel and to the 3-D scene."
+            ],
+            facts: [
+              { k: "Where it runs", v: "On OptixEdge, fully offline" },
+              { k: "Decision rhythm", v: "One verdict every 30 seconds" },
+              { k: "Packaging", v: "Two containers: easy to install, update and remove" }
+            ]
+          },
+          {
+            label: "The model",
+            title: "A Model That Only Knows \"Normal\"",
+            summary: "The AI is an autoencoder: it squeezes the 10 readings into a short summary and rebuilds them. It was trained only on healthy data, so it is good at rebuilding normal behavior, and only that.",
+            points: [
+              "Imagine it has only ever learned to draw circles.",
+              "A circle goes in, a circle comes out: almost no difference. Normal.",
+              "A square goes in, it still draws a circle: a big difference. Anomaly.",
+              "The size of that difference, compared with a threshold, is the verdict."
+            ],
+            facts: [
+              { k: "Training data", v: "5 000 normal readings: no fault examples needed" },
+              { k: "The threshold", v: "Learned automatically from normal data" },
+              { k: "Model size", v: "About 7 KB: smaller than a photo on your phone" }
+            ]
+          },
+          {
+            label: "The AI chip",
+            title: "Running on the NPU",
+            summary: "Inside the OptixEdge there is a chip made for neural networks: the NPU. Our model runs on it, from inside its container, without installing anything on the device.",
+            points: [
+              "The model is translated into 8-bit integers, the NPU's native language.",
+              "The translated model gives the same verdicts as the original.",
+              "The container borrows the NPU driver from the device, read-only.",
+              "If the NPU is not available, the model falls back to the CPU and says so."
+            ],
+            facts: [
+              { k: "Processor", v: "NXP i.MX 8M Plus: CPU, graphics chip and NPU" },
+              { k: "NPU power", v: "About 2.3 trillion operations per second" },
+              { k: "Installed on the device", v: "Nothing: the device only lends what it has" }
+            ]
+          },
+          {
+            label: "The proof",
+            title: "Prove It, Don't Claim It",
+            summary: "A label saying \"NPU\" proves nothing. The HMI panel shows evidence from independent witnesses, and when we switch the NPU off on purpose, every sign must disappear.",
+            points: [
+              "Our software, the AI runtime and the NPU driver each confirm it.",
+              "The whole model, 5 of 5 layers, is handed over to the NPU.",
+              "Switch the NPU off: the panel badge must turn to CPU. It does.",
+              "If the AI service stops, the messenger announces it: no stale badge."
+            ],
+            facts: [
+              { k: "Model on the NPU", v: "5 of 5 layers" },
+              { k: "Same answer", v: "CPU and NPU outputs identical (difference 0.0)" },
+              { k: "Where to see it", v: "FactoryTalk Optix proof panel, with a Benchmark button" }
+            ]
+          },
+          {
+            label: "The surprise",
+            title: "Fast Enough, and an Honest Result",
+            summary: "For a model this small, the CPU is actually faster than the NPU. It is like hiring a truck to move one box: carrying it by hand wins. Both are far faster than needed.",
+            points: [
+              "Each trip to the NPU has a fixed cost, however small the job.",
+              "Our model is tiny, so the trip costs more than the work itself.",
+              "Bigger models, like image recognition, are where the NPU wins.",
+              "Work done by the NPU leaves the CPU free for the HMI."
+            ],
+            facts: [
+              { k: "One check on the CPU", v: "About 0.35 ms" },
+              { k: "One check on the NPU", v: "About 0.77 ms" },
+              { k: "Time between checks", v: "30 s: both are thousands of times faster than needed" }
+            ]
+          },
+          {
+            label: "Takeaways",
+            title: "Takeaways",
+            summary: "What matters from this demo.",
+            points: [
+              "Let the data speak: the model learns normal behavior directly from the machine.",
+              "No hand-crafted alarms for complex patterns: the model sees what rules miss.",
+              "Your data stays yours: everything runs locally and offline, with low latency.",
+              "Machines age: retrain the model on the \"new normal\" and keep going."
+            ],
+            facts: [
+              { k: "Approach", v: "Learns \"normal\" from data; no fault examples needed" },
+              { k: "Edge benefit", v: "Offline, low latency, data stays on site" },
+              { k: "Need the cloud?", v: "Send the result (one bit), not the raw data" }
+            ]
+          }
+        ]
+      },
+      it: {
+        documentTitle: "OptixEdge: Rilevamento anomalie sull'edge",
+        deckAriaLabel: "Presentazione OptixEdge",
+        railAriaLabel: "Sezioni della presentazione",
+        progressAriaLabel: "Avanzamento",
+        languageSwitchAriaLabel: "Cambia lingua",
+        languageButtonAriaLabels: { en: "Passa all'inglese", it: "Passa all'italiano" },
+        headerTitle: "OptixEdge: Rilevamento anomalie sull'edge",
+        headerSub: "FactoryTalk Optix + un modello AI che impara com'è il \"normale\", tutto su un solo dispositivo",
+        pointsTitle: "Punti chiave",
+        factsTitle: "Dati del progetto",
+        prevLabel: "Precedente",
+        prevAriaLabel: "Sezione precedente",
+        nextLabel: "Successivo",
+        nextAriaLabel: "Sezione successiva",
+        footerNote: "Usa i tasti sinistra/destra per navigare",
+        steps: [
+          {
+            label: "Panoramica",
+            title: "Che cos'è questo progetto",
+            summary: "Un digital twin di una macchina per graffette, sorvegliato da un piccolo modello AI che gira direttamente su OptixEdge e dice, ogni 30 secondi, se la macchina si comporta normalmente.",
+            points: [
+              "FactoryTalk Optix simula la macchina: 10 sensori, letti ogni secondo.",
+              "Un pulsante inietta un guasto; un indicatore mostra il verdetto dell'AI.",
+              "Una scena 3D della macchina va in allarme quando l'AI vede un'anomalia.",
+              "Tutto gira sull'OptixEdge accanto alla macchina: niente cloud, niente PC."
+            ],
+            facts: [
+              { k: "La macchina", v: "Linea graffette: alimenta il filo, piega, taglia, confeziona" },
+              { k: "Cosa si misura", v: "10 sensori: correnti motore, temperatura, vibrazioni, scarti..." },
+              { k: "La risposta", v: "Un bit: normale o anomalia" }
+            ]
+          },
+          {
+            label: "Il problema",
+            title: "Perché gli allarmi classici non lo vedono",
+            summary: "Raramente una macchina si guasta con un valore fuori scala. Più spesso ogni sensore sembra ancora a posto, ma è cambiato il modo in cui si muovono insieme. Un allarme classico, una soglia per sensore, non può vederlo.",
+            points: [
+              "Ogni sensore può restare nei limiti mentre la macchina si sta già usurando.",
+              "Il segnale è nelle relazioni: per esempio più corrente a parità di velocità.",
+              "Scrivere a mano regole per ogni combinazione di 10 sensori non è realistico.",
+              "I dati per vederlo spesso sono già raccolti, e raramente usati."
+            ],
+            facts: [
+              { k: "Allarme classico", v: "Un sensore, una soglia fissa" },
+              { k: "Questo progetto", v: "Tutti i 10 sensori giudicati insieme, come un unico pattern" },
+              { k: "Chi fissa i limiti", v: "I dati della macchina stessa, non regole scritte a mano" }
+            ]
+          },
+          {
+            label: "Architettura",
+            title: "Tre pezzi, una scatola",
+            summary: "FactoryTalk Optix raccoglie i dati, un messaggero li consegna, il modello AI li giudica e rimanda il verdetto. Tutti e tre vivono sullo stesso OptixEdge.",
+            points: [
+              "FactoryTalk Optix pubblica le 10 letture dei sensori ogni secondo.",
+              "Un messaggero (un broker MQTT) le consegna, come un ufficio postale con le caselle.",
+              "Il modello AI raccoglie 30 secondi di letture, le giudica e risponde.",
+              "Il verdetto torna al pannello HMI e alla scena 3D."
+            ],
+            facts: [
+              { k: "Dove gira", v: "Su OptixEdge, completamente offline" },
+              { k: "Ritmo delle decisioni", v: "Un verdetto ogni 30 secondi" },
+              { k: "Confezione", v: "Due container: facili da installare, aggiornare e rimuovere" }
+            ]
+          },
+          {
+            label: "Il modello",
+            title: "Un modello che conosce solo il \"normale\"",
+            summary: "L'AI è un autoencoder: comprime le 10 letture in un breve riassunto e poi le ricostruisce. È stato addestrato solo su dati sani, quindi sa ricostruire bene il comportamento normale, e solo quello.",
+            points: [
+              "Immagina che abbia imparato a disegnare soltanto cerchi.",
+              "Entra un cerchio, esce un cerchio: quasi nessuna differenza. Normale.",
+              "Entra un quadrato, disegna comunque un cerchio: grande differenza. Anomalia.",
+              "L'ampiezza di quella differenza, confrontata con una soglia, è il verdetto."
+            ],
+            facts: [
+              { k: "Dati di addestramento", v: "5 000 letture normali: nessun esempio di guasto necessario" },
+              { k: "La soglia", v: "Imparata automaticamente dai dati normali" },
+              { k: "Dimensione del modello", v: "Circa 7 KB: meno di una foto sul telefono" }
+            ]
+          },
+          {
+            label: "Il chip AI",
+            title: "In esecuzione sull'NPU",
+            summary: "Dentro l'OptixEdge c'è un chip fatto per le reti neurali: l'NPU. Il nostro modello gira lì, dall'interno del suo container, senza installare nulla sul dispositivo.",
+            points: [
+              "Il modello viene tradotto in interi a 8 bit, la lingua nativa dell'NPU.",
+              "Il modello tradotto dà gli stessi verdetti dell'originale.",
+              "Il container prende in prestito il driver NPU dal dispositivo, in sola lettura.",
+              "Se l'NPU non è disponibile, il modello passa alla CPU e lo dichiara."
+            ],
+            facts: [
+              { k: "Processore", v: "NXP i.MX 8M Plus: CPU, chip grafico e NPU" },
+              { k: "Potenza NPU", v: "Circa 2,3 mila miliardi di operazioni al secondo" },
+              { k: "Installato sul dispositivo", v: "Niente: il dispositivo presta solo ciò che ha" }
+            ]
+          },
+          {
+            label: "La prova",
+            title: "Dimostrarlo, non dichiararlo",
+            summary: "Un'etichetta con scritto \"NPU\" non prova nulla. Il pannello HMI mostra le prove di testimoni indipendenti e, quando spegniamo apposta l'NPU, ogni segnale deve sparire.",
+            points: [
+              "Il nostro software, il runtime AI e il driver NPU lo confermano ciascuno.",
+              "L'intero modello, 5 strati su 5, viene affidato all'NPU.",
+              "Spegni l'NPU: il badge sul pannello deve passare a CPU. E lo fa.",
+              "Se il servizio AI si ferma, il messaggero lo annuncia: niente badge vecchi."
+            ],
+            facts: [
+              { k: "Modello sull'NPU", v: "5 strati su 5" },
+              { k: "Stessa risposta", v: "Uscite di CPU e NPU identiche (differenza 0,0)" },
+              { k: "Dove vederlo", v: "Pannello prove di FactoryTalk Optix, con pulsante Benchmark" }
+            ]
+          },
+          {
+            label: "La sorpresa",
+            title: "Veloce abbastanza, e un risultato onesto",
+            summary: "Per un modello così piccolo, la CPU è in realtà più veloce dell'NPU. È come noleggiare un camion per spostare una scatola: portarla a mano vince. Entrambi sono molto più veloci del necessario.",
+            points: [
+              "Ogni viaggio verso l'NPU ha un costo fisso, per quanto piccolo sia il lavoro.",
+              "Il nostro modello è minuscolo: il viaggio costa più del lavoro stesso.",
+              "I modelli grandi, come il riconoscimento di immagini, sono dove l'NPU vince.",
+              "Il lavoro fatto dall'NPU lascia la CPU libera per l'HMI."
+            ],
+            facts: [
+              { k: "Un controllo sulla CPU", v: "Circa 0,35 ms" },
+              { k: "Un controllo sull'NPU", v: "Circa 0,77 ms" },
+              { k: "Tempo tra due controlli", v: "30 s: entrambi migliaia di volte più veloci del necessario" }
+            ]
+          },
+          {
+            label: "Conclusioni",
+            title: "Messaggi chiave",
+            summary: "Cosa conta in questa demo.",
+            points: [
+              "Lasciamo parlare i dati: il modello impara il normale direttamente dalla macchina.",
+              "Niente allarmi fatti a mano per pattern complessi: il modello vede ciò che sfugge.",
+              "I dati restano vostri: tutto gira in locale e offline, con bassa latenza.",
+              "Le macchine invecchiano: riaddestra il modello sulla \"nuova normalità\"."
+            ],
+            facts: [
+              { k: "Approccio", v: "Impara il \"normale\" dai dati; nessun esempio di guasto" },
+              { k: "Vantaggio edge", v: "Offline, bassa latenza, i dati restano in sito" },
+              { k: "Serve il cloud?", v: "Invia il risultato (un bit), non i dati grezzi" }
+            ]
+          }
+        ]
+      }
+    };
+
+    var deckEl = document.getElementById("deck");
+    var railEl = document.getElementById("step-rail");
+    var cardEl = document.getElementById("slide-card");
+    var headerTitleEl = document.getElementById("header-title");
+    var headerSubEl = document.getElementById("header-sub");
+    var kickerEl = document.getElementById("slide-kicker");
+    var titleEl = document.getElementById("slide-title");
+    var summaryEl = document.getElementById("slide-summary");
+    var pointsTitleEl = document.getElementById("slide-points-title");
+    var pointsEl = document.getElementById("points-list");
+    var factsTitleEl = document.getElementById("slide-facts-title");
+    var factsGridEl = document.getElementById("facts-grid");
+    var prevBtn = document.getElementById("prev-btn");
+    var nextBtn = document.getElementById("next-btn");
+    var progressWrapEl = document.getElementById("progress-wrap");
+    var progressEl = document.getElementById("progress-bar");
+    var footerNoteEl = document.getElementById("footer-note");
+    var langSwitchEl = document.getElementById("lang-switch");
+    var langButtons = {
+      en: document.getElementById("lang-en-btn"),
+      it: document.getElementById("lang-it-btn")
+    };
+
+    var activeLanguage = "en";
+    var index = 0;
+    var chips = [];
+
+    function t() {
+      return translations[activeLanguage];
+    }
+
+    function clampIndex(newIndex) {
+      return Math.max(0, Math.min(t().steps.length - 1, newIndex));
+    }
+
+    function updateLanguageButtons() {
+      Object.keys(langButtons).forEach(function (language) {
+        var isActive = language === activeLanguage;
+        langButtons[language].classList.toggle("active", isActive);
+        langButtons[language].setAttribute("aria-pressed", isActive ? "true" : "false");
+      });
+    }
+
+    function updateStaticText() {
+      var tr = t();
+      document.title = tr.documentTitle;
+      document.documentElement.lang = activeLanguage;
+      deckEl.setAttribute("aria-label", tr.deckAriaLabel);
+      railEl.setAttribute("aria-label", tr.railAriaLabel);
+      progressWrapEl.setAttribute("aria-label", tr.progressAriaLabel);
+      langSwitchEl.setAttribute("aria-label", tr.languageSwitchAriaLabel);
+      headerTitleEl.textContent = tr.headerTitle;
+      headerSubEl.textContent = tr.headerSub;
+      pointsTitleEl.textContent = tr.pointsTitle;
+      factsTitleEl.textContent = tr.factsTitle;
+      prevBtn.textContent = tr.prevLabel;
+      prevBtn.setAttribute("aria-label", tr.prevAriaLabel);
+      nextBtn.textContent = tr.nextLabel;
+      nextBtn.setAttribute("aria-label", tr.nextAriaLabel);
+      footerNoteEl.textContent = tr.footerNote;
+      langButtons.en.setAttribute("aria-label", tr.languageButtonAriaLabels.en);
+      langButtons.it.setAttribute("aria-label", tr.languageButtonAriaLabels.it);
+    }
+
+    function buildRail() {
+      railEl.innerHTML = "";
+      chips = t().steps.map(function (step, stepIndex) {
+        var button = document.createElement("button");
+        var number = document.createElement("strong");
+        button.type = "button";
+        button.className = "step-chip";
+        button.setAttribute("aria-label", (stepIndex + 1) + ". " + step.label);
+        number.textContent = (stepIndex + 1) + ". ";
+        button.appendChild(number);
+        button.appendChild(document.createTextNode(step.label));
+        button.addEventListener("click", function () { setStep(stepIndex); });
+        railEl.appendChild(button);
+        return button;
+      });
+    }
+
+    function renderFacts(facts) {
+      factsGridEl.innerHTML = "";
+      facts.forEach(function (fact, factIndex) {
+        var tile = document.createElement("div");
+        var key = document.createElement("div");
+        var value = document.createElement("div");
+        tile.className = "fact-tile";
+        tile.style.animationDelay = (factIndex * 70) + "ms";
+        key.className = "fact-label";
+        key.textContent = fact.k;
+        value.className = "fact-value";
+        value.textContent = fact.v;
+        tile.appendChild(key);
+        tile.appendChild(value);
+        factsGridEl.appendChild(tile);
+      });
+    }
+
+    function renderPoints(points) {
+      pointsEl.innerHTML = "";
+      points.forEach(function (point) {
+        var item = document.createElement("li");
+        item.textContent = point;
+        pointsEl.appendChild(item);
+      });
+    }
+
+    // Long bullets or few facts read better in one column.
+    function shouldUseSingleColumn(step) {
+      return step.facts.length < 3 || step.points.some(function (point) { return point.length > 92; });
+    }
+
+    function setStep(newIndex) {
+      var steps = t().steps;
+      var step;
+
+      index = clampIndex(newIndex);
+      step = steps[index];
+
+      cardEl.classList.remove("slide-anim");
+      void cardEl.offsetWidth;
+      cardEl.classList.add("slide-anim");
+
+      kickerEl.textContent = (index + 1) + " / " + steps.length;
+      titleEl.textContent = step.title;
+      summaryEl.textContent = step.summary;
+      renderPoints(step.points);
+      renderFacts(step.facts);
+      cardEl.classList.toggle("single-col", shouldUseSingleColumn(step));
+
+      chips.forEach(function (chip, chipIndex) {
+        chip.classList.toggle("active", chipIndex === index);
+      });
+      if (chips[index] && window.matchMedia("(max-width: 1060px)").matches) {
+        chips[index].scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+      }
+
+      prevBtn.disabled = index === 0;
+      nextBtn.disabled = index === steps.length - 1;
+      progressEl.style.width = (((index + 1) / steps.length) * 100) + "%";
+    }
+
+    function setLanguage(language) {
+      if (!translations[language] || language === activeLanguage) {
+        return;
+      }
+      activeLanguage = language;
+      updateStaticText();
+      buildRail();
+      setStep(index);
+      updateLanguageButtons();
+    }
+
+    prevBtn.addEventListener("click", function () { setStep(index - 1); });
+    nextBtn.addEventListener("click", function () { setStep(index + 1); });
+
+    window.addEventListener("keydown", function (event) {
+      if (event.key === "ArrowLeft") { setStep(index - 1); }
+      if (event.key === "ArrowRight") { setStep(index + 1); }
+    });
+
+    Object.keys(langButtons).forEach(function (language) {
+      langButtons[language].addEventListener("click", function () { setLanguage(language); });
+    });
+
+    updateStaticText();
+    buildRail();
+    setStep(0);
+    updateLanguageButtons();
+  })();
+  </script>
+</body>
+</html>

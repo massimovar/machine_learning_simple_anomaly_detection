@@ -10,12 +10,15 @@ WHY THIS FILE EXISTS:
     so in the log and in the MQTT status ("accelerator").
 
 PIPELINE (cheapest order first):
-    1. centre square crop: MoveNet expects a square image, and the middle of
-       the frame is where the operator stands.
-    2. resize to 192x192: the model's input size.
-    3. BGR -> RGB on the small image: OpenCV delivers BGR; converting 192x192
+    1. letterbox: MoveNet expects a square image.  The whole frame is shrunk
+       to fit 192x192 and the rest is padded with black (Google's MoveNet
+       tutorial does the same), so an operator anywhere in the picture, or
+       an arm stretched out for a swipe, is still seen.  A centre crop of a
+       16:9 frame would cut 40 % of its width.
+    2. BGR -> RGB on the small image: OpenCV delivers BGR; converting 192x192
        pixels instead of the full frame saves CPU.
-    4. inference -> (17, 3) array of (y, x, score); x and y are 0..1 of the crop.
+    3. inference -> (17, 3) array of (y, x, score); x and y are 0..1 of the
+       padded square, whose middle is the middle of the frame.
 """
 
 import logging
@@ -23,17 +26,19 @@ import logging
 import cv2
 import numpy as np
 
-# WHY three options:
-#   ai_edge_litert  LiteRT, Google's current TFLite runtime (pip, any machine);
-#                   much faster on the CPU than the old tflite_runtime 2.14
-#                   (laptop container: 3 ms instead of 33 ms per frame)
-#   tflite_runtime  the runtime NXP ships in its BSP next to the NPU delegate
+# WHY three options, in this order:
+#   tflite_runtime  the device's own runtime, borrowed by tools/npu_entrypoint.sh
+#                   only when the NPU override mounts the device's /usr/lib.  The
+#                   VX delegate is linked against that same TFLite library, the
+#                   pairing NXP builds and tests.
+#   ai_edge_litert  LiteRT, Google's current TFLite runtime, inside the image:
+#                   the CPU runtime everywhere else (laptop container: 3 ms per frame)
 #   tensorflow      a laptop that only has full TensorFlow installed
 try:
-    from ai_edge_litert.interpreter import Interpreter, load_delegate
+    from tflite_runtime.interpreter import Interpreter, load_delegate
 except ImportError:
     try:
-        from tflite_runtime.interpreter import Interpreter, load_delegate
+        from ai_edge_litert.interpreter import Interpreter, load_delegate
     except ImportError:
         import tensorflow as tf
         Interpreter = tf.lite.Interpreter
@@ -42,22 +47,24 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-def center_square(frame):
-    """Largest square in the middle of the frame (a view, no copy)."""
+def letterbox(frame, side):
+    """Whole frame scaled to fit a side x side square, centred, black padding."""
     h, w = frame.shape[:2]
-    side = min(h, w)
-    top, left = (h - side) // 2, (w - side) // 2
-    return frame[top:top + side, left:left + side]
+    scale = side / max(h, w)
+    nw, nh = round(w * scale), round(h * scale)
+    small = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    top, left = (side - nh) // 2, (side - nw) // 2
+    return cv2.copyMakeBorder(small, top, side - nh - top, left, side - nw - left,
+                              cv2.BORDER_CONSTANT, value=(0, 0, 0))
 
 
-def preprocess(frame, width, height):
-    """BGR camera frame -> uint8 RGB batch of shape [1, height, width, 3]."""
-    small = cv2.resize(center_square(frame), (width, height), interpolation=cv2.INTER_LINEAR)
-    return cv2.cvtColor(small, cv2.COLOR_BGR2RGB)[np.newaxis]
+def preprocess(frame, side):
+    """BGR camera frame -> uint8 RGB batch of shape [1, side, side, 3]."""
+    return cv2.cvtColor(letterbox(frame, side), cv2.COLOR_BGR2RGB)[np.newaxis]
 
 
 class PoseEstimator:
-    def __init__(self, model_path, use_npu=False, vx_delegate_path="/usr/lib/libvx_delegate.so",
+    def __init__(self, model_path, use_npu=False, vx_delegate_path="/opt/npu/lib/libvx_delegate.so",
                  num_threads=2):
         self.accelerator = "cpu"
         self._interpreter = None
@@ -87,11 +94,12 @@ class PoseEstimator:
         _, self.height, self.width, _ = (int(v) for v in inp["shape"])
         self._input_index = inp["index"]
         self._output_index = self._interpreter.get_output_details()[0]["index"]
-        logger.info("MoveNet %dx%d loaded on %s", self.width, self.height, self.accelerator.upper())
+        logger.info("MoveNet %dx%d loaded on %s (runtime: %s)", self.width, self.height,
+                    self.accelerator.upper(), Interpreter.__module__.split(".")[0])
 
     def infer(self, frame):
         """BGR frame -> (17, 3) float32 array of (y, x, score)."""
-        self._interpreter.set_tensor(self._input_index, preprocess(frame, self.width, self.height))
+        self._interpreter.set_tensor(self._input_index, preprocess(frame, self.width))
         self._interpreter.invoke()
         return self._interpreter.get_tensor(self._output_index)[0, 0]
 

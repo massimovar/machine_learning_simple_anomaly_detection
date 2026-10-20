@@ -44,8 +44,6 @@ services:
       - TF_CPP_MIN_LOG_LEVEL=0
       - VIV_VX_ENABLE_CACHE_GRAPH_BINARY=1
       - VIV_VX_CACHE_BINARY_GRAPH_DIR=/var/cache/npu
-      # Optional hardware evidence, only if Phase 0 finds readable driver counters:
-      # - NPU_COUNTERS_PATH=/host/gc/idle      (+ a read-only bind mount of that file)
 
 volumes:
   npu-graph-cache:

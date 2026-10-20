@@ -1,56 +1,35 @@
-﻿import pickle
-from typing import List, Optional
+import json
 
 import numpy as np
 
 
-class PreprocessingError(ValueError):
-    pass
-
-
 class SampleBuffer:
-    def __init__(self, window_size: int, tag_names: List[str]):
-        if window_size <= 0:
-            raise PreprocessingError("window_size must be greater than zero")
-        if not tag_names:
-            raise PreprocessingError("tag_names cannot be empty")
+    """Collects one row per sensor message; every window_size rows returns their per-tag mean."""
 
+    def __init__(self, window_size: int, tag_names: list):
         self.window_size = window_size
         self.tag_names = list(tag_names)
-        self.samples: List[List[float]] = []
+        self.rows = []
 
-    def add(self, sensor_dict: dict) -> Optional[np.ndarray]:
-        try:
-            row = [float(sensor_dict[tag]) for tag in self.tag_names]
-        except KeyError as exc:
-            raise PreprocessingError(f"missing sensor tag: {exc.args[0]}") from exc
-        except (TypeError, ValueError) as exc:
-            raise PreprocessingError("sensor values must be numeric") from exc
-
-        self.samples.append(row)
-
-        if len(self.samples) == self.window_size:
-            window = np.asarray(self.samples, dtype=np.float32)
-            self.samples.clear()
-            return window
-
-        return None
+    def add(self, sensor: dict):
+        # A missing tag raises KeyError, a non-numeric value ValueError: the
+        # message is dropped before it can touch the window.
+        self.rows.append([float(sensor[tag]) for tag in self.tag_names])
+        if len(self.rows) < self.window_size:
+            return None
+        window = np.asarray(self.rows, dtype=np.float32)
+        self.rows.clear()
+        return window.mean(axis=0)
 
 
-def aggregate_window(window: np.ndarray) -> np.ndarray:
-    window = np.asarray(window, dtype=np.float32)
-    if window.ndim != 2 or window.shape[0] == 0:
-        raise PreprocessingError("window must be a non-empty 2-D array")
-    return window.mean(axis=0)
+def load_scaler(path: str) -> dict:
+    """The per-tag min and max of the training windows, saved by training/train.py."""
+    with open(path, "r", encoding="utf-8") as f:
+        scaler = json.load(f)
+    return {"min": np.asarray(scaler["min"], dtype=np.float64), "max": np.asarray(scaler["max"], dtype=np.float64)}
 
 
-def load_scaler(scaler_path: str):
-    with open(scaler_path, "rb") as f:
-        return pickle.load(f)
-
-
-def normalise(feature_vector: np.ndarray, scaler) -> np.ndarray:
-    feature_vector = np.asarray(feature_vector, dtype=np.float32)
-    if feature_vector.ndim != 1:
-        raise PreprocessingError("feature_vector must be a 1-D array")
-    return scaler.transform(feature_vector.reshape(1, -1)).flatten()
+def normalise(feature_vector: np.ndarray, scaler: dict) -> np.ndarray:
+    """Min-max scaling: the training range of every tag maps to [0, 1]."""
+    return ((np.asarray(feature_vector, dtype=np.float64) - scaler["min"])
+            / (scaler["max"] - scaler["min"])).astype(np.float32)

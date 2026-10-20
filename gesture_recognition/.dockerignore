@@ -1,0 +1,11 @@
+# Only config.yaml, src/, models/ (the .tflite) and tools/npu_entrypoint.sh
+# go into the image; keep everything else out of the build context.
+**/__pycache__/
+**/*.pyc
+tests/
+tools/*.py
+tools/npu_probe.sh
+deploy_tools/
+*.tar
+.env
+.git/

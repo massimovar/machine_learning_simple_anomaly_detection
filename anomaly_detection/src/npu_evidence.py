@@ -12,9 +12,6 @@ WHY THIS FILE EXISTS:
                   file. Only an NPU compilation produces that file.
     galcore       The NPU driver's version: the kernel driver's when readable,
                   else the one compiled into the lent user-space driver (libGAL).
-    counters      An optional file exposed by the driver (path set with
-                  NPU_COUNTERS_PATH). We read it before and after a benchmark
-                  so a person can see the hardware's own numbers move.
 
 Every function returns None or an empty result instead of raising: missing
 evidence is information, not an error.
@@ -23,7 +20,6 @@ evidence is information, not an error.
 import os
 import re
 
-_COUNTER_LINE = re.compile(r"^\s*([A-Za-z][\w .-]*?)\s*[:=]\s*(-?\d[\d,]*)")
 # "$VERSION$6.4.11:745085:cb782f4af5$" -> "6.4.11:745085" (release:build, without the git hash)
 _GAL_VERSION = re.compile(rb"\$VERSION\$(\d+\.\d+\.\d+[^:$]*(?::\d+)?)")
 
@@ -71,25 +67,3 @@ def galcore_version(paths=("/sys/module/galcore/version", "/sys/kernel/debug/gc/
     except OSError:
         return None
     return f"libGAL {match.group(1).decode('ascii')}" if match else None
-
-
-def parse_counters(text: str) -> dict:
-    """'On: 123 ns' style lines -> {'On': 123}. Unknown lines are ignored."""
-    counters = {}
-    for line in text.splitlines():
-        match = _COUNTER_LINE.match(line)
-        if match:
-            counters[match.group(1).strip()] = int(match.group(2).replace(",", ""))
-    return counters
-
-
-def read_counters(environ=None):
-    environ = os.environ if environ is None else environ
-    path = environ.get("NPU_COUNTERS_PATH")
-    if not path:
-        return None
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            return {"path": path, "values": parse_counters(f.read())}
-    except OSError as exc:
-        return {"path": path, "error": str(exc)}

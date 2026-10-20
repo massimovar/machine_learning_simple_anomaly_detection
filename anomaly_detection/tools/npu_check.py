@@ -56,9 +56,8 @@ def main() -> int:
         "engine": engine.describe(),
         "galcore_version": npu_evidence.galcore_version(),
         "dev_galcore": os.path.exists("/dev/galcore"),
-        "benchmark": run_benchmark(engine, cpu_engine, vector, args.runs, npu_evidence.read_counters),
+        "benchmark": run_benchmark(engine, cpu_engine, vector, args.runs),
         "graph_cache": npu_evidence.graph_cache(),
-        "native_log_tail": engine.native_log[-15:],
     }
     print(json.dumps(report, indent=2))
     print(f"\nRESULT: inference ran on the {engine.accelerator.upper()}"

@@ -1,63 +1,45 @@
-﻿import os
+import json
+import os
 import sys
+import tempfile
 import unittest
 
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from preprocessing import PreprocessingError, SampleBuffer, aggregate_window, normalise  # noqa: E402
-
-
-class RecordingScaler:
-    def __init__(self):
-        self.seen = None
-
-    def transform(self, values):
-        self.seen = values.copy()
-        return values / 10.0
+from mqtt_client import flatten_records  # noqa: E402
+from preprocessing import SampleBuffer, load_scaler, normalise  # noqa: E402
 
 
 class PreprocessingTests(unittest.TestCase):
-    def test_sample_buffer_uses_configured_sensor_tag_order(self):
+    def test_buffer_returns_the_per_tag_mean_in_configured_order(self):
         buffer = SampleBuffer(window_size=2, tag_names=["b", "a"])
-
         self.assertIsNone(buffer.add({"a": 1, "b": 2}))
-        window = buffer.add({"a": 3, "b": 4})
+        np.testing.assert_array_equal(buffer.add({"a": 3, "b": 4}), np.array([3, 2], dtype=np.float32))
+        self.assertIsNone(buffer.add({"a": 5, "b": 6}))  # a new window starts
 
-        np.testing.assert_array_equal(
-            window,
-            np.array([[2, 1], [4, 3]], dtype=np.float32),
-        )
-
-    def test_sample_buffer_reports_missing_sensor_tags(self):
+    def test_bad_messages_are_rejected_and_not_buffered(self):
         buffer = SampleBuffer(window_size=1, tag_names=["a", "b"])
-
-        with self.assertRaisesRegex(PreprocessingError, "missing sensor tag: b"):
+        with self.assertRaises(KeyError):
             buffer.add({"a": 1})
+        with self.assertRaises(ValueError):
+            buffer.add({"a": "bad", "b": 1})
+        self.assertEqual(buffer.rows, [])
 
-    def test_sample_buffer_reports_non_numeric_sensor_values(self):
-        buffer = SampleBuffer(window_size=1, tag_names=["a"])
+    def test_normalise_maps_the_training_range_to_0_1(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "scaler.json")
+            with open(path, "w") as f:
+                json.dump({"min": [0, 10], "max": [2, 20]}, f)
+            result = normalise(np.array([1, 25], dtype=np.float32), load_scaler(path))
+        np.testing.assert_allclose(result, [0.5, 1.5])
+        self.assertEqual(result.dtype, np.float32)
 
-        with self.assertRaisesRegex(PreprocessingError, "sensor values must be numeric"):
-            buffer.add({"a": "bad"})
-
-    def test_aggregate_window_averages_each_tag(self):
-        result = aggregate_window(np.array([[1, 3], [5, 7]], dtype=np.float32))
-
-        np.testing.assert_array_equal(result, np.array([3, 5], dtype=np.float32))
-
-    def test_aggregate_window_rejects_wrong_shape(self):
-        with self.assertRaisesRegex(PreprocessingError, "non-empty 2-D array"):
-            aggregate_window(np.array([1, 2, 3]))
-
-    def test_normalise_uses_scaler(self):
-        scaler = RecordingScaler()
-
-        result = normalise(np.array([2, 4], dtype=np.float32), scaler)
-
-        np.testing.assert_array_equal(scaler.seen, np.array([[2, 4]], dtype=np.float32))
-        np.testing.assert_array_equal(result, np.array([0.2, 0.4], dtype=np.float32))
+    def test_ftoptix_records_are_flattened_and_flat_payloads_pass(self):
+        records = {"Records": [{"TagName": "a", "Value": 1.5}, {"TagName": "b", "Value": 2}], "Timestamp": "t"}
+        self.assertEqual(flatten_records(records), {"a": 1.5, "b": 2})
+        self.assertEqual(flatten_records({"a": 1}), {"a": 1})
 
 
 if __name__ == "__main__":

@@ -10,31 +10,38 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import pose  # noqa: E402
-from pose import PoseEstimator, center_square, preprocess  # noqa: E402
+from pose import PoseEstimator, letterbox, preprocess  # noqa: E402
 
 MODEL = os.path.join(os.path.dirname(__file__), "..", "models", "movenet_lightning_int8.tflite")
 
 
 class TestPreprocessing(unittest.TestCase):
 
-    def test_center_square_of_landscape_frame(self):
-        frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        frame[0, 80] = 255                       # top-left corner of the centred square
-        crop = center_square(frame)
-        self.assertEqual(crop.shape, (480, 480, 3))
-        self.assertEqual(crop[0, 0, 0], 255)
+    def test_letterbox_of_landscape_frame_pads_top_and_bottom(self):
+        frame = np.full((360, 640, 3), 255, dtype=np.uint8)
+        square = letterbox(frame, 192)
+        self.assertEqual(square.shape, (192, 192, 3))
+        # 640 -> 192 (x0.3), so 360 -> 108 rows, centred: rows 42..149
+        self.assertEqual(square[41, 96, 0], 0)
+        self.assertEqual(square[42, 96, 0], 255)
+        self.assertEqual(square[149, 96, 0], 255)
+        self.assertEqual(square[150, 96, 0], 0)
+        self.assertEqual(square[96, 0, 0], 255)       # full width kept
+        self.assertEqual(square[96, 191, 0], 255)
 
-    def test_center_square_of_portrait_frame(self):
-        frame = np.zeros((640, 480, 3), dtype=np.uint8)
-        frame[80, 0] = 255
-        crop = center_square(frame)
-        self.assertEqual(crop.shape, (480, 480, 3))
-        self.assertEqual(crop[0, 0, 0], 255)
+    def test_letterbox_of_portrait_frame_pads_left_and_right(self):
+        frame = np.full((640, 480, 3), 255, dtype=np.uint8)
+        square = letterbox(frame, 192)
+        # 480 -> 144 columns, centred: columns 24..167
+        self.assertEqual(square[96, 23, 0], 0)
+        self.assertEqual(square[96, 24, 0], 255)
+        self.assertEqual(square[96, 167, 0], 255)
+        self.assertEqual(square[96, 168, 0], 0)
 
     def test_preprocess_gives_uint8_rgb_batch(self):
         frame = np.zeros((480, 640, 3), dtype=np.uint8)
         frame[:, :] = (255, 0, 0)                # pure blue in OpenCV's BGR order
-        batch = preprocess(frame, 192, 192)
+        batch = preprocess(frame, 192)
         self.assertEqual(batch.shape, (1, 192, 192, 3))
         self.assertEqual(batch.dtype, np.uint8)
         self.assertEqual(tuple(batch[0, 96, 96]), (0, 0, 255))   # blue is last in RGB

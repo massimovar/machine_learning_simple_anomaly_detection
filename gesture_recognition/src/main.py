@@ -6,6 +6,7 @@ WHY THIS FILE EXISTS:
     Wires the pieces together and runs the loop
 
         camera (newest frame) -> MoveNet (17 keypoints) -> gesture rules -> MQTT
+                                                       +-> MJPEG picture with the skeleton
 
     and reports health three ways:
       - MQTT status every few seconds and at once on camera changes (FT Optix shows it)
@@ -34,6 +35,7 @@ from camera import CAMERA_LOST, RUNNING, Camera
 from gestures import GestureConfig, GestureEngine
 from mqtt_client import GesturePublisher, make_status
 from pose import PoseEstimator
+from stream import MjpegServer, annotate, placeholder
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,6 +53,7 @@ WATCHDOG_S = 15
 # duration on the i.MX 8M Plus yet); a hang there still ends in a restart.
 STARTUP_S = 120
 LOG_EVERY_N_STATUS = 15
+SHOW_GESTURE_S = 2.0   # the MJPEG picture names a recognised gesture this long
 
 
 def load_config(path):
@@ -109,7 +112,10 @@ def main():
     config = load_config(os.path.join(ROOT, "config.yaml"))
     cam_cfg, model_cfg, mqtt_cfg = config["camera"], config["model"], config["mqtt"]
     engine = GestureEngine(GestureConfig(**config["gestures"]), mirror=cam_cfg["mirror"])
+    min_score = config["gestures"]["min_keypoint_score"]
 
+    stream = MjpegServer(config["stream"]["port"], config["stream"]["jpeg_quality"])
+    stream.start()
     publisher = GesturePublisher(mqtt_cfg["broker_host"], mqtt_cfg["broker_port"], mqtt_cfg["client_id"],
                                  mqtt_cfg["events_topic"], mqtt_cfg["status_topic"])
     publisher.start()
@@ -128,6 +134,7 @@ def main():
     period = 1.0 / model_cfg["target_fps"]
     window_s = mqtt_cfg["status_interval_s"]
     seq, state = 0, None
+    fps, shown_gesture, shown_until = 0.0, None, 0.0
     status_count, next_status = 0, time.perf_counter()
     recent = deque()   # (t_done, inference_ms, processing_ms) of frames in the last window_s
     try:
@@ -162,6 +169,8 @@ def main():
                 # the watchdog restarts the service.
                 if camera.state != RUNNING:
                     watchdog.feed()
+                    if stream.viewers:
+                        stream.put(placeholder(f"Camera: {camera.state}"))
                 continue
             watchdog.feed()
             frame, t_frame, seq = item
@@ -173,6 +182,11 @@ def main():
             recent.append((t2, (t1 - t0) * 1000, (t2 - t_frame) * 1000))   # processing: frame received -> decision
             if event is not None:
                 publisher.publish_event(event.gesture, event.confidence)
+                shown_gesture, shown_until = event.gesture, t2 + SHOW_GESTURE_S
+            if stream.viewers:
+                info = f"{accelerator.upper()}  {fps:.0f} fps  {(t1 - t0) * 1000:.0f} ms"
+                stream.put(annotate(frame, keypoints, min_score, cam_cfg["mirror"],
+                                    shown_gesture if t2 < shown_until else None, info))
 
             spare = period - (time.perf_counter() - t0)   # rate cap: at most target_fps
             if spare > 0:
@@ -180,6 +194,7 @@ def main():
     finally:
         logger.info("Stopping")
         camera.stop()
+        stream.stop()
         publisher.stop(make_status("offline", accelerator=accelerator))
 
 

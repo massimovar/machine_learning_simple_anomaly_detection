@@ -3,7 +3,7 @@
 > **What is this?** A self-contained learning project with two small AI applications for an industrial HMI built with **FactoryTalk Optix**. Both target the **NXP i.MX 8M Plus** edge controller (ARM Cortex-A53 CPU with an on-chip Neural Processing Unit, NPU), run in containers and talk to the HMI over **MQTT**. There is no GPU and no cloud.
 >
 > - **Part 1, anomaly detection:** a lightweight neural network that we train ourselves watches the machine's sensor data and raises an alert when the pattern looks abnormal. It runs on **TensorFlow Lite**: on the CPU of your PC, and on the NPU of an OptixEdge from a container that borrows the device's NPU libraries read-only, with nothing installed on the device. A FactoryTalk Optix panel proves where it runs ([status](#11-what-is-this-project)).
-> - **Part 2, gesture control (work in progress):** a camera watches the operator, a ready-made pose model (**MoveNet**) finds the body joints in every picture, and simple rules turn hand movements into four HMI commands. The service is built and tested on a laptop; the FactoryTalk Optix side and the NPU are not built yet ([status](#92-what-is-built-and-what-is-not)).
+> - **Part 2, gesture control (work in progress):** a camera watches the operator, a ready-made pose model (**MoveNet**) finds the body joints in every picture, and simple rules turn hand movements into four HMI commands. The service runs on a laptop and on the OptixEdge's CPU; the FactoryTalk Optix NetLogic is written but not yet run, and the NPU path has never run ([status](#92-what-is-built-and-what-is-not)).
 >
 > **No machine-learning background is assumed:** every concept is explained from scratch.
 
@@ -51,7 +51,7 @@
 13. [From Keypoints to Gestures](#13-from-keypoints-to-gestures)
 14. [One Gesture, One Event](#14-one-gesture-one-event)
 15. [MQTT Messages for Gestures](#15-mqtt-messages-for-gestures)
-16. [FactoryTalk Optix Integration (Planned)](#16-factorytalk-optix-integration-planned)
+16. [FactoryTalk Optix Integration](#16-factorytalk-optix-integration)
 17. [Health Monitoring and Camera Loss](#17-health-monitoring-and-camera-loss)
 18. [Containers and the Laptop Setup](#18-containers-and-the-laptop-setup)
 19. [Performance and the NPU Plan](#19-performance-and-the-npu-plan)
@@ -594,7 +594,7 @@ The price is a small rounding error, at most half a mark. [10.6](#106-quantizati
 
 #### 3.4.1 From float to int8, without retraining
 
-`training/train.py` makes the int8 twin itself, right after training: `quantize.export_int8` converts the same trained weights to full int8, next to the float model. `training/quantize.py`, run on its own, does the same starting from `models/autoencoder.tflite`: it reads the weights out of the file, rebuilds the identical Keras network (largest difference 2.98 × 10⁻⁷, a rounding error), converts it and prints the float-vs-int8 comparison (optional; `--per-channel` tries the other kind of ruler, see 3.4.4). Either way, the conversion changes only one thing: how the numbers are stored. So any difference between the two files is caused by quantization alone.
+`training/train.py` makes the int8 twin itself, right after training: `convert()` turns the same trained Keras model into a float file and, with a representative dataset, into a full-int8 file next to it. Then it prints the float-vs-int8 comparison (3.4.4). The conversion changes only one thing: how the numbers are stored. So any difference between the two files is caused by quantization alone.
 
 The converter needs a **representative dataset**: real inputs, to measure the range of every intermediate value. We pass the scaled training windows, exactly what the model sees in production. Ranges measured on unrealistic data would put the ruler's marks in the wrong place.
 
@@ -611,7 +611,7 @@ weights (64, 16)  int8  per-tensor
 weights (10, 64)  int8  per-tensor
 ```
 
-The scale is 0.003922 = 1/255, and the zero point −128 sits at 0.0. So the 256 marks cover exactly [0, 1], the output range of the MinMaxScaler. The converter found this by itself from the representative data.
+The scale is 0.003922 = 1/255, and the zero point −128 sits at 0.0. So the 256 marks cover exactly [0, 1], the output range of the min-max scaling (3.2). The converter found this by itself from the representative data.
 
 Worked examples, with `q = round(x / scale) + zero_point` and `back = (q − zero_point) × scale`:
 
@@ -628,7 +628,7 @@ The error is at most half a mark (0.00196). The last row matters: a sensor value
 
 #### 3.4.3 Where the conversion happens
 
-The int8 model takes and returns int8 numbers. `src/detector.py` translates at the edges, using the scale and zero point stored in the model file:
+The int8 model takes and returns int8 numbers. `quantize()` and `dequantize()` in `src/model.py` translate at the edges, using the scale and zero point stored in the model file:
 
 ```python
 q = np.clip(np.round(x / scale) + zero_point, -128, 127)   # float -> int8, before invoke()
@@ -640,7 +640,7 @@ The same code serves both files. For the float model there is no scale, and the 
 
 #### 3.4.4 Per-tensor, and a separate threshold
 
-TFLite quantizes `Dense` weights **per-channel** by default (one ruler per output neuron). Reports for this chip say the NPU prefers **per-tensor** (one ruler per matrix) ([19.4](#194-how-the-npu-will-be-used), Step 3). `quantize.py` asks the converter for per-tensor through a flag whose name begins with `_experimental`, so a future TensorFlow may change it. For MoveNet, per-tensor destroyed accuracy. So we measured instead of assuming:
+TFLite quantizes `Dense` weights **per-channel** by default (one ruler per output neuron). Reports for this chip say the NPU prefers **per-tensor** (one ruler per matrix) ([19.4](#194-how-the-npu-will-be-used), Step 3). `train.py` asks the converter for per-tensor through a flag whose name begins with `_experimental`, so a future TensorFlow may change it; `train.py` prints a warning if any tensor comes out per-channel. For MoveNet, per-tensor destroyed accuracy. So we measured instead of assuming:
 
 | | float32 | int8 per-tensor | int8 per-channel |
 |---|---|---|---|
@@ -650,16 +650,16 @@ TFLite quantizes `Dense` weights **per-channel** by default (one ruler per outpu
 | False alarms (200 normal windows) | 10 | 10 | 10 |
 | Decisions different from float32 | — | **0** | **0** |
 
-Why its own threshold? Rounding adds a small error to every reconstruction, so "normal" scores are slightly larger (0.010236 vs 0.010150). The float threshold would raise false alarms slowly over time. `quantize.py` therefore recalibrates the three-sigma threshold ([3.2](#32-the-math)) on the int8 model's own scores and writes `models/threshold_int8.json`. `config.yaml` keeps each model with its threshold:
+Why its own threshold? Rounding adds a small error to every reconstruction, so "normal" scores are slightly larger (0.010236 vs 0.010150). The float threshold would raise false alarms slowly over time. `train.py` therefore recalibrates the three-sigma threshold ([3.2](#32-the-math)) on the int8 model's own scores and writes `models/threshold_int8.json`. `config.yaml` keeps each model with its threshold:
 
 ```yaml
-variants:
-  float32: { model_path: models/autoencoder.tflite,      threshold_path: models/threshold.json }
-  int8:    { model_path: models/autoencoder_int8.tflite, threshold_path: models/threshold_int8.json }
-precision: auto   # int8 when use_npu is true, float32 otherwise
+float32: { model_path: models/autoencoder.tflite,      threshold_path: models/threshold.json }
+int8:    { model_path: models/autoencoder_int8.tflite, threshold_path: models/threshold_int8.json }
 ```
 
-The gate passed with zero decision changes, so per-tensor is the default.
+The detector takes `int8` when `use_npu` is true and `float32` otherwise. If the NPU then fails, the same int8 file runs on the CPU, so the threshold still matches the model.
+
+At the end of every training `train.py` prints this comparison as a **gate**: `PASS` when int8 makes the same decisions as float32 on the test windows, `REVIEW` otherwise. The gate passed with zero decision changes, so per-tensor is the default.
 
 ---
 
@@ -672,8 +672,8 @@ flowchart LR
     A["🏭 FTOptix\n(sensor data)"] -->|MQTT publish\nTCP 1883| B["📫 MQTT Broker\n(Mosquitto)"]
     B -->|MQTT subscribe\nTCP 1883| C["mqtt_client.py\n(receive & parse)"]
     C --> D["preprocessing.py\n(buffer → window → normalise)"]
-    D --> E["detector.py\n(TFLite autoencoder inference)"]
-    E --> F["detector.py\n(score → threshold)"]
+    D --> E["model.py\n(TFLite autoencoder inference)"]
+    E --> F["main.py\n(score → threshold)"]
     F -->|MQTT publish alert\nanomaly/paperclip/alerts| B
     B -->|MQTT subscribe| G["AnomalyFeedbackManager\n(FTOptix NetLogic)\nparses JSON → sets IsAnomaly"]
     G -->|PeriodicTask\nwrites every 2 s| H["isanomaly.json (or .js)\n(treeJs_scene/ folder)"]
@@ -690,9 +690,9 @@ flowchart LR
 
 4. **preprocessing.py** buffers 30 messages (= 30 seconds), averages them into a single vector of 10 values, and normalises each value with the saved scaler.
 
-5. **detector.py** feeds the normalised vector through the TFLite autoencoder and reads the reconstruction.
+5. **model.py** feeds the normalised vector through the TFLite autoencoder and reads the reconstruction.
 
-6. **detector.py** computes the MSE between the original and the reconstruction. If MSE > threshold → anomaly. The result is published back to the MQTT broker on topic `anomaly/paperclip/alerts`.
+6. **model.py** computes the MSE between the original and the reconstruction, and **main.py** compares it with the threshold: if MSE > threshold → anomaly. The result is published back to the MQTT broker on topic `anomaly/paperclip/alerts`.
 
 7. **AnomalyFeedbackManager** (a FTOptix NetLogic) subscribes to `anomaly/paperclip/alerts`, parses the JSON payload, and writes the `IsAnomaly` Boolean into the FTOptix information model.
 
@@ -739,14 +739,14 @@ Read the table top-down: each row uses the row below it.
 | Piece | What it is | What it does for us | Where it comes from |
 |---|---|---|---|
 | **Our detector** (`src/`) | Python application | Reads sensor windows from MQTT, calls the model, publishes alerts and evidence | Image |
-| **paho-mqtt, PyYAML, scikit-learn** | Python packages | MQTT client; reads `config.yaml`; the MinMaxScaler that maps sensor values to [0, 1] | Image (pip) |
+| **paho-mqtt, PyYAML** | Python packages | MQTT client; reads `config.yaml` | Image (pip) |
 | **numpy** 1.26 | Python package | Holds every tensor we pass in and out. TFLite's Python bridge is compiled against numpy's C interface, so the major version is pinned (`<2.0`) | Image (pip) |
 | **`tflite_runtime`** 2.16.2 | Python package: `interpreter.py` (the `Interpreter` and `load_delegate` API) plus `_pywrap_tensorflow_interpreter_wrapper.so`, a compiled bridge | Turns Python calls into calls on the C++ runtime. The bridge is machine code built for CPython **3.12**, so the image's Python must be 3.12 ([4.5](#45-which-tflite-runtime)) | **Device**, lent read-only from `/usr/lib/python3.12/site-packages` |
 | **`ai-edge-litert`** 1.2.0 | Google's newer packaging of the same runtime (LiteRT), with its own TFLite copy inside | The fallback: runs the model on the CPU when the device has no `tflite_runtime`, and is runtime B of [4.5](#45-which-tflite-runtime) | Image (pip) |
 | **`libtensorflow-lite.so.2.16.2`** | The TensorFlow Lite C++ runtime | Loads the `.tflite` file, plans memory, runs each op. Any op not taken by a delegate runs here, on the CPU | **Device**, lent read-only |
 | **XNNPACK, ruy** | CPU math libraries inside TFLite | Hand-tuned ARM NEON kernels and matrix multiplication. They are why our model takes only 10 µs on the CPU ([5.7](#57-why-the-npu-is-slower-here)) | Inside `libtensorflow-lite` |
-| **`libvx_delegate.so`** | A TFLite **external delegate**: a plug-in loaded at run time through the C function `tflite_plugin_create_delegate` | Looks at the model's graph, claims the ops the NPU supports, and rewrites them as TIM-VX operations. It reports "5 of 5 nodes" to TFLite ([5.4](#54-catching-the-c-evidence)). It is linked against the device's `libtensorflow-lite.so.2.16.2` | **Device**, lent read-only |
-| **`libtim-vx.so`** | TIM-VX ("Tensor Interface Module for OpenVX"), VeriSilicon's C++ library, with **OVXLIB** inside | Translates neural-network operations (fully connected, ReLU, sigmoid…) into an OpenVX graph. The `OVXLIB_VERSION 1.2.14` lines in [5.4](#54-catching-the-c-evidence) come from here | **Device**, lent read-only |
+| **`libvx_delegate.so`** | A TFLite **external delegate**: a plug-in loaded at run time through the C function `tflite_plugin_create_delegate` | Looks at the model's graph, claims the ops the NPU supports, and rewrites them as TIM-VX operations. It reports "5 of 5 nodes" to TFLite ([5.4](#54-reading-the-delegation-from-the-graph)). It is linked against the device's `libtensorflow-lite.so.2.16.2` | **Device**, lent read-only |
+| **`libtim-vx.so`** | TIM-VX ("Tensor Interface Module for OpenVX"), VeriSilicon's C++ library, with **OVXLIB** inside | Translates neural-network operations (fully connected, ReLU, sigmoid…) into an OpenVX graph. The `OVXLIB_VERSION 1.2.14` lines in [5.4](#54-reading-the-delegation-from-the-graph) come from here | **Device**, lent read-only |
 | **`libOpenVX.so.1`**, `libOpenVXU.so` | VeriSilicon's implementation of **OpenVX**, a public standard API (from the Khronos Group) for graphs of image and neural-network operations | `vxVerifyGraph` compiles the whole graph into NPU instructions (the 65 ms warm-up); `vxProcessGraph` runs it (each `invoke`). It also writes and reads the `.nb` graph cache ([5.5.3](#553-the-evidence-ladder)) | **Device**, lent read-only |
 | **`libGAL.so`** | The Graphics Abstraction Layer: the user-space half of the Vivante driver | Allocates memory the NPU can read, fills command buffers, submits them, waits. It speaks to the kernel driver with `ioctl` calls whose data layout is private to one driver release. Its version string is our `GalcoreVersion` ([5.8.2](#582-the-variables-in-modelnpu)) | **Device**, lent read-only |
 | **`libVSC.so`**, `libCLC.so` | VeriSilicon shader compiler and its OpenCL C front end | Compile small programs for the NPU's programmable cores, used for operations the fixed neural-network engine does not do itself | **Device**, lent read-only |
@@ -880,7 +880,7 @@ Whatever tool deploys it, the detector container needs exactly these things from
 | The device's NPU libraries, read-only | `volumes: - /usr/lib:/host/usr/lib:ro` | The entrypoint links only the NPU libraries and the `tflite_runtime` package from it ([4.4](#44-the-entrypoint-borrow-only-the-npu-libraries)). `:ro` makes the device's files unchangeable from inside |
 | A volume for compiled NPU graphs | `npu-graph-cache:/var/cache/npu` and `VIV_VX_ENABLE_CACHE_GRAPH_BINARY=1`, `VIV_VX_CACHE_BINARY_GRAPH_DIR=/var/cache/npu` | Evidence (the `.nb` file) and a faster restart ([5.5.3](#553-the-evidence-ladder)) |
 | The switch | `USE_NPU=${USE_NPU:-true}` (`false` for the negative control) | Read by `InferenceEngine` ([5.3](#53-inferenceengine-try-the-npu-fall-back-remember-why)) |
-| Native log lines | `TF_CPP_MIN_LOG_LEVEL=0` | Keeps TFLite's INFO lines, which carry delegation evidence ([5.4](#54-catching-the-c-evidence)) |
+| Native log lines | `TF_CPP_MIN_LOG_LEVEL=0` | Keeps TFLite's INFO lines, which carry delegation evidence ([5.4](#54-reading-the-delegation-from-the-graph)) |
 
 `docker-compose.npu.yml` adds exactly these lines to the base `docker-compose.yml`. Nothing else is needed: no extra capabilities, no host network, nothing installed. The device must already *have* its NPU stack in `/usr/lib` (the **Device** rows of [4.3](#43-every-module-library-and-driver)); on our OptixEdge it does.
 
@@ -896,17 +896,15 @@ All paths are relative to `anomaly_detection/`, except the `FTOptix/…` rows.
 
 | File | Purpose | Key concept |
 |---|---|---|
-| `config.yaml` | All tuneable parameters in one place: MQTT topics, window size, the two model variants, `use_npu` | Centralised configuration |
-| `src/main.py` | Entry point: wires everything together and answers the benchmark command | Application "conductor" |
-| `src/mqtt_client.py` | MQTT subscribe and publish helpers; the status, command and benchmark topics; the Last Will | Pub/sub messaging |
-| `src/preprocessing.py` | Buffer samples, window, normalise | Feature engineering |
-| `src/model.py` | Builds the autoencoder for training, and `InferenceEngine`: chooses the runtime, loads the NPU delegate, falls back to the CPU, records evidence ([5.3](#53-inferenceengine-try-the-npu-fall-back-remember-why)) | The ML model, and where it runs |
-| `src/detector.py` | Converts float ↔ int8 at the model's edges ([3.4.3](#343-where-the-conversion-happens)) and compares the anomaly score with the threshold | Decision logic |
+| `config.yaml` | All tuneable parameters in one place: MQTT topics, window size, the float32 and int8 models, `use_npu` | Centralised configuration |
+| `src/main.py` | Entry point: wires everything together, compares the score with the threshold, builds the alert and answers the benchmark command | Application "conductor" |
+| `src/mqtt_client.py` | Connect, subscribe, publish; the retained status and the Last Will | Pub/sub messaging |
+| `src/preprocessing.py` | Buffer samples into a window, average it, normalise with the training min/max | Feature engineering |
+| `src/model.py` | `InferenceEngine`: chooses the runtime, loads the NPU delegate, falls back to the CPU, records evidence ([5.3](#53-inferenceengine-try-the-npu-fall-back-remember-why)); converts float ↔ int8 at the model's edges ([3.4.3](#343-where-the-conversion-happens)) and computes the anomaly score | The ML model, and where it runs |
 | `src/benchmark.py` | Times the same model on the CPU and on the NPU, with the same input ([5.6](#56-the-benchmark-call-step-by-step)) | A/B measurement |
-| `src/npu_evidence.py` | Reads the driver version, the NPU graph-cache files and, optionally, driver counters | Evidence |
+| `src/npu_evidence.py` | Reads the driver version and the NPU graph-cache files | Evidence |
 | `training/generate_synthetic.py` | Creates fake sensor data | Synthetic data generation |
-| `training/train.py` | Trains the autoencoder offline; writes the float model, its int8 twin and a threshold for each | Model training |
-| `training/quantize.py` | Rebuilds the int8 twin from `autoencoder.tflite`, calibrates its threshold and compares float with int8 ([3.4](#34-quantization-the-same-network-in-integers)) | Quantization |
+| `training/train.py` | Trains the autoencoder offline; writes the float model, its int8 twin, a threshold for each and the scaler, then compares float with int8 ([3.4](#34-quantization-the-same-network-in-integers)) | Model training and quantization |
 | `tests/test_integration.py` | Sends a normal and an anomalous window through a running broker and checks both alerts ([7.6](#76-test-it)) | End-to-end test |
 | `tests/test_inference.py`, `tests/test_preprocessing.py` | Unit tests: run without a broker or an NPU | Unit testing |
 | `Dockerfile` | The PC image: Python 3.11 on Debian *bookworm*, `tflite-runtime` 2.14, amd64, CPU only | Containerisation |
@@ -915,9 +913,11 @@ All paths are relative to `anomaly_detection/`, except the `FTOptix/…` rows.
 | `tools/npu_check.py` | One-shot proof: "can this container run our model on the NPU?" ([7.10](#710-check-that-it-runs-on-the-npu)) | Smoke test |
 | `docker-compose.yml` | Runs the broker and the detector together (TCP 1883 required; WebSocket 9001 reserved, unused) | Multi-container orchestration |
 | `docker-compose.npu.yml` | Override for the OptixEdge: the NPU device, the device's libraries read-only, the graph-cache volume ([4.8](#48-what-the-npu-container-receives-from-the-device)) | Compose override |
+| `deploy_tools/*.ps1` | Windows PowerShell scripts that run the commands of section 7 for you: on the PC with Docker or Podman, or on the test device over SSH ([7.0](#70-shortcut-the-deploy-scripts)). Excluded from the image by `.dockerignore` | Deploy automation |
 | `FTOptix/…/ThePaperClipMachineSimulator.cs` | FTOptix NetLogic: generates the 10 simulated sensor tags and publishes them via MQTT every second. Includes an `[ExportMethod]` to inject an anomaly on demand | Sensor simulation |
 | `FTOptix/…/AnomalyFeedbackManager.cs` | FTOptix NetLogic: subscribes to the alert topic, parses the JSON, sets `IsAnomaly`, and every 2 s writes `treeJs_scene/isanomaly.json` for the 3-D scene | MQTT → OPC UA bridge, file-based state export |
 | `FTOptix/…/NpuStatusManager.cs`, `NpuModelBuilder.cs` | FTOptix NetLogic: the NPU evidence variables and the Benchmark button ([5.8](#58-the-factorytalk-optix-proof-panel)) | HMI proof |
+| `FTOptix/…/GestureEventManager.cs`, `GestureModelBuilder.cs` | FTOptix NetLogic for Part 2: the builder creates the gesture variables, subscriptions, pages and dialog; the manager turns gesture events into page changes, a dialog and a banner ([16](#16-factorytalk-optix-integration)). Written and compiled, not yet run | Gesture HMI |
 | `FTOptix/…/paper_clip_machine_world.html` | 3-D digital twin entry point (Three.js r128): the paper-clip machine outdoors on sand, with paper-clip mountains, a bulldozer and a 24 h day/night cycle in 60 s. Served by FTOptix WebPresentationEngine on port 8080 | Live browser visualisation |
 | `FTOptix/…/js/scene/*.js` | The scene code: 12 ES5 classic scripts loaded in order, sharing one `window.PCM` namespace — `core` (renderer, quality tiers, dynamic resolution, URL parameters), `assets` (shared materials, shader hook, procedural textures, geometry helpers), `fx` (glow halos, light cones, particles, ground decals), `sky` (sky dome, sun, moon, stars, clouds, day/night controller), `terrain` (sand, paper-clip mountains, scattered clips), `rockwell` (GuardLogix 5380 safety PLC, Compact 5000 I/O, PowerFlex 525, Stratix, 440G, 450L, OptixEdge and other device faces), `machine`, `characters` (operator, bulldozer driver), `site` (flood-light towers, props, bulldozer), `anomaly` (state polling, alarm effects), `ui` (tour, balloons, hints, title), `main` (build order, frame loop) | Modular, CSP-safe, no build step |
 | `FTOptix/…/js/hydrate.js` | Initialises HTML elements from `window.CONTENT` at page load. Extracted from inline `<script>` to satisfy CSP `script-src 'self'` | CSP-compliant hydration |
@@ -926,7 +926,7 @@ All paths are relative to `anomaly_detection/`, except the `FTOptix/…` rows.
 
 ### 5.2 The 10 most important lines of code
 
-**1. The autoencoder bottleneck** (`src/model.py`):
+**1. The autoencoder bottleneck** (`training/train.py`):
 ```python
 tf.keras.layers.Dense(bottleneck_size, activation="relu")
 ```
@@ -934,10 +934,10 @@ This is where the magic happens: the network is forced to compress 64 numbers in
 
 **2. Buffer emits a window** (`src/preprocessing.py`):
 ```python
-if len(self.samples) == self.window_size:
-    window = np.asarray(self.samples, dtype=np.float32)
-    self.samples.clear()
-    return window
+if len(self.rows) < self.window_size:
+    return None
+window = np.asarray(self.rows, dtype=np.float32)
+self.rows.clear()
 ```
 Samples accumulate one by one until we have a full window (30 samples), then the buffer resets.
 
@@ -949,27 +949,27 @@ Collapses 30 samples × 10 tags into one vector of 10 averaged values — smooth
 
 **4. Normalisation** (`src/preprocessing.py`):
 ```python
-scaled = scaler.transform(feature_vector.reshape(1, -1))
+(feature_vector - scaler["min"]) / (scaler["max"] - scaler["min"])
 ```
-The scaler (fitted during training) maps raw values to [0, 1] so no single tag dominates due to its scale.
+The per-tag minimum and maximum, measured during training and saved in `models/scaler.json`, map raw values to [0, 1] so no single tag dominates due to its scale.
 
-**5. TFLite inference** (`src/detector.py`):
+**5. TFLite inference** (`src/model.py`):
 ```python
-interpreter.set_tensor(input_details[0]["index"], input_data)
-interpreter.invoke()
-reconstructed = interpreter.get_tensor(output_details[0]["index"])[0]
+self.interpreter.set_tensor(self._input["index"], quantize(input_data, self._input))
+self.interpreter.invoke()
+output = dequantize(self.interpreter.get_tensor(self._output["index"]), self._output)[0]
 ```
 Write the input, run the model, read the output — the three-line essence of TFLite inference.
 
-**6. Anomaly score** (`src/detector.py`):
+**6. Anomaly score** (`src/model.py`):
 ```python
-return float(np.mean((original - reconstructed) ** 2))
+return float(np.mean((original - self.reconstruct(original)) ** 2))
 ```
 The reconstruction error: low for normal, high for anomalous.
 
-**7. Threshold check** (`src/detector.py`):
+**7. Threshold check** (`src/main.py`):
 ```python
-return DetectionResult(score > threshold, score, threshold)
+"is_anomaly": score > threshold,
 ```
 The decision is still one comparison: is the reconstruction error higher than what we saw during training?
 
@@ -981,13 +981,13 @@ Tells the broker: "send me every message on this topic." Done inside `on_connect
 
 **9. Keras training call** (`training/train.py`):
 ```python
-model.fit(x=scaled_data, y=scaled_data, epochs=..., batch_size=...)
+model.fit(scaled, scaled, epochs=..., batch_size=..., shuffle=True)
 ```
-One call replaces the manual training loop. Keras handles shuffling, batching, forward pass, gradient computation, and weight update on every epoch. The autoencoder's target is its own input (`y=scaled_data`).
+One call replaces the manual training loop. Keras handles shuffling, batching, forward pass, gradient computation, and weight update on every epoch. The autoencoder's target is its own input (the second `scaled`).
 
 **10. Threshold calculation** (`training/train.py`):
 ```python
-threshold = mse_mean + sigma * mse_std
+"threshold": mse_mean + sigma * mse_std
 ```
 The three-sigma rule: anything more than 3 standard deviations above mean training error is an anomaly.
 
@@ -1018,7 +1018,7 @@ Three details, each for a reason:
 
 The runtime is chosen in the order `tflite_runtime` → `ai_edge_litert` → `tensorflow`: whichever imports first. In the NPU container that is the device's `tflite_runtime` 2.16.2, borrowed by the entrypoint, because it shares its TFLite library with the delegate ([4.5](#45-which-tflite-runtime)). With `HOST_TFLITE_RUNTIME=0`, or on a laptop, LiteRT runs the same model.
 
-### 5.4 Catching the C++ evidence
+### 5.4 Reading the delegation from the graph
 
 When a delegate takes over part of a graph, many TFLite builds print a line like:
 
@@ -1026,20 +1026,17 @@ When a delegate takes over part of a graph, many TFLite builds print a line like
 INFO: Replacing 5 out of 5 node(s) with delegate (Vx Delegate) node, yielding 1 partitions.
 ```
 
-That is evidence, but it is printed by C++ code directly to a file descriptor, below Python's `sys.stdout`/`sys.stderr`. `capture_native_output()` temporarily redirects descriptors 1 and 2 into a file, keeps the lines, and echoes them to the real log. `delegation_summary()` turns them into `{"delegate": "Vx Delegate", "nodes": 5, "of": 5}`. Our graph has 5 nodes: 4 `FULLY_CONNECTED` and 1 `LOGISTIC` (the sigmoid). "5 out of 5" would mean the whole model runs on the NPU; "4 out of 5" would mean the sigmoid stays on the CPU, and data travels CPU → NPU → CPU every inference.
+Our graph has 5 nodes: 4 `FULLY_CONNECTED` and 1 `LOGISTIC` (the sigmoid). "5 out of 5" would mean the whole model runs on the NPU; "4 out of 5" would mean the sigmoid stays on the CPU, and data travels CPU → NPU → CPU every inference.
 
-**Two surprises from the device**, both found by measuring:
+**The device's TFLite 2.16.2 does not print that line at all**, found by measuring. So the detector reads the graph itself (`graph_delegation()` in `src/model.py`). After a delegate is applied, the interpreter lists the original ops *plus* one `DELEGATE` node per partition:
 
-1. **The device's TFLite 2.16.2 does not print the "Replacing" line at all.** So the code also reads the graph itself (`graph_delegation()`). After a delegate is applied, the interpreter lists the original ops *plus* one `DELEGATE` node per partition:
+```text
+['FULLY_CONNECTED', 'FULLY_CONNECTED', 'FULLY_CONNECTED', 'FULLY_CONNECTED', 'LOGISTIC', 'DELEGATE']
+```
 
-   ```text
-   ['FULLY_CONNECTED', 'FULLY_CONNECTED', 'FULLY_CONNECTED', 'FULLY_CONNECTED', 'LOGISTIC', 'DELEGATE']
-   ```
+An original op belongs to the partition if it lies on a path from the `DELEGATE` node's inputs to its outputs. On the device: `{"delegate": "Vx Delegate", "nodes": 5, "of": 5}`, shown on the panel as `Vx Delegate: 5/5 nodes`. On the CPU the same reading reports XNNPACK, TFLite's own CPU delegate.
 
-   An original op belongs to the partition if it lies on a path from the `DELEGATE` node's inputs to its outputs. On the device: `Vx Delegate: 5/5 nodes`.
-2. **The VX delegate writes its own lines (`INFO: Vx delegate: ...`) to stdout, not stderr.** We found it by running the check twice, once with `2>/dev/null` and once with `>/dev/null`. That is why the capture covers both descriptors, and calls C's `fflush()` before restoring them: when stdout is not a terminal, C keeps it in a buffer that would otherwise be written after the capture ends.
-
-`TF_CPP_MIN_LOG_LEVEL=3` in the base compose file hides INFO lines. The NPU override sets it to `0`.
+The C++ log lines that the runtime does print still reach the container log (`docker logs`), next to Python's. `TF_CPP_MIN_LOG_LEVEL=3` in the base compose file hides TFLite's INFO lines; the NPU override sets it to `0`. The VX delegate writes its own lines (`INFO: Vx delegate: ...`) to stdout, not stderr.
 
 **Going one level deeper (lab only).** The NPU's own graph compiler, OVXLIB, can describe what it built. With `VSI_NN_LOG_LEVEL=4` on the device it prints every NPU node:
 
@@ -1063,12 +1060,34 @@ Read it like a recipe. Our 5 TFLite ops became 4 `FCL2` (fully connected), 3 `RE
 
 | Topic | Direction | Retained | Content |
 |---|---|---|---|
-| `anomaly/paperclip/alerts` | detector → HMI | no | `is_anomaly`, `score`, `threshold`, plus `accelerator`, `precision`, `inference_ms` for every window |
+| `anomaly/paperclip/alerts` | detector → HMI | no | `is_anomaly`, `anomaly_score`, `threshold`, plus `accelerator`, `precision`, `inference_ms` for every window |
 | `anomaly/paperclip/status` | detector → HMI | **yes** | Where the model runs and why: accelerator, NPU error, runtime, delegate, delegation, warm-up, driver version, graph-cache files |
 | `anomaly/paperclip/cmd` | HMI → detector | no | `{"cmd": "benchmark", "runs": 1000}` (capped at 5000, see [5.6](#56-the-benchmark-call-step-by-step)) |
 | `anomaly/paperclip/benchmark` | detector → HMI | no | CPU vs active engine: p50, p95, largest output difference |
 
-The full payloads are documented in the `src/mqtt_client.py` docstring. The alert payload only **adds** fields, so the existing `AnomalyFeedbackManager`, which reads `is_anomaly`, keeps working.
+Example payloads on the NPU (illustrative values, shortened with `…`; FactoryTalk Optix reads them field by field, so the keys are a contract):
+
+```text
+alerts     {"is_anomaly": false, "anomaly_score": 0.001234, "threshold": 0.004096,
+            "accelerator": "npu", "precision": "int8", "inference_ms": 0.6812}
+
+status     {"state": "online", "started_at": "…", "accelerator": "npu", "npu_requested": true,
+(retained)  "npu_error": null, "model": "autoencoder_int8.tflite", "precision": "int8",
+            "runtime": "tflite_runtime 2.16.2", "delegate": "/opt/npu/lib/libvx_delegate.so",
+            "delegation": [{"delegate": "Vx Delegate", "nodes": 5, "of": 5}], "warmup_ms": 16.2,
+            "threshold": 0.004096, "galcore_version": "6.4.11",
+            "graph_cache": {"enabled": true, "dir": "/var/cache/npu", "files": 1, "bytes": 54976, "names": ["….nb"]}}
+
+benchmark  {"model": "autoencoder_int8.tflite", "precision": "int8", "runs": 1000,
+            "cpu": {"accelerator": "cpu", "runs": 1000, "p50_ms": 0.35, "p95_ms": 0.547, "mean_ms": …, "min_ms": …},
+            "npu": {"accelerator": "npu", "runs": 1000, "p50_ms": 0.656, "p95_ms": 0.754, "mean_ms": …, "min_ms": …},
+            "npu_unavailable": null, "max_output_difference": 0.0, "npu_vs_cpu_p50": 1.87,
+            "finished_at": "…"}
+```
+
+On the CPU, `npu` is `null`, `npu_unavailable` says why, and `npu_vs_cpu_p50` is absent. A refused or failed benchmark answers `{"error": "…"}`; a stopped detector leaves `{"state": "offline"}` as the status (5.5.2).
+
+The alert payload only **adds** fields to the first version, so the existing `AnomalyFeedbackManager`, which reads `is_anomaly`, keeps working.
 
 #### 5.5.2 Retained status and the Last Will
 
@@ -1127,12 +1146,12 @@ sequenceDiagram
 | Step | Code | What it does | Why |
 |---|---|---|---|
 | 1 | `NpuStatusManager.RequestBenchmark()` | Reads `BenchmarkRuns`, clamps it to 1–5 000, publishes the command, sets `BenchmarkRunning` | It only *sends*: the UI thread never waits for the answer. QoS 1 so the command is not lost; **not retained**, or the detector would run a benchmark again at every reconnect |
-| 2 | `main.handle_command()` | Ignores unknown commands. Under `bench_lock`: if a benchmark is running, answers `{"error": "benchmark already running"}`; else marks it running and starts a thread | Two benchmarks at once would compete for the CPU and spoil each other's numbers. Check-and-set under a lock, so two quick clicks cannot both pass |
-| 3 | `main.benchmark_worker()` | Creates the CPU engine on first use, picks the input, calls `run_benchmark`, adds `finished_at`, frees the slot in `finally`, publishes the result and a fresh status | A **thread**, because the MQTT loop must keep delivering sensor data. `finally`, because a crashed benchmark must not block all the next ones |
+| 2 | `main.handle_command()` | Ignores unknown commands. Tries to take `bench_lock` without waiting: if a benchmark already holds it, answers `{"error": "benchmark already running"}`; else starts a thread | Two benchmarks at once would compete for the CPU and spoil each other's numbers. Taking the lock is check-and-set in one step, so two quick clicks cannot both pass |
+| 3 | `main.benchmark_worker()` | Calls `run_benchmark` on the CPU engine and the main engine with the last input, adds `finished_at`, releases the lock in `finally`, publishes the result and a fresh status | A **thread**, because the MQTT loop must keep delivering sensor data. `finally`, because a crashed benchmark must not block all the next ones |
 | 4 | `benchmark.run_benchmark()` | Clamps `runs` again (never trust the request), times N runs on the CPU, then N on the main engine, compares the outputs | The CPU first and then the NPU, never at the same time, so they do not compete for the CPU |
 | 5 | `NpuStatusManager.ParseBenchmark()` | Copies the numbers into the `Bench*` variables and writes `BenchMessage` | The panel only displays; all the measuring happens next to the model |
 
-**The two engines, and the one thing that differs.** The CPU engine is a second interpreter on the **same `.tflite` file**, created with `use_npu=False`. Both get the **same input**: the last real normalised window (`bench["last_vector"]`), or a vector of 0.5 (the middle of the normal range) if no window has arrived yet. Same model, same input, same code path: only the engine changes. That is the "one variable at a time" rule from the ladder.
+**The two engines, and the one thing that differs.** The CPU engine is a second interpreter on the **same `.tflite` file**, created at start-up with `use_npu=False`. Both get the **same input**: the last real normalised window (`last_vector`), or a vector of 0.5 (the middle of the normal range) if no window has arrived yet. Same model, same input, same code path: only the engine changes. That is the "one variable at a time" rule from the ladder.
 
 **What one run measures.** One run is one call of `engine.reconstruct(vector)`: one complete inference, batch 1, exactly what the detector does for every window:
 
@@ -1159,7 +1178,6 @@ The one-time graph compilation (the warm-up, 16–72 ms) happened when the engin
 | `npu_vs_cpu_p50` | `BenchNpuVsCpu` | NPU p50 ÷ CPU p50. **Above 1: the NPU is slower** for one inference of this model |
 | `max_output_difference` | `BenchMaxOutputDiff` | The largest gap between the CPU's and the NPU's outputs for the same input. Measured: **0.0** |
 | `npu_unavailable` | `BenchMessage` | Why there is no NPU run (`npu` is `null`), for example `NPU not requested (USE_NPU=false)` |
-| `counters_before` / `counters_after` | `NpuCounterDelta` | Driver counters read just before and after the NPU runs, if `NPU_COUNTERS_PATH` is readable. Usually `null` ([5.5.3](#553-the-evidence-ladder)) |
 | `finished_at` | `BenchFinishedAt` | UTC time when the result was ready |
 
 **How many runs? More runs do not make the NPU win.** It is tempting to raise the run count until the NPU comes out ahead. We tried it on the device: the same benchmark with 1 000, 10 000 and 50 000 runs:
@@ -1295,7 +1313,7 @@ The tables give each variable, the JSON field it comes from, and the value on ou
 | `Precision` | String | `precision` | `int8` or `float32` ([3.4.4](#344-per-tensor-and-a-separate-threshold)) | `int8` |
 | `Runtime` | String | `runtime` | The TFLite Python package that was imported, and its version ([5.3](#53-inferenceengine-try-the-npu-fall-back-remember-why)) | `tflite_runtime 2.16.2` |
 | `Delegate` | String | `delegate` | Path of the delegate library loaded inside the container; `none (CPU)` when none | `/opt/npu/lib/libvx_delegate.so` |
-| `Delegation` | String | `delegation` | How many of the model's nodes each delegate took ([5.4](#54-catching-the-c-evidence)); `no delegate took any node` on the CPU | `Vx Delegate: 5/5 nodes` |
+| `Delegation` | String | `delegation` | How many of the model's nodes each delegate took ([5.4](#54-reading-the-delegation-from-the-graph)); `no delegate took any node` on the CPU | `Vx Delegate: 5/5 nodes` |
 | `WarmupMs` | Double | `warmup_ms` | Duration of the first inference, where the NPU compiles the graph | about 66 ms; 16 ms with the graph cache |
 | `Threshold` | Double | `threshold` | The anomaly threshold of the loaded model variant | 0.010236 |
 | `GalcoreVersion` | String | `galcore_version` | The NPU driver's version. The kernel driver's own version file is in sysfs on some devices; on ours it is only in debugfs, readable by root. So the detector falls back to the version string compiled into the lent `libGAL.so` (the user-space half of the same driver release). The prefix says which source was read | `libGAL 6.4.11:745085` |
@@ -1323,7 +1341,7 @@ The tables give each variable, the JSON field it comes from, and the value on ou
 | `BenchMaxOutputDiff` | Double | `max_output_difference` | Largest difference between the CPU and NPU outputs for the same input | 0.0 |
 | `BenchMessage` | String | built by the NetLogic | A sentence for the operator: the ratio explained, `No NPU run: <reason>` (from `npu_unavailable`), or an error | |
 | `BenchFinishedAt` | String | `finished_at` | When the benchmark ended | |
-| `NpuCounterDelta` | String | `counters_before`, `counters_after` | Change of driver counters during the benchmark. Here always `n/a (driver counters not exposed to the container)`: the rootless container cannot read debugfs ([5.5.3](#553-the-evidence-ladder)) | n/a |
+| `NpuCounterDelta` | String | `counters_before`, `counters_after` (no longer sent by the detector) | Change of driver counters during the benchmark. Always `n/a (driver counters not exposed to the container)`: the rootless container cannot read debugfs, so the detector does not send counters ([5.5.3](#553-the-evidence-ladder)) | n/a |
 
 Percentiles, briefly: run the same inference 5 000 times and sort the times. p50 is the one in the middle (the typical case), p95 the one at position 4 750 (a bad but common case). A mean would be dragged up by a few slow runs, when the operating system paused our process.
 
@@ -1350,7 +1368,7 @@ Percentiles, briefly: run the same inference 5 000 times and sort the times. p50
 | Algorithm | Autoencoder | Learns multivariate patterns; intuitive anomaly score (reconstruction error); great for teaching | Isolation Forest — simpler but treats samples independently, less to learn |
 | Framework | TensorFlow Lite (TFLite) | Chosen for this project because it integrates with the NXP eIQ/VSI delegate stack on the i.MX 8M Plus target, `tflite-runtime` on the edge device is only a few MB, and it provides a clear split between training (full TF/Keras, dev machine) and inference (TFLite, edge device) | PyTorch — no NPU delegate in this project stack; scikit-learn — can’t easily define custom neural nets |
 | Preprocessing | Window averaging (30s, no overlap) | Simple, smooths noise, keeps model input small (10 features) | Raw samples — noisy; sliding window with overlap — adds complexity without much benefit for a tutorial |
-| Normalisation | MinMaxScaler to [0, 1] | Matches Sigmoid output; prevents scale imbalance | StandardScaler (z-score) — works too, but [0,1] matches Sigmoid naturally |
+| Normalisation | Min-max to [0, 1], saved as plain JSON (`scaler.json`) | Matches Sigmoid output; prevents scale imbalance; two lists of numbers need no scikit-learn in the image | StandardScaler (z-score) — works too, but [0,1] matches Sigmoid naturally |
 | Threshold | mean + 3σ | Classic, easy to explain, well-understood | Fixed threshold — doesn't adapt; percentile — needs more data |
 | MQTT QoS | Level 1 (at least once) | Don't lose alerts; QoS 2 adds unnecessary overhead | QoS 0 — might lose alerts; QoS 2 — overkill |
 | Docker base | PC image: `python:3.11-slim` (Debian *bookworm*) + `tflite-runtime` 2.14. NPU image: `python:3.12-slim-trixie` ([6.2](#62-running-on-the-npu)) | Small image, no compilation issues with pip | Alpine — smaller but C-extension installs often fail |
@@ -1375,7 +1393,7 @@ Percentiles, briefly: run the same inference 5 000 times and sort the times. p50
 | Work with the device's rootless Docker | Switch to a rootful daemon | Nothing changed on the host. It also keeps debugfs closed to containers, so the driver evidence stays a root lab check |
 | Driver client list as hardware evidence | The `gc/idle` On-time counter | The counter gave 601 ms once and 0 ms twice for the same benchmark; the client list was right every time ([5.5.3](#553-the-evidence-ladder)) |
 | `GalcoreVersion` read from the lent `libGAL.so` when the kernel's version file is unreadable | Show `unknown` | On our device the kernel driver's version is only in debugfs (root-only). `libGAL` is built from the same driver release and carries its version string |
-| A separate int8 file next to the float one | Replace float with int8 | The float model stays the CPU reference; `precision: auto` picks |
+| A separate int8 file next to the float one | Replace float with int8 | The float model stays the CPU reference; `use_npu` picks int8 |
 | Per-tensor weights | Per-channel (TFLite default) | NPU-friendly, and measured: zero decision changes |
 | Fallback to the CPU on any NPU error | Fail hard | The detector must keep protecting the machine; the status explains why |
 | Benchmark in a worker thread, on request | Benchmark at start-up | Never blocks the 1 Hz sensor path; the operator sees it happen |
@@ -1409,6 +1427,25 @@ The core learning loop: predict, measure, compare, explain the gap. Results from
 ## 7. How to Run
 
 Every command below was run as printed, on a Windows PC and on our OptixEdge. Two device paths are the exception: the Portainer clicks of 7.8 and the `tcp://…:2375` connection of 7.9 follow the standard tools rather than a recorded run, because our test device's Docker daemon is rootless and listens only on a local socket. The same image and compose files were deployed on it over SSH (the 7.9 variant). Commands are for **Windows PowerShell**; where Linux or macOS differ, the difference is shown next to it. Replace `<optixedge-ip>` with your device's IP address (ours is `172.16.17.105`).
+
+### 7.0 Shortcut: the deploy scripts
+
+On Windows, three scripts in `deploy_tools/` run the commands of this section for you. Train the model first (7.4); the scripts check for it. Each script works from any folder, and `Get-Help <script> -Full` lists its options.
+
+| Script | Where it runs the detector | Actions (`-Action`) |
+|---|---|---|
+| `deploy_local_docker.ps1` | This PC, with Docker Desktop (7.5) | `Up` (default), `Logs`, `Status`, `Test`, `Down` |
+| `deploy_local_podman.ps1` | This PC, with Podman (7.5); starts the Podman machine if needed | `Up` (default), `Logs`, `Status`, `Test`, `Down` |
+| `deploy_device.ps1` | The OptixEdge test device: builds the arm64 image (7.7), copies and starts it over SSH (7.9 variant) | `Deploy` (default), `Logs`, `Status`, `Check`, `Test`, `Down`, `Remove` |
+
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy_tools\deploy_local_podman.ps1              # PC: build, start, show the status
+powershell -ExecutionPolicy Bypass -File deploy_tools\deploy_local_podman.ps1 -Action Test # PC: the integration test of 7.6
+powershell -ExecutionPolicy Bypass -File deploy_tools\deploy_device.ps1 -DeviceIp <optixedge-ip>
+powershell -ExecutionPolicy Bypass -File deploy_tools\deploy_device.ps1 -SkipBuild -UseNpu false   # negative control, no rebuild
+```
+
+`deploy_device.ps1` builds with Podman by default (`-Engine docker` for Docker Desktop), and reaches the device as `root` over SSH. Without an SSH key it asks for the password about three times. `-Action Remove` deletes everything the project created on the device (7.11), after asking for confirmation. The rest of this section explains what the scripts do, step by step.
 
 ### 7.1 The big picture
 
@@ -1474,7 +1511,7 @@ python -m venv venv                            # create the private package fold
 .\venv\Scripts\Activate.ps1                    # switch this terminal to it: the prompt now starts with (venv)
 pip install -r requirements.txt tensorflow     # runtime packages + TensorFlow for training (a few minutes)
 python training\generate_synthetic.py          # write fake sensor data to data\
-python training\train.py                       # train, then export both model files
+python training\train.py                       # train, export both model files, compare float with int8
 ```
 
 On Linux or macOS, the same steps are:
@@ -1492,7 +1529,7 @@ Then look at the result with `Get-ChildItem models` (Linux/macOS: `ls -l models`
 ```text
 autoencoder.tflite        16544   the float32 model: the graph and its weights
 autoencoder_int8.tflite    7064   its int8 twin, for the NPU (3.4)
-scaler.pkl                  681   the fitted MinMaxScaler (3.2)
+scaler.json                  527  per-tag min and max of the training windows (3.2)
 threshold.json              124   the anomaly threshold of the float model
 threshold_int8.json         125   the threshold of the int8 model (3.4.4)
 ```
@@ -1996,17 +2033,15 @@ These change behaviour without rebuilding the image. Set them under `environment
 
 | Variable | Default | What it does |
 |---|---|---|
-| `USE_NPU` | `false` in `config.yaml`; `true` in `Dockerfile.npu` and the NPU compose file | Try the NPU. If it fails, the detector runs on the CPU and the status says why ([5.3](#53-inferenceengine-try-the-npu-fall-back-remember-why)) |
-| `MODEL_PRECISION` | `auto` | `auto` = int8 when `USE_NPU` is true, float32 otherwise. `float32` or `int8` forces one (`float32` on the NPU runs in float16: [6.3](#63-the-ladder-log-predictions-vs-results)) |
+| `USE_NPU` | `false` in `config.yaml`; `true` in `Dockerfile.npu` and the NPU compose file | Try the NPU with the int8 model. If it fails, the same int8 model runs on the CPU and the status says why ([5.3](#53-inferenceengine-try-the-npu-fall-back-remember-why)). `false` runs the float32 model on the CPU |
 | `VX_DELEGATE_PATH` | `/opt/npu/lib/libvx_delegate.so` (set by the entrypoint) | Where the NPU delegate is |
 | `MQTT_BROKER_HOST`, `MQTT_BROKER_PORT` | `mqtt-broker`, `1883` | Which broker the detector (or `tests/test_integration.py`, default `localhost`) connects to |
-| `TF_CPP_MIN_LOG_LEVEL` | `3` on the PC, `0` on the NPU | `0` keeps TFLite's INFO lines, which carry the delegation evidence ([5.4](#54-catching-the-c-evidence)) |
+| `TF_CPP_MIN_LOG_LEVEL` | `3` on the PC, `0` on the NPU | `0` keeps TFLite's INFO lines, which carry the delegation evidence ([5.4](#54-reading-the-delegation-from-the-graph)) |
 | `VIV_VX_ENABLE_CACHE_GRAPH_BINARY`, `VIV_VX_CACHE_BINARY_GRAPH_DIR` | `1`, `/var/cache/npu` | Store the compiled NPU graph (`.nb`) on the volume: evidence, and a faster start ([5.5.3](#553-the-evidence-ladder)) |
 | `HOST_LIB_DIR` | `/host/usr/lib` | Where the device's libraries are mounted inside the container |
 | `NPU_HOST_LIBS` | the list in `tools/npu_entrypoint.sh` | Which library name patterns the entrypoint links; add one if a device names a library differently |
 | `NPU_DEBUG` | `0` | `1` prints the entrypoint's full `ldd` result ([4.4](#44-the-entrypoint-borrow-only-the-npu-libraries)) |
 | `HOST_TFLITE_RUNTIME` | `1` | `0` uses the image's LiteRT instead of the device's `tflite_runtime` (runtime B of [4.5](#45-which-tflite-runtime)) |
-| `NPU_COUNTERS_PATH` | not set | A driver counter file to read before and after a benchmark (needs a read-only mount of that file; [5.5.3](#553-the-evidence-ladder)) |
 | `LITERT_VERSION` | `1.2.0` | A **build** argument of `Dockerfile.npu`: `podman build --build-arg LITERT_VERSION=… ` |
 
 ### 8.3 Next steps
@@ -2019,7 +2054,7 @@ These change behaviour without rebuilding the image. Set them under `environment
 
 # Part 2 — Gesture Control
 
-> Sections 9 to 25: a camera, a ready-made pose model and a few geometric rules let an operator control the HMI with four hand gestures. The Python service is built and tested on a laptop; the FactoryTalk Optix side and the NPU are planned.
+> Sections 9 to 25: a camera, a ready-made pose model and a few geometric rules let an operator control the HMI with four hand gestures. The Python service runs on a laptop and on the OptixEdge's CPU; the FactoryTalk Optix NetLogic is written but not yet run, and the NPU path has never run.
 
 ## 9. Gesture Control Overview
 
@@ -2029,7 +2064,7 @@ An operator stands in front of a camera and controls the HMI without touching it
 
 | Gesture (name in the messages) | What the operator does | What the HMI will do |
 |---|---|---|
-| `open_palm` | Raises one hand to shoulder or face height, forearm up, and holds it still for 1 second, like a "stop" sign | Open a dialog |
+| `open_palm` | Raises one hand to shoulder or face height, in front of the body, forearm up, and holds it still for about 1 second, like a "stop" sign. The gesture is reported when the hand is then lowered ([13.7](#137-open-palm)) | Open a dialog |
 | `palm_up` | Pushes one hand quickly upwards until it is above the head | Show a message |
 | `swipe_left` | Moves one hand quickly to their own left, between chest and head height | Go to the previous page |
 | `swipe_right` | Moves one hand quickly to their own right, between chest and head height | Go to the next page |
@@ -2039,7 +2074,7 @@ An operator stands in front of a camera and controls the HMI without touching it
 Two honest limits up front:
 
 - **No fingers.** The pose model finds wrists and elbows but no fingers, so it cannot tell an open hand from a fist. In this project, "open palm" means "a raised, still hand with the forearm pointing up" ([10.4](#104-pose-estimation-and-keypoints)).
-- **The HMI side is not built yet.** The actions in the last column are designed ([section 16](#16-factorytalk-optix-integration-planned)) but not implemented. Today the service publishes MQTT messages, which you can watch with an MQTT client ([23.7](#237-watch-the-messages)).
+- **The HMI side is written but not yet run.** The actions in the last column are implemented in two NetLogics ([section 16](#16-factorytalk-optix-integration)) that compile but have not run in FactoryTalk Optix yet. Today the service publishes MQTT messages, which you can watch with an MQTT client ([23.7](#237-watch-the-messages)), and serves the camera picture with the detected body drawn on it, ready for a FactoryTalk Optix WebBrowser object ([16.5](#165-the-camera-picture-in-a-webbrowser-object)).
 
 ### 9.2 What is built and what is not
 
@@ -2047,13 +2082,14 @@ Legend: ✅ done and verified · ⚠️ partly verified · 📝 designed or writ
 
 | Part | Status | Evidence |
 |---|---|---|
-| Gesture service: camera → MoveNet → rules → MQTT | ✅ | 60 unit tests pass, natively and inside the container |
+| Gesture service: camera → MoveNet → rules → MQTT | ✅ | 77 unit tests pass natively. An earlier version of the suite also passed inside the laptop container; the current 77 were not run there again |
+| On the OptixEdge test device, CPU only, with the Tapo C310 camera | ✅ | The arm64 image runs there; the camera on the device's WAN port is read over RTSP (`/stream2`) without any NAT rule; 15 to 16 fps, image preparation + MoveNet about 50 ms per frame; MQTT status arrives; container `healthy` ([11.1](#111-production-on-the-imx-8m-plus), [19.3](#193-expected-on-the-imx-8m-plus)) |
+| MJPEG stream with the skeleton drawn on it | ✅ | `http://<device>:8081/` shown in Chromium (Edge, headless) from the device; the skeleton drawing checked on a test photo with the arm64 image ([16.5](#165-the-camera-picture-in-a-webbrowser-object)) |
 | Laptop run with Podman and the built-in webcam | ✅ | 19.5 frames per second; preparing the image and running MoveNet take about 3.2 ms per frame on the laptop CPU ([19.1](#191-measured-on-the-laptop)) |
 | Health reporting and camera reconnect | ✅ | Camera stream stopped → `camera_lost` after about 2 s → `running` again when it returns; service killed → `offline` after about 1 s ([17.5](#175-who-notices-what)) |
-| Gestures made by a real person in front of the camera | ⚠️ | The rules are tested only with synthetic (computer-generated) poses. The thresholds are reasoned design values, not yet tuned on recordings |
-| FactoryTalk Optix side: subscriptions, NetLogic, pages, dialog | 📝 | Design only ([section 16](#16-factorytalk-optix-integration-planned)) |
-| NPU acceleration on the i.MX 8M Plus | 📝 | Code path written. Its fallback to the CPU is tested on the laptop; it has never run on the device |
-| ARM64 image, edge compose file, Ethernet IP camera | ❌ | Roadmap ([25.3](#253-roadmap)) |
+| Gestures made by a real person in front of the camera | ⚠️ | Keypoints recorded on the OptixEdge (120 s, 13 labelled gestures) and replayed through the real rules: 13 of 13 detected and no false events after the fixes, against 3 of 13 and 5 false events before. Two recordings without gestures (a person standing, a person walking) give no events ([22](#22-gesture-decision-log)). One small set of recordings: not yet several people or a trade-show crowd |
+| FactoryTalk Optix side: subscriptions, NetLogic, pages, dialog | 📝 | `GestureEventManager` (runtime) and `GestureModelBuilder` (design time) written; they compile against the Studio 1.7.5.13 assemblies but have not run in Studio or in the runtime ([section 16](#16-factorytalk-optix-integration)) |
+| NPU acceleration on the i.MX 8M Plus | 📝 | Image and override file ready, with the same library borrowing as Part 1 ([19.4](#194-how-the-npu-will-be-used)). The fallback to the CPU is tested on the laptop and on the device; the test device has no NPU enabled, so the NPU itself has never run |
 
 ### 9.3 The big idea in one paragraph
 
@@ -2070,8 +2106,8 @@ About 20 times per second, the service takes the newest picture from the camera,
 | What the model outputs | How well it can rebuild its input (the reconstruction error) | 17 body points, each with a score |
 | Decision | One threshold (three-sigma rule) | Geometric rules over time, plus repeat protection |
 | MQTT output | `anomaly/paperclip/alerts` | `gesture/paperclip/events` and `gesture/paperclip/status` |
-| FactoryTalk Optix side | `AnomalyFeedbackManager` NetLogic sets `IsAnomaly` (built) | `GestureEventManager` NetLogic (planned) |
-| Where the model runs | ARM CPU (NPU not enabled yet) | Laptop CPU today; the i.MX 8M Plus NPU is planned |
+| FactoryTalk Optix side | `AnomalyFeedbackManager` NetLogic sets `IsAnomaly` (built) | `GestureEventManager` NetLogic (written, not yet run) |
+| Where the model runs | ARM CPU (NPU not enabled yet) | OptixEdge CPU today (about 50 ms per frame); the NPU when the device has it enabled (override file ready) |
 
 ## 10. Machine Learning Basics for Gesture Control
 
@@ -2133,7 +2169,7 @@ Google published MoveNet in May 2021 ([MoveNet blog](https://blog.tensorflow.org
 | **Lightning** (we use this) | 192 × 192 | "intended for latency-critical applications" |
 | Thunder | 256 × 256 | for applications that need higher accuracy |
 
-A separate MultiPose version "detects up to 6 poses" ([TensorFlow.js MoveNet page](https://github.com/tensorflow/tfjs-models/blob/master/pose-detection/src/movenet/README.md)). We use **SinglePose Lightning, int8, version 4** from TensorFlow Hub, which is also where NXP's [eIQ Model Zoo](https://github.com/NXP/eiq-model-zoo/blob/main/tasks/vision/pose-estimation/movenet/README.md) downloads it. The zoo page says this int8 model "has been tested on i.MX 8MP", but it publishes no speed figure. `tools/fetch_model.py` downloads it and checks its SHA-256 fingerprint, so every machine runs a byte-identical file (2,894,840 bytes).
+A separate MultiPose version "detects up to 6 poses" ([TensorFlow.js MoveNet page](https://github.com/tensorflow/tfjs-models/blob/master/pose-detection/src/movenet/README.md)). We use **SinglePose Lightning, int8, version 4** from TensorFlow Hub, which is also where NXP's [eIQ Model Zoo](https://github.com/NXP/eiq-model-zoo/blob/main/tasks/vision/pose-estimation/movenet/README.md) downloads it. The zoo page says this int8 model "has been tested on i.MX 8MP", but it publishes no speed figure. `tools/fetch_model.py` downloads it and checks its SHA-256 fingerprint, so every machine runs a byte-identical file (2,894,840 bytes). Because NXP's zoo uses this same file, there is no separate i.MX version to convert.
 
 **How it works inside (simplified from the blog):**
 
@@ -2193,58 +2229,63 @@ Think of a **ruler with 256 marks**. The scale is the distance between two marks
 
 ## 11. Gesture Architecture
 
-This section shows where each piece runs: first the planned production setup, then the laptop setup that runs today, then the inside of the service.
+This section shows where each piece runs: first the device setup, then the laptop setup used for development, then the inside of the service.
 
 ### 11.1 Production on the i.MX 8M Plus
 
-> 📝 **Planned.** This is the target design. None of it has run on the device yet ([9.2](#92-what-is-built-and-what-is-not)).
+> ✅ **Runs on the OptixEdge test device, on the CPU** (the device has no NPU enabled). The NPU part is ready but untested ([9.2](#92-what-is-built-and-what-is-not)).
 
 ```mermaid
 flowchart LR
-  CAM["Ethernet IP camera<br/>RTSP or MJPEG"]
-  subgraph EDGE["i.MX 8M Plus edge device"]
+  CAM["Tapo C310 IP camera<br/>192.168.8.66, RTSP"]
+  subgraph EDGE["OptixEdge (i.MX 8M Plus), rootless Docker"]
     subgraph SVC["Container: gesture service"]
       GRAB["Camera thread<br/>keeps the newest frame"]
       POSE["MoveNet<br/>17 keypoints"]
       RULES["Gesture rules"]
       PUB["MQTT publisher"]
+      MJPEG["MJPEG server<br/>port 8081"]
     end
-    NPU[("NPU<br/>through the VX delegate")]
+    NPU[("NPU<br/>through the VX delegate<br/>(when enabled)")]
     BROKER["Mosquitto broker<br/>shared with Part 1"]
     subgraph OPTIX["FactoryTalk Optix runtime"]
       MQ["MQTT client"]
       NL["GestureEventManager<br/>NetLogic"]
-      UI["Pages, dialog, message"]
+      WB["WebBrowser object"]
     end
   end
-  SCREEN["Browser or panel"]
-  CAM -->|frames| GRAB
+  CAM -->|"WAN port, RTSP over TCP"| GRAB
   GRAB --> POSE
   POSE --> RULES
   RULES --> PUB
+  POSE -->|picture + skeleton| MJPEG
   POSE <-.->|inference| NPU
   PUB -->|events and status| BROKER
   BROKER --> MQ
   MQ --> NL
-  NL --> UI
-  UI --> SCREEN
+  MJPEG -->|"http://device:8081/"| WB
 ```
 
 Reading the diagram from left to right:
 
-1. An **Ethernet IP camera** sends its video stream (RTSP, or MJPEG over HTTP) to the edge device.
-2. The **gesture service** runs in a container. It keeps only the newest frame, runs MoveNet on it (on the NPU when possible, otherwise on the CPU), applies the gesture rules and publishes MQTT messages.
-3. The **Mosquitto broker** is the one Part 1 already uses, so no second broker is needed.
-4. **FactoryTalk Optix** receives the messages with its built-in MQTT client. A NetLogic called `GestureEventManager` checks each message and performs the action. The result appears in every browser or panel that shows the HMI.
+1. The **Tapo C310** camera is plugged into the device's **WAN** port. The service reads its low-resolution substream, `rtsp://***@192.168.8.66:554/stream2`, over TCP.
+2. The **gesture service** runs in a container. It keeps only the newest frame, runs MoveNet on it (on the NPU when the device has one, otherwise on the CPU), applies the gesture rules and publishes MQTT messages.
+3. The same service draws the 17 points and the skeleton on each analysed picture and serves them as an **MJPEG** stream on port 8081 ([16.5](#165-the-camera-picture-in-a-webbrowser-object)).
+4. The **Mosquitto broker** is the one Part 1 already uses, so no second broker is needed.
+5. **FactoryTalk Optix** receives the messages with its built-in MQTT client; a NetLogic called `GestureEventManager` performs the actions ([16](#16-factorytalk-optix-integration)). A WebBrowser object shows the MJPEG page.
 
-Planned device settings, each explained in the linked section:
+**No 1:1 NAT is needed.** The containers reach the camera through the device's own routing to its WAN side: a container on the device opened `192.168.8.66:554` directly. Only the device talks to the camera; the laptop and the FactoryTalk Optix clients on the LAN side see the result on port 8081 of the device's LAN address. A NAT rule would only be needed to open the camera's own stream or web page from the LAN.
 
-| Setting | Planned value | Why |
+Device settings, in `docker-compose.edge.yml` and `docker-compose.npu.yml` ([18.5](#185-the-edge-compose-files)):
+
+| Setting | Value | Why |
 |---|---|---|
-| Container network | `network_mode: host`: the container shares the device's network | The broker is reachable at `127.0.0.1:1883`, the same address FactoryTalk Optix uses, and the camera's video does not pass through the container network's address translation (NAT), which can block RTSP video sent over UDP. The service opens no listening ports, so sharing the network exposes nothing new ([22](#22-gesture-decision-log)) |
-| `USE_NPU` | `true` | Use the NPU. The code falls back to the CPU by itself if the NPU fails ([12.4](#124-running-movenet-and-reading-the-result)) |
-| Camera stream | A low-resolution substream, for example 640 × 360 at about 20 fps | The CPU must decode every frame the camera sends ([19.5](#195-bottlenecks)) |
-| Camera address | `CAMERA_URL`, set in the Portainer stack | Camera passwords never go into Git |
+| Container network | The compose project's own network; port 8081 published | Docker on the OptixEdge runs **rootless**: `network_mode: host` would give the container rootless Docker's private network, not the device's. The normal network reaches the camera and the broker, and publishes the stream port |
+| `MQTT_HOST` | The device's own address, for example `10.0.0.42` | The broker publishes port 1883 on the device. The usual alias for "the host" (`host.docker.internal`) did not work under rootless Docker; the device's address did |
+| RTSP over TCP | `OPENCV_FFMPEG_CAPTURE_OPTIONS=rtsp_transport;tcp`, set in the image | Video sent over UDP does not get through the container network's address translation; TCP does |
+| `USE_NPU` | `false` in the edge file, `true` with the NPU override | Without `/dev/galcore` Docker refuses to create a container that asks for it, so the NPU settings live in a separate file ([19.4](#194-how-the-npu-will-be-used)) |
+| Camera stream | `/stream2`, the low-resolution substream | The CPU decodes every frame the camera sends; `/stream1` is the 3-megapixel main stream ([19.5](#195-bottlenecks)) |
+| Camera address | `CAMERA_URL` in `gesture_recognition/.env` on the PC that deploys | Camera passwords never go into Git or into the image ([23.10](#2310-run-on-the-optixedge)) |
 
 ### 11.2 Development on a Windows laptop
 
@@ -2290,8 +2331,8 @@ A **thread** is an independent line of work inside one program. Threads run at t
 
 1. **Camera thread** ([12.1](#121-keeping-only-the-newest-frame)): OpenCV reads the next JPEG from the stream and decodes it into an array of numbers (640 × 480 × 3 with the bridge's default settings). The array goes into the latest-frame slot together with a frame number and a timestamp, replacing the previous frame.
 2. **Main thread**: takes the newest frame it has not processed yet, waiting at most 0.5 s.
-3. **Preprocess** ([12.3](#123-preparing-the-image-for-the-model)): cuts out the middle 480 × 480 square, shrinks it to 192 × 192 and swaps BGR to RGB.
-4. **MoveNet** ([12.4](#124-running-movenet-and-reading-the-result)): returns 17 keypoints. On the laptop CPU this takes about 3 ms.
+3. **Preprocess** ([12.3](#123-preparing-the-image-for-the-model)): shrinks the whole frame to fit 192 × 192, fills the rest of the square with black (a letterbox) and swaps BGR to RGB.
+4. **MoveNet** ([12.4](#124-running-movenet-and-reading-the-result)): returns 17 keypoints. On the laptop CPU this takes about 3 ms; on the OptixEdge CPU, together with step 3, about 50 ms.
 5. **Gesture rules** ([13](#13-from-keypoints-to-gestures) and [14](#14-one-gesture-one-event)): presence gate, body coordinates, wrist tracks, detectors, latch. This takes tens of microseconds.
 6. **Publish** ([15](#15-mqtt-messages-for-gestures)): if a gesture fired, one JSON message goes to `gesture/paperclip/events`.
 7. **Rate cap** ([12.2](#122-the-rate-cap)): if the work took less than 50 ms, the loop waits for the rest, so it runs at most 20 times per second.
@@ -2360,34 +2401,40 @@ Why limit the rate when the laptop could do much more?
 From `pose.py`:
 
 ```python
-def center_square(frame):
-    """Largest square in the middle of the frame (a view, no copy)."""
+def letterbox(frame, side):
+    """Whole frame scaled to fit a side x side square, centred, black padding."""
     h, w = frame.shape[:2]
-    side = min(h, w)
-    top, left = (h - side) // 2, (w - side) // 2
-    return frame[top:top + side, left:left + side]
+    scale = side / max(h, w)
+    nw, nh = round(w * scale), round(h * scale)
+    small = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    top, left = (side - nh) // 2, (side - nw) // 2
+    return cv2.copyMakeBorder(small, top, side - nh - top, left, side - nw - left,
+                              cv2.BORDER_CONSTANT, value=(0, 0, 0))
 
 
-def preprocess(frame, width, height):
-    """BGR camera frame -> uint8 RGB batch of shape [1, height, width, 3]."""
-    small = cv2.resize(center_square(frame), (width, height), interpolation=cv2.INTER_LINEAR)
-    return cv2.cvtColor(small, cv2.COLOR_BGR2RGB)[np.newaxis]
+def preprocess(frame, side):
+    """BGR camera frame -> uint8 RGB batch of shape [1, side, side, 3]."""
+    return cv2.cvtColor(letterbox(frame, side), cv2.COLOR_BGR2RGB)[np.newaxis]
 ```
 
-**Worked example** with a 640 × 480 webcam frame:
+A **letterbox** is what a TV does with a wide film: the whole picture is shown, smaller, with black bands where it does not fill the screen.
 
-1. `side = min(480, 640) = 480`, `top = 0`, `left = (640 − 480) // 2 = 80`. The crop keeps columns 80 to 559: a 480 × 480 square from the middle. "A view, no copy" means NumPy only points into the original array, so the crop itself costs almost nothing.
-2. `cv2.resize` shrinks the square by 480 ÷ 192 = 2.5 to 192 × 192 pixels. `INTER_LINEAR` is OpenCV's standard bilinear method: each new pixel is a weighted average of its nearest original pixels.
-3. `cv2.cvtColor` swaps BGR to RGB. Doing this on the small picture means 192 × 192 = 36,864 pixels instead of 640 × 480 = 307,200, which is 8.3 times less work.
+**Worked example** with a 640 × 360 frame, the size of the Tapo C310's `/stream2` on the device:
+
+1. `scale = 192 ÷ max(360, 640) = 0.3`. The frame shrinks to `nw = 192` by `nh = 108` pixels. Width and height shrink by the same factor, so nothing is stretched. `INTER_LINEAR` is OpenCV's standard bilinear method: each new pixel is a weighted average of its nearest original pixels.
+2. `top = (192 - 108) // 2 = 42`, `left = 0`. `cv2.copyMakeBorder` adds 42 black rows above and 42 below. The picture fills rows 42 to 149 of the 192 × 192 square, and every one of its 640 columns is still there (`test_letterbox_of_landscape_frame_pads_top_and_bottom`). A portrait picture gets its bands on the left and right instead (`test_letterbox_of_portrait_frame_pads_left_and_right`).
+3. `cv2.cvtColor` swaps BGR to RGB. Doing this on the small picture means 192 × 192 = 36,864 pixels instead of 640 × 360 = 230,400, which is 6.25 times less work.
 4. `[np.newaxis]` adds the "batch" dimension that the model expects: shape (192, 192, 3) becomes (1, 192, 192, 3), "one picture".
 
-**Why crop instead of squeezing or padding?**
+**Why a letterbox instead of cropping or squeezing?** MoveNet needs a square, and the camera delivers a wide 16:9 picture. There are three ways to make it fit:
 
-- **Squeezing** the whole 640 × 480 frame into 192 × 192 would shrink the width by 3.33 and the height by 2.5, so people would look thinner than they are.
-- **Padding** (adding borders to make the frame square, as the [TensorFlow tutorial](https://www.tensorflow.org/hub/tutorials/movenet) does) keeps the proportions, but the 640 × 640 padded frame shrinks by 3.33 instead of 2.5, so the operator appears smaller in the model's input.
-- **Cropping** keeps the proportions and keeps the operator as large as possible. The price: the left and right 80-pixel strips (a quarter of the width) are invisible to the model. That is acceptable because the operator stands in the middle, and the presence gate ignores people near the edges anyway ([13.2](#132-the-presence-gate)).
+- **Squeezing** the whole 640 × 360 frame into 192 × 192 would shrink the width by 3.33 but the height only by 1.875, so people would look much thinner than they are.
+- **Cropping** the largest square from the middle keeps the proportions and keeps the operator as large as possible. An earlier version did this. But from a 640 × 360 frame the middle square is 360 × 360, so 280 of the 640 columns, more than 40 % of the width, never reach the model. On the device, that was where the operator's outstretched arm and the end points of a swipe were: swipes never fired ([22](#22-gesture-decision-log)).
+- **Letterboxing** keeps the proportions and the whole picture. Google's [MoveNet tutorial](https://www.tensorflow.org/hub/tutorials/movenet) does the same. The price: the operator appears smaller in the square, because 640 pixels shrink to 192 instead of 360, and the black bands carry no information. The presence gate therefore accepts narrower shoulders than before ([13.2](#132-the-presence-gate)).
 
-A square crop also means x and y share the same unit: 0.1 across is the same distance as 0.1 down. The rules depend on this when they measure distances in shoulder widths ([13.3](#133-body-coordinates-in-shoulder-widths)).
+**What the numbers mean now.** MoveNet's x and y are fractions from 0 to 1 of the **padded square**, black bands included. The middle of the square is the middle of the frame, so "near the middle" still means the middle of the camera picture. For a 640 × 360 frame, x covers the whole width from 0 to 1, while the picture itself only spans y from 42 ÷ 192 ≈ 0.22 to 150 ÷ 192 ≈ 0.78.
+
+The padding keeps the proportions, so x and y still share the same unit: 0.1 across is the same distance as 0.1 down. The rules depend on this when they measure distances in shoulder widths ([13.3](#133-body-coordinates-in-shoulder-widths)).
 
 ### 12.4 Running MoveNet and reading the result
 
@@ -2395,10 +2442,10 @@ A square crop also means x and y share the same unit: 0.1 across is the same dis
 
 ```python
 try:
-    from ai_edge_litert.interpreter import Interpreter, load_delegate
+    from tflite_runtime.interpreter import Interpreter, load_delegate
 except ImportError:
     try:
-        from tflite_runtime.interpreter import Interpreter, load_delegate
+        from ai_edge_litert.interpreter import Interpreter, load_delegate
     except ImportError:
         import tensorflow as tf
         Interpreter = tf.lite.Interpreter
@@ -2407,8 +2454,8 @@ except ImportError:
 
 | Runtime | When it is used |
 |---|---|
-| `ai_edge_litert` (LiteRT) | Inside the container, and in the virtual environment of [23.1](#231-prerequisites): both install `requirements.txt` |
-| `tflite_runtime` | The runtime that NXP ships next to its NPU delegate, in case the device image uses it ([19.4](#194-how-the-npu-will-be-used)) |
+| `tflite_runtime` | Tried first: the device's own runtime, which the NPU entrypoint borrows only when the NPU override mounts the device's `/usr/lib`. The VX delegate is built against this same library ([19.4](#194-how-the-npu-will-be-used)) |
+| `ai_edge_litert` (LiteRT) | Everywhere else: inside the container on the CPU, and in the virtual environment of [23.1](#231-prerequisites); both install `requirements.txt`. The log line says which one loaded: `MoveNet 192x192 loaded on CPU (runtime: ai_edge_litert)` |
 | `tensorflow` | A computer with only full TensorFlow installed. Our first native Windows test runs used this one, because neither LiteRT nor `tflite_runtime` was installed there |
 
 All three offer the same `Interpreter` class, so the rest of the code does not care which one was found.
@@ -2447,16 +2494,16 @@ All three offer the same `Interpreter` class, so the rest of the code does not c
 ```python
     def infer(self, frame):
         """BGR frame -> (17, 3) float32 array of (y, x, score)."""
-        self._interpreter.set_tensor(self._input_index, preprocess(frame, self.width, self.height))
+        self._interpreter.set_tensor(self._input_index, preprocess(frame, self.width))
         self._interpreter.invoke()
         return self._interpreter.get_tensor(self._output_index)[0, 0]
 ```
 
-`set_tensor` copies the prepared picture into the model's input, `invoke()` runs the network, and `get_tensor` reads the output of shape [1, 1, 17, 3]. The `[0, 0]` picks "picture 0, person 0" and leaves a table of 17 rows (keypoints) by 3 columns (y, x, score).
+`set_tensor` copies the prepared picture into the model's input, `invoke()` runs the network, and `get_tensor` reads the output of shape [1, 1, 17, 3]. The `[0, 0]` picks "picture 0, person 0" and leaves a table of 17 rows (keypoints) by 3 columns (y, x, score). `preprocess` needs only `self.width`, the model's input size of 192: a square has one side length.
 
 **Warm-up.** Before the camera starts, `warm_up()` runs three inferences on a black picture. The first inferences are slow: on the NPU, the first one compiles the network for the hardware, which takes seconds according to the [Avocado reference](https://github.com/avocado-linux/references/blob/main/imx8mp-npu-pose/README.md). Doing this before the camera starts means the first real gesture is not delayed.
 
-**Reading the numbers.** Suppose the right wrist comes back as `(0.40, 0.30, 0.85)`. In the 480 × 480 crop that is row 0.40 × 480 = 192 and column 0.30 × 480 = 144. Adding the 80 cropped columns, it is pixel x = 224, y = 192 of the original 640 × 480 frame. The service never converts back to pixels, though: the rules work directly with the 0 to 1 values, as the next section shows.
+**Reading the numbers.** Suppose the right wrist comes back as `(0.40, 0.30, 0.85)` for a 640 × 360 frame. The padded square stands for a 640 × 640 area of the frame, with (640 − 360) ÷ 2 = 140 rows of black band above the picture. So the wrist is at row 0.40 × 640 − 140 = 116 and column 0.30 × 640 = 192: pixel x = 192, y = 116 of the original frame. `stream.py` does exactly this to draw the skeleton on the picture ([16.5](#165-the-camera-picture-in-a-webbrowser-object), `test_point_maps_from_the_padded_square`). The rules never convert back to pixels, though: they work directly with the 0 to 1 values, as the next section shows.
 
 ## 13. From Keypoints to Gestures
 
@@ -2478,7 +2525,7 @@ The time is passed in as an argument instead of being read from the clock inside
 A common first idea is to train a second neural network that reads the keypoints and answers "swipe left" or "nothing". We did not, for four reasons:
 
 - **No training data.** A learned classifier needs many labelled recordings of each gesture, made by different people, and even more recordings of everything that is *not* a gesture. This project has none yet.
-- **The gestures are geometry.** "The wrist moved at least 1.5 shoulder widths sideways within 0.6 s" can be checked with a ruler and a stopwatch. A model would have to learn what one sentence already says.
+- **The gestures are geometry.** "The wrist moved at least 1 shoulder width sideways within 0.6 s" can be checked with a ruler and a stopwatch. A model would have to learn what one sentence already says.
 - **Rules can be explained and tested.** When a rule fires, you can say exactly which numbers made it fire. The same input always gives the same output, and every rule is covered by unit tests ([21](#21-testing-the-gesture-service)). The thresholds live in `config.yaml` and can change without any retraining ([24](#24-tuning-the-gesture-parameters)).
 - **They cost almost nothing.** The rules take tens of microseconds per frame on the CPU and do not use the NPU at all.
 
@@ -2506,11 +2553,12 @@ At a trade show, people walk past behind the operator all the time. MoveNet Sing
 | Check | Setting (default) | Passes when |
 |---|---|---|
 | Shoulders visible | `min_keypoint_score` (0.3) | MoveNet's score is at least 0.3 for *both* shoulders |
-| Close enough | `min_shoulder_width` (0.12) | The shoulders are at least 0.12 of the picture apart. In the laptop webcam's 480 × 480 crop, that is 0.12 × 480 = 57.6 pixels |
-| Centred | `max_center_offset` (0.35) | The point midway between the shoulders is at most 0.35 from the middle, so x is between 0.15 and 0.85 |
+| Close enough | `min_shoulder_width` (0.07) | The shoulders are at least 0.07 of the padded square apart ([12.3](#123-preparing-the-image-for-the-model)). For a 640 × 360 frame the square is 640 frame pixels wide, so that is 0.07 × 640 ≈ 45 pixels of the camera picture |
+| Centred | `max_center_offset` (0.35) | The point midway between the shoulders is at most 0.35 from the middle, so x is between 0.15 and 0.85 of the padded square |
 
 - `math.hypot(dx, dy)` is Pythagoras' theorem, √(dx² + dy²): the straight-line distance between the two shoulders. `cx, cy` is the point midway between them.
 - People farther from the camera look smaller, so their shoulders are closer together in the picture. The width check therefore works as a distance limit. How many metres that is depends on the camera's lens, so it must be checked with the real camera ([24](#24-tuning-the-gesture-parameters)).
+- **Why 0.07 and not 0.12, as before.** The earlier centre crop showed the operator larger. In the letterbox, a 16:9 frame fills the square's full width, so the same person covers only 360 ÷ 640 ≈ 0.56 times as much of the square, and 0.12 × 0.56 ≈ 0.07. Without the change, an operator at the same distance would suddenly count as "too far away".
 - When the gate fails, `update()` returns at once and the frame adds nothing to the tracks (`test_far_person_is_gated`, `test_off_center_person_is_gated`).
 - `person_present` in the MQTT status ([15.2](#152-payloads)) is true from the first frame that passes the gate until the engine forgets the person, 0.5 s after the last frame that passed.
 
@@ -2556,8 +2604,8 @@ Now the same person takes a step sideways, and everything moves 0.1 to the right
 | y (SW) | What is there |
 |---|---|
 | +1.4 | `ABOVE_HEAD`, where the tests end a palm-up |
-| +1.0 | End line of `palm_up` (`up_end_y`), and top of the swipe band (`swipe_band_max_y`) |
-| +0.8 | Top of the open-palm zone (`palm_zone_max_y`) |
+| +1.0 | Top of the swipe band (`swipe_band_max_y`) |
+| +0.8 | End line of `palm_up` (`up_end_y`), and top of the open-palm zone (`palm_zone_max_y`) |
 | +0.2 | `PALM`, where the tests hold the "stop sign" |
 | 0 | The shoulder line |
 | −0.2 | `CHEST_L` and `CHEST_R`, where the tests start and end swipes |
@@ -2566,7 +2614,7 @@ Now the same person takes a step sideways, and everything moves 0.1 to the right
 | −1.2 | Bottom of the swipe band (`swipe_band_min_y`) |
 | −1.6 | `REST_R` and `REST_L`, the arms hanging down in the tests |
 
-These are reasoned design values. For example, the rules assume that a hand 1 SW above the shoulder line is at about the top of the head. None of these heights has been checked against recordings of real people yet ([25.2](#252-limitations)).
+These started as reasoned design values. Recordings of real gestures on the device ([22](#22-gesture-decision-log)) moved one of them: real palm-ups started at about y = −0.1 and ended between +0.9 and +1.5, so the end line came down from +1.0 to +0.8 ([13.6](#136-palm-up)). The other heights were not changed, but they have been checked against only one small set of recordings ([25.2](#252-limitations)).
 
 ### 13.4 A track for each wrist
 
@@ -2585,18 +2633,22 @@ A track keeps the last 1.5 s of samples: the longest rule window (1.0 s, for the
 **A movement must be seen to count.** Before a new sample is added, the track is cleared, so it starts again from the new sample, in three cases:
 
 ```python
-            if (last.frame != self._frame - 1 or dt >= c.max_gap_s
-                    or math.hypot(x - last.x, y - last.y) > c.max_wrist_speed * max(dt, 1e-3)):
+            if (last.frame < self._frame - 2 or dt >= c.max_gap_s
+                    or math.hypot(x - last.x, y - last.y) > c.max_wrist_jump):
                 track.clear()
 ```
 
-1. **The previous frame did not see this wrist** (`last.frame != self._frame - 1`). Its score was too low, or the person did not pass the gate.
+1. **The wrist was missed in two or more frames in a row** (`last.frame < self._frame - 2`). `last.frame` is the frame that last saw this wrist. If that was the previous frame, or the one before it, the track goes on: **one** missed frame in between is tolerated. A frame misses the wrist when its score is too low or when the person did not pass the gate.
 2. **Too much time passed** since the last sample (`dt >= max_gap_s`, 0.3 s), for example because the camera stalled.
-3. **The wrist "teleported"**: it moved faster than `max_wrist_speed`, 15 SW per second. At 20 fps that is 0.75 SW between two frames. `max(dt, 1e-3)` only avoids multiplying by zero.
+3. **The wrist "teleported"**: it jumped more than `max_wrist_jump`, 1.5 SW, between two sightings. `math.hypot` gives the straight-line distance between the last sample and the new one.
 
-Why so strict? Imagine that MoveNet sees the right wrist on the left, is unsure for three frames because of motion blur, and then sees it on the right. Did the hand swipe, or did MoveNet mix up the left and right wrists? The rules cannot know, so they do not guess: movement is measured only across consecutive frames that all saw the wrist. Several tests check this, for example a left–right wrist swap (`test_left_right_wrist_swap_glitch_is_not_a_swipe`) and a swipe hidden behind three unsure frames (`test_swipe_across_a_few_missed_frames_is_ignored`).
+**Why tolerate one missed frame?** During a fast movement, MoveNet often misses the wrist in a single frame, because the hand is blurred. On the device this was measured, and it was one of the reasons why real swipes did not fire: an earlier version restarted the track after *any* missed frame, so a fast gesture broke into pieces too short to count. Now a swipe, a palm-up and a palm hold all survive one missed frame (`test_swipe_across_one_missed_frame_fires`, `test_palm_up_across_one_missed_frame_fires`, `test_open_palm_hold_survives_one_missed_frame`).
 
-This has a cost. If a real swipe is so fast that MoveNet loses the wrist halfway, that swipe does not fire either. Whether this happens with real people is one of the things the planned recordings must show ([25.2](#252-limitations)).
+**Why not more?** Imagine that MoveNet sees the right wrist on the left, is unsure for three frames, and then sees it on the right. Did the hand swipe, or did MoveNet mix up the left and right wrists? The rules cannot know, so they do not guess: two or more missed frames in a row end the track. Several tests check this, for example a left–right wrist swap (`test_left_right_wrist_swap_glitch_is_not_a_swipe`), a swipe hidden behind three unsure frames (`test_swipe_across_a_few_missed_frames_is_ignored`) and a palm hold interrupted by two missed frames (`test_open_palm_hold_restarts_after_two_missed_frames`).
+
+**Why a jump per sighting, not a speed?** An earlier version limited the speed instead: 15 SW per second. But on the device the frames do not arrive evenly. They come in bursts, 0.02 to 0.12 s apart. A real fast swipe that moves 0.57 SW between two frames only 0.02 s apart is moving at about 28 SW per second, so the speed limit called it a teleport and restarted the track. The distance between two sightings does not depend on that timing. In the recordings, the largest real movement between two sightings was 1.36 SW, and the only glitch jumped 2.18 SW. The limit of 1.5 SW sits between the two; any value from 1.0 to 2.0 SW worked on the recordings (`test_fast_swipe_in_frames_arriving_in_a_burst_fires`).
+
+This still has a cost. A swipe in which MoveNet loses the wrist for two or more frames in a row does not fire. In the recordings on the device, tolerating one missed frame was enough: all 13 recorded gestures fired ([22](#22-gesture-decision-log)).
 
 The last sample stays in the track until the next one arrives, so a hand that is unseen for a moment still counts as raised. This matters for the latch ([14.1](#141-the-latch-and-its-release)).
 
@@ -2604,7 +2656,7 @@ After the samples are added, the detectors run on each wrist that got a new samp
 
 ### 13.5 Swipe left and swipe right
 
-**The rule in words:** within the last 0.6 s, the wrist moved at least 1.5 SW sideways and at most half as much up or down, and it stayed between chest and head height the whole time.
+**The rule in words:** within the last 0.6 s, the wrist moved at least 1 SW sideways and at most half as much up or down, and it stayed between chest and head height the whole time.
 
 ```python
     def _swipe(self, samples):
@@ -2629,9 +2681,10 @@ How to read it:
 
 - The loop walks **backwards** in time, from the newest sample to older ones, and compares each older sample `s` with the newest one.
 - It gives up (`return None`) at the first sample that is more than 0.6 s old (`swipe_window_s`) or outside the band from −1.2 to +1.0 SW. So **every** sample of the stroke must be inside the band, not only its two ends. An arm swinging like a pendulum through hip height has both ends in the band but its middle below it, so it is not a swipe (`test_arm_swing_through_hip_height_is_not_a_swipe`).
-- It fires at the first sample that is at least 1.5 SW away sideways (`swipe_min_dx`), as long as the vertical difference is at most half the sideways one (`max_off_axis_ratio`, 0.5). A positive `dx` is a movement to the operator's right.
+- It fires at the first sample that is at least 1.0 SW away sideways (`swipe_min_dx`), as long as the vertical difference is at most half the sideways one (`max_off_axis_ratio`, 0.5). A positive `dx` is a movement to the operator's right.
 - Walking backwards finds the **newest** possible start point, which is where the stroke really began. This matters for the return-stroke block ([14.3](#143-the-return-stroke)).
-- The rule is checked on every frame, so it fires on the first frame that reaches 1.5 SW, even if the hand is still moving.
+- The rule is checked on every frame, so it fires on the first frame that reaches 1.0 SW, even if the hand is still moving.
+- **Why 1.0 SW.** The first value was 1.5 SW. On the device, real swipes moved the wrist only 1.0 to 1.3 SW, so they could never reach it. In replays of the recordings, any value from 0.7 to 1.2 SW detected every recorded swipe; 1.0 sits in the middle ([22](#22-gesture-decision-log)).
 
 **Worked example** (`test_swipe_right`): the right wrist waits at `CHEST_L` (x = −0.5, y = −0.2), then moves to `CHEST_R` (x = +1.2) in 0.4 s. At 20 fps that is 8 frames, each one 1.7 ÷ 8 = 0.2125 SW further right.
 
@@ -2639,17 +2692,19 @@ How to read it:
 |---|---|---|---|
 | 1 | −0.2875 | 0.2125 | nothing |
 | … | … | … | … |
-| 7 | +0.9875 | 1.4875 | nothing, just short of 1.5 |
-| 8 | +1.2 | 1.7 | `swipe_right` |
+| 4 | +0.35 | 0.85 | nothing, short of 1.0 |
+| 5 | +0.5625 | 1.0625 | `swipe_right` |
+
+The swipe fires on frame 5, 0.25 s into the stroke, while the hand still has 3 frames to go.
 
 Two more numbers:
 
-- The **slowest** swipe that can fire covers 1.5 SW in 0.6 s, an average of 2.5 SW per second. The same 1.7 SW stroke made in 0.8 s covers only about 1.28 SW in any 0.6 s, so it does not fire.
+- The **slowest** swipe that can fire covers 1.0 SW in 0.6 s, an average of about 1.7 SW per second. The same 1.7 SW stroke made in 1.2 s covers only about 0.85 SW in any 0.6 s, so it does not fire.
 - A stroke of 1.6 SW sideways and 1.0 SW upwards is too diagonal: 1.0 is more than 0.5 × 1.6 = 0.8.
 
 ### 13.6 Palm up
 
-**The rule in words:** the wrist is now at least 1 SW above the shoulder line, and within the last 0.7 s it rose by at least 1.2 SW, mostly straight up (sideways movement at most half the rise).
+**The rule in words:** the wrist is now at least 0.8 SW above the shoulder line, and within the last 0.5 s it rose by at least 0.9 SW, mostly straight up (sideways movement at most half the rise).
 
 ```python
     def _palm_up(self, samples):
@@ -2665,43 +2720,71 @@ Two more numbers:
         return None
 ```
 
-- The first check is a quick exit: if the newest sample is below the end line (`up_end_y`, 1.0 SW), nothing else is checked.
-- The loop walks **forwards** from the oldest sample. It stops at the first sample that is at most 0.7 s old (`up_window_s`), at least 1.2 SW lower than the newest one (`up_min_rise`), and less than half the rise away sideways.
+- The first check is a quick exit: if the newest sample is below the end line (`up_end_y`, 0.8 SW), nothing else is checked.
+- The loop walks **forwards** from the oldest sample. It stops at the first sample that is at most 0.5 s old (`up_window_s`), at least 0.9 SW lower than the newest one (`up_min_rise`), and less than half the rise away sideways.
+- **Why these values.** The first values were an end line at 1.0 SW and a rise of 1.2 SW within 0.7 s. On the device, real palm-ups started at about y = −0.1 and ended between +0.9 and +1.5, so some never crossed 1.0. But they were fast: each rose at least 1.44 SW within 0.35 s. So the end line came down to 0.8 and the rise to 0.9, while the window shrank to 0.5 s, so that a slow raise of the hand still does not count ([22](#22-gesture-decision-log)).
 
 **Worked example** (`test_palm_up`): the right wrist moves from `REST_R` (y = −1.6) to `ABOVE_HEAD` (y = +1.4), a rise of 3.0 SW, in 0.5 s. That is 10 frames of 0.3 SW each.
 
-- Frame 8: y = −1.6 + 8 × 0.3 = 0.8. Below the end line: nothing.
+- Frame 8: y = −1.6 + 8 × 0.3 = 0.8, exactly on the end line on paper. The computer stores decimal numbers in binary with a tiny rounding error, and here the sum comes out as 0.79999995, a hair below the line. Nothing fires.
 - Frame 9: y = 1.1, above the end line. The hand has risen 2.7 SW since it left the resting position 0.45 s ago, and moved only 0.18 SW sideways. `palm_up` fires, before the hand reaches the top.
 
 Height keeps the similar gestures apart:
 
-- Raising a hand to face height to hold it (`PALM`, y = +0.2) never reaches the end line at +1.0, so it is not `palm_up` (`test_raising_hand_to_hold_is_not_palm_up`).
+- Raising a hand to face height to hold it (`PALM`, y = +0.2) never reaches the end line at +0.8, so it is not `palm_up` (`test_raising_hand_to_hold_is_not_palm_up`).
 - A hand held above the head after a `palm_up` is above the open-palm zone, whose top is +0.8, so it does not also fire `open_palm` (`test_palm_up_then_hold_above_head_is_not_open_palm`).
-- A hand raised slowly, the same 3.0 SW in 2 s, rises only about 1.05 SW in any 0.7 s, so it fires neither gesture (`test_hand_raised_slowly_above_head_is_neither_gesture`).
+- A hand raised slowly, the same 3.0 SW in 2 s, rises only about 0.75 SW in any 0.5 s, so it fires neither gesture (`test_hand_raised_slowly_above_head_is_neither_gesture`).
 
 ### 13.7 Open palm
 
-**The rule in words:** for the last full second, the wrist was seen in every frame, the forearm pointed up, the hand stayed between chest and face height, and it did not wander more than 0.2 SW from its average position.
+**The rule in words:** the hand is first held up like a stop sign: for a full second, the wrist was seen, the forearm pointed up, the hand stayed in front of the body between chest and face height, and it did not wander more than 0.2 SW from its average position. That only **arms** the gesture. `open_palm` fires when the hand is then **lowered**, below the release line, within 0.5 s.
+
+**Why on release?** The first version fired as soon as the hold was complete. On the device, that caused false events: before a swipe, people raise the hand and hold it still for a moment, and that pose is exactly the same as a stop sign. A rule that looks only at the hold cannot tell them apart. What happens *next* can: a swipe moves sideways, a stop sign is lowered. So the hold only arms the gesture, and whatever follows decides.
 
 ```python
-    def _open_palm(self, samples):
+    def _open_palm(self, side, samples):
+        c = self.config
+        newest = samples[-1]
+        window = self._palm_hold(samples)
+        if window is not None:
+            self._palm_held[side] = (newest.t, window)
+            return None
+        held = self._palm_held[side]
+        if held is not None and newest.y < c.release_y and newest.t - held[0] <= c.palm_lower_s:
+            self._palm_held[side] = None
+            return "open_palm", held[1]
+        return None
+
+    def _palm_hold(self, samples):
+        """Return the samples of a still, raised hand held long enough, else None."""
         c = self.config
         newest = samples[-1]
         if newest.t - samples[0].t < c.palm_hold_s:
             return None
         window = [s for s in samples if s.t >= newest.t - c.palm_hold_s]
-        if not all(s.forearm_up and c.palm_zone_min_y <= s.y <= c.palm_zone_max_y for s in window):
+        if not all(s.forearm_up and c.palm_zone_min_y <= s.y <= c.palm_zone_max_y and abs(s.x) <= c.palm_max_abs_x
+                   for s in window):
             return None
         mx = sum(s.x for s in window) / len(window)
         my = sum(s.y for s in window) / len(window)
         if any(math.hypot(s.x - mx, s.y - my) > c.palm_still_radius for s in window):
             return None
-        return "open_palm", window
+        return window
 ```
 
-1. **Seen for the whole second.** The track must cover at least `palm_hold_s` (1.0 s). A track restarts whenever a frame misses the wrist ([13.4](#134-a-track-for-each-wrist)), so this means "seen in every frame for one second" (`test_open_palm_hold_restarts_after_a_missed_frame`).
-2. **Forearm up, inside the zone.** Every sample of the last second must have `forearm_up` and a height between −0.6 and +0.8 SW.
+`_palm_hold` checks the hold:
+
+1. **Seen for the whole second.** The track must cover at least `palm_hold_s` (1.0 s). A track survives one missed frame but restarts after two in a row ([13.4](#134-a-track-for-each-wrist)), so this means "seen, apart from single blurred frames, for one second" (`test_open_palm_hold_survives_one_missed_frame`, `test_open_palm_hold_restarts_after_two_missed_frames`). A shorter hold does not count (`test_hold_shorter_than_palm_hold_s_is_not_open_palm`).
+2. **Forearm up, inside the zone, in front of the body.** Every sample of the last second must have `forearm_up`, a height between −0.6 and +0.8 SW, and a sideways distance of at most 1.0 SW from the middle of the shoulders (`palm_max_abs_x`). The last check is new. At the end of a swipe, the arm is held out to the side, still and raised, and that looked like a stop sign too. Real stop signs on the device were held at 0.3 to 0.5 SW from the middle (`test_arm_held_out_after_a_swipe_is_not_open_palm`).
 3. **Still.** The code averages the positions of the last second (`mx`, `my`) and checks that no sample is more than 0.2 SW (`palm_still_radius`) from that average. A waving hand fails (`test_waving_hand_is_not_open_palm`); a hand that trembles by up to 0.05 SW passes (`test_jittery_palm_still_fires_once`).
+
+`_open_palm` then decides:
+
+- **While the hold is valid**, it stores the time and the samples of the hold in `self._palm_held[side]` and returns nothing. Each frame of a longer hold overwrites them with the newest second.
+- **When the hold ends**, it checks the newest sample. If the hand is below `release_y` (−1.0 SW, the same line as the latch release, [14.1](#141-the-latch-and-its-release)) no more than `palm_lower_s` (0.5 s) after the last valid hold frame, `open_palm` fires. A hand lowered so slowly that it crosses the line later does not fire (`test_hand_lowered_long_after_the_hold_is_not_open_palm`). Real stop signs on the device dropped from about y = −0.2 to below −1.0 in about 0.1 s, so 0.5 s leaves plenty of room.
+- **If a swipe or a palm-up comes first**, it wins: `_detect` asks those detectors before `_open_palm`, and every event clears all armed holds ([13.8](#138-confidence-and-which-gesture-wins), `test_swipe_from_a_held_hand_is_only_a_swipe`, `test_palm_up_from_a_held_hand_is_only_palm_up`).
+
+The confidence of `open_palm` comes from the samples of the hold, not from the lowering, because the hold is where the "stop sign" was seen.
 
 `forearm_up` was computed when the sample was added:
 
@@ -2712,21 +2795,23 @@ Height keeps the similar gestures apart:
 
 `(cy - ey) / sw` is the elbow's height in shoulder widths, so the wrist must be at least 0.3 SW (`palm_min_forearm_rise`) above an elbow that MoveNet can see. That is the shape of a "stop" sign. Arms crossed in front of the chest have the wrists hardly higher than the elbows, so they are not a palm (`test_crossed_arms_are_not_open_palm`).
 
-**Worked example** (`test_open_palm_fires_after_hold_time`): the right hand moves from rest to `PALM` in 0.3 s and stays there. `open_palm` fires on the 20th frame after the hand arrives, exactly 1.0 s later. One frame earlier, the 1-second window still contains the last moving sample, at y = −0.1. That sample is about 0.29 SW from the average, more than 0.2, so the hand does not count as still yet.
+**Worked example** (`test_open_palm_fires_when_lowered_after_the_hold`): the right hand moves from rest to `PALM` (y = +0.2) in 0.3 s and stays there for 1.2 s. The hold becomes valid on the 20th frame after the hand arrives, exactly 1.0 s later. One frame earlier, the 1-second window still contains the last moving sample, at y = −0.1. That sample is about 0.29 SW from the average, more than 0.2, so the hand does not count as still yet. Nothing is published while the hand stays up. Then the hand is lowered to rest in 0.2 s, 4 frames at y = −0.25, −0.7, −1.15 and −1.6. On the third, the hand is below −1.0, 0.15 s after the last valid hold frame: `open_palm` fires.
 
-Remember that this is a **proxy**: it detects "a raised, still hand with the forearm up". It cannot see whether the hand is open or closed ([10.4](#104-pose-estimation-and-keypoints)).
+**For the operator:** hold the stop sign for about one second, then lower the hand. The event arrives about 0.1 to 0.3 s after the hand drops.
+
+Remember that this is a **proxy**: it detects "a raised, still hand with the forearm up, then lowered". It cannot see whether the hand is open or closed ([10.4](#104-pose-estimation-and-keypoints)).
 
 ### 13.8 Confidence, and which gesture wins
 
 **Which detector.** For each wrist with a new sample, `_detect` asks the detectors in a fixed order and takes the first answer:
 
 ```python
-    def _detect(self, track):
-        samples = list(track)
-        return self._swipe(samples) or self._palm_up(samples) or self._open_palm(samples)
+    def _detect(self, side):
+        samples = list(self._tracks[side])
+        return self._swipe(samples) or self._palm_up(samples) or self._open_palm(side, samples)
 ```
 
-The rules are designed so that only one of them can be true at a time: a swipe is mostly sideways, a palm-up is mostly vertical and ends above the head, and an open palm is still and below the head. The order only matters if that design has a gap.
+The rules are designed so that only one of them can be true at a time: a swipe is mostly sideways, a palm-up is mostly vertical and ends above the head, and an open palm is a still hold followed by a drop. There is one planned overlap: a hand held still before a swipe or a palm-up also arms `open_palm` ([13.7](#137-open-palm)). Two things make sure the movement wins. `_open_palm` is asked last, so on the frame where a swipe or palm-up fires it does not run at all. And every event clears all armed holds (`self._palm_held = {s: None for s in ARMS}` in `update()`), so the hand that comes down after the swipe cannot fire `open_palm` later.
 
 **Confidence.** Each detector also returns the samples it used. The confidence is the average `quality` of those samples, rounded to two decimals:
 
@@ -2742,7 +2827,7 @@ A sample's quality is the average of the wrist's score and the shoulders' averag
 
 ## 14. One Gesture, One Event
 
-The requirement is easy to state: one gesture must cause one action, even while the operator is still performing it. The rules alone do not guarantee this. Hold a palm still for 10 seconds: in a simulation, the open-palm rule became true after 1 s and stayed true on each of the following 180 frames. Without protection, that would open 181 dialogs.
+The requirement is easy to state: one gesture must cause one action, even while the operator is still performing it. The rules alone do not guarantee this. Take a swipe that ends with the hand held still: in a simulation, the swipe rule became true and then stayed true on each of the following 10 frames, because the start and end points were still inside the 0.6 s window. Without protection, that would turn 11 pages. (`open_palm` fires only once by design, on the release, but the hold before it is true on every frame: 181 frames for a palm held for 10 seconds.)
 
 The protection has three parts: a **latch** after every event ([14.1](#141-the-latch-and-its-release)), **trimming** of the tracks ([14.2](#142-trimming)) and a **block on the return stroke** after a swipe ([14.3](#143-the-return-stroke)).
 
@@ -2779,18 +2864,19 @@ In words:
 2. **Swipes** are released as soon as the cooldown is over. (`OPPOSITE_SWIPE` holds the two swipe names, so `gesture in OPPOSITE_SWIPE` means "is a swipe".)
 3. **`open_palm` and `palm_up`** also wait until the hand that made them is **lowered** below the release line, 1 SW below the shoulders (`release_y`, −1.0), or has not been seen for 0.5 s (`lost_s`).
 
-The palm gestures wait for the hand to come down because they are *held*: the "stop sign" stays up as long as the operator likes, and the rule stays true the whole time. A swipe is a short movement that ends by itself.
+The palm gestures wait for the hand to come down because they are *held*: after a palm-up, the hand may stay above the head as long as the operator likes. A swipe is a short movement that ends by itself. `open_palm` is only reported once the hand is already down ([13.7](#137-open-palm)), so for it this check is normally passed as soon as the cooldown is over. It still matters if the operator raises the hand straight back up.
 
-**Example: a palm held for 10 seconds** (`test_palm_held_ten_seconds_fires_once`):
+**Example: a palm held for 10 seconds, then lowered** (`test_palm_held_ten_seconds_fires_once`):
 
-| Time after the hand stops | What happens |
+| Time | What happens |
 |---|---|
-| 1.0 s | `open_palm` fires and the latch is set |
-| 1.0 to 2.0 s | Cooldown: nothing can fire |
-| 2.0 to 10 s | The cooldown is over, but the hand is still up (y = +0.2, above −1.0): still latched |
-| Hand lowered below −1.0 | Latch released, tracks trimmed |
+| 1.0 s after the hand stops | The hold is complete: `open_palm` is armed, nothing is published |
+| 1.0 to 10 s | The hand stays up; the hold stays armed and is renewed on every frame. Still nothing is published |
+| Hand lowered | On the third frame of the drop, the hand is below −1.0: `open_palm` fires and the latch is set |
+| The next 1.0 s | Cooldown: nothing can fire |
+| After the cooldown | The hand is already down: latch released, tracks trimmed |
 
-Result: one event. Raising the hand again starts a new 1-second hold, which fires again (`test_palm_refires_after_lowering`). Moving the raised hand around, or losing sight of it for 0.15 s, does not release the latch (`test_palm_moving_while_raised_does_not_refire`, `test_palm_held_through_a_short_dropout_fires_once`).
+Result: one event. Raising the hand again, holding it for a second and lowering it fires again (`test_palm_refires_after_lowering`). Moving the raised hand to a new place, or losing sight of it for 0.15 s, does not fire anything while the hand is up, and lowering it at the end fires only once (`test_palm_moving_while_raised_does_not_fire_twice`, `test_palm_held_through_a_short_dropout_fires_once`).
 
 The whole life cycle:
 
@@ -2824,7 +2910,7 @@ It is called at three moments:
 | The latch is released | Both | Movement made while the latch was on never counts |
 | A return stroke is blocked ([14.3](#143-the-return-stroke)) | That hand's | The blocked stroke cannot fire later |
 
-The newest sample is kept so that the hand's current position stays known. Everything older, and with it every movement made so far, is forgotten. A new gesture must therefore be made in full: a new swipe must cover 1.5 SW again, and a new hold must last a full second again.
+The newest sample is kept so that the hand's current position stays known. Everything older, and with it every movement made so far, is forgotten. A new gesture must therefore be made in full: a new swipe must cover 1.0 SW again, and a new hold must last a full second again.
 
 ### 14.3 The return stroke
 
@@ -2843,7 +2929,7 @@ The cooldown catches a quick return, within 1 s. A relaxed person may take longe
                 and t_start - t_last < self.config.opposite_swipe_block_s)
 ```
 
-`t_start` is the time of the stroke's start point, found by the backward scan in `_swipe` ([13.5](#135-swipe-left-and-swipe-right)). The block uses the start time, not the moment the stroke reaches 1.5 SW, because a slow return stroke can begin inside the 1.5 s and reach the threshold after it. It is still the return stroke.
+`t_start` is the time of the stroke's start point, found by the backward scan in `_swipe` ([13.5](#135-swipe-left-and-swipe-right)). The block uses the start time, not the moment the stroke reaches 1.0 SW, because a slow return stroke can begin inside the 1.5 s and reach the threshold after it. It is still the return stroke.
 
 A blocked stroke also stays blocked **while it goes on**. When a stroke is blocked, `update()` trims that hand's track and remembers the stroke's direction in `_blocked_stroke`:
 
@@ -2869,25 +2955,25 @@ Then, for every new sample of that hand, `_add_sample` checks whether the hand s
                 self._blocked_stroke[side] = 0
 ```
 
-`direction` is +1 for a stroke moving right and −1 for one moving left. The last step multiplied by `direction` is positive only while the hand keeps going the same way. In that case the track is trimmed again, so the stroke can never add up to 1.5 SW. As soon as the hand stops or turns, the block ends. A hand that was not seen for 0.5 s or more has also ended its stroke (`if dt >= c.lost_s: self._blocked_stroke[side] = 0` in `_add_sample`).
+`direction` is +1 for a stroke moving right and −1 for one moving left. The last step multiplied by `direction` is positive only while the hand keeps going the same way. In that case the track is trimmed again, so the stroke can never add up to 1.0 SW. As soon as the hand stops or turns, the block ends. A hand that was not seen for 0.5 s or more has also ended its stroke (`if dt >= c.lost_s: self._blocked_stroke[side] = 0` in `_add_sample`).
 
-Every case is a unit test. After a `swipe_right`, the operator:
+Every case is a unit test. The `swipe_right` fires 0.15 s before the hand reaches its end point ([13.5](#135-swipe-left-and-swipe-right)), so the times below are counted from the event. After a `swipe_right`, the operator:
 
 | Does this | Result | Why | Test |
 |---|---|---|---|
 | Moves the hand straight back to the left within 0.4 s | Ignored | Inside the 1 s cooldown | `test_swipe_with_fast_return_fires_once` |
 | Swipes left and right again within 0.4 s | Ignored | Inside the cooldown | `test_second_swipe_within_cooldown_is_ignored` |
-| Holds still for 1.0 s, then moves 2.0 SW left in 0.3 s | Blocked | The stroke starts 1.0 s after the event | `test_return_stroke_after_cooldown_is_blocked` |
-| Holds still for 1.2 s, then moves 2.0 SW left in 0.5 s, reaching 1.5 SW at about 1.6 s | Blocked | Timed from the start of the stroke (1.2 s), not from the moment it reaches 1.5 SW | `test_slow_return_starting_inside_the_block_is_blocked` |
-| Holds still for 1.25 s, then moves 3.1 SW left in 0.6 s, until 1.85 s | Blocked to the end | The stroke keeps moving the same way | `test_long_return_stroke_is_blocked_even_past_the_block_time` |
+| Holds still for 1.0 s, then moves 2.0 SW left in 0.3 s | Blocked | The stroke starts 1.2 s after the event | `test_return_stroke_after_cooldown_is_blocked` |
+| Holds still for 1.2 s, then moves 2.0 SW left in 0.5 s | Blocked | The stroke starts at 1.4 s and reaches 1.0 SW at about 1.65 s. It is timed from the start, not from the moment it reaches 1.0 SW | `test_slow_return_starting_inside_the_block_is_blocked` |
+| Holds still for 1.25 s, then moves 3.1 SW left in 0.6 s, until about 2.0 s | Blocked to the end | The stroke keeps moving the same way | `test_long_return_stroke_is_blocked_even_past_the_block_time` |
 | Does the same, then the wrist is unseen for 1 s, reappears on the right and moves left | `swipe_left` fires | A hand lost for 0.5 s has ended its stroke | `test_swipe_after_the_hand_was_lost_is_not_the_return_stroke` |
-| Holds still for 1.6 s, then swipes left | `swipe_left` fires | The stroke starts when the hand leaves the end point, at 1.6 s | `test_opposite_swipe_after_holding_still_past_the_block_fires` |
-| Lowers the hand, rests, and starts a full swipe left 2.1 s after the event | `swipe_left` fires | The stroke starts after the block | `test_opposite_swipe_allowed_after_block` |
+| Holds still for 1.6 s, then swipes left | `swipe_left` fires | The stroke starts when the hand leaves the end point, 1.75 s after the event | `test_opposite_swipe_after_holding_still_past_the_block_fires` |
+| Lowers the hand, rests, and starts a full swipe left about 2.25 s after the event | `swipe_left` fires | The stroke starts after the block | `test_opposite_swipe_allowed_after_block` |
 | Lowers the hand and swipes right again | `swipe_right` fires | Same direction, and the cooldown is over | `test_two_swipes_after_cooldown_fire_twice` |
 
-The row "holds still for 1.6 s" shows why `_swipe` scans backwards. When the left swipe reaches 1.5 SW, its 0.6 s window still contains still samples from 1.3 s onwards. Scanning forwards from the oldest sample would pick 1.3 s as the start, and the swipe would be blocked. Scanning backwards picks the last still sample, at 1.6 s, the moment the hand really started moving.
+The row "holds still for 1.6 s" shows why `_swipe` scans backwards. When the left swipe reaches 1.0 SW, at about 1.95 s, its 0.6 s window still contains still samples from 1.35 s onwards. Scanning forwards from the oldest sample would pick 1.35 s as the start, and the swipe would be blocked. Scanning backwards picks the last still sample, at 1.75 s, the moment the hand really started moving.
 
-**Advice for demos:** to go back a page after a "next", hold the hand still for a little more than 1.5 s before swiping the other way. In a simulation at 20 fps, the opposite swipe was blocked after waiting 1.3, 1.45 or 1.5 s at the end point, and fired after waiting 1.55 or 1.7 s.
+**Advice for demos:** to go back a page after a "next", hold the hand still for a little more than 1.5 s before swiping the other way. In a simulation at 20 fps, the opposite swipe was blocked after waiting 1.2, 1.3 or 1.35 s at the end point, and fired after waiting 1.4 s or more (1.4 to 1.7 s were tried). Waiting a little more than 1.5 s leaves a safety margin.
 
 ### 14.4 Forgetting a person or the camera
 
@@ -2895,7 +2981,7 @@ Three situations wipe the engine's memory:
 
 | Situation | What is forgotten | Where |
 |---|---|---|
-| Nobody passes the presence gate for 0.5 s (`lost_s`) | Everything: tracks, latch, last swipe, blocked strokes | `reset()`, at the start of `update()` |
+| Nobody passes the presence gate for 0.5 s (`lost_s`) | Everything: tracks, latch, last swipe, blocked strokes, armed palm holds | `reset()`, at the start of `update()` |
 | The point between the shoulders jumps by more than one shoulder width ([13.2](#132-the-presence-gate)) | The wrist tracks only; the latch stays | `_clear_tracks()`, in `update()` |
 | The camera is lost | Everything | `engine.reset()`, called by `main.py` when the camera state becomes `camera_lost` |
 
@@ -2908,6 +2994,7 @@ Three situations wipe the engine's memory:
         self._latch: Optional[tuple] = None        # (gesture, side, t)
         self._last_swipe: Optional[tuple] = None   # (gesture, t)
         self._blocked_stroke = {side: 0 for side in ARMS}   # +1/-1: blocked stroke moving right/left
+        self._palm_held = {side: None for side in ARMS}     # (t, window) of the last valid palm hold
 ```
 
 The idea: a gesture half made by someone who has left, or started before a camera outage, must not be completed later by someone or something else (`test_person_lost_mid_gesture_restarts_the_hold`). When only the shoulders jump, the latch stays, so a glitch in the middle of a held palm cannot release it and fire the same gesture a second time.
@@ -2917,9 +3004,10 @@ The idea: a gesture half made by someone who has left, or started before a camer
 These are accepted for now and listed again in [25.2](#252-limitations):
 
 - **A quick "back" is ignored.** A deliberate opposite swipe that starts within 1.5 s of a swipe is treated as the return stroke. Worse, its own return movement can then fire the first direction again, so "next, back" becomes "next, next". To the rules, this is exactly the same movement as swipe, return, swipe. The booth guide must tell operators to pause about 1.5 s before reversing.
-- **Any sideways arm movement at chest height is a swipe.** Pointing at something or stretching can move a wrist 1.5 SW sideways inside the band, and by the rule's definition that is a swipe. Possible fixes, to be tested with recordings: raise the bottom of the band, or require the forearm to point up.
-- **Fast swipes may be lost.** If motion blur hides the wrist in the middle of a swipe, the track restarts and the swipe does not fire ([13.4](#134-a-track-for-each-wrist)).
-- **Synthetic tests only.** All the timings in sections 13 and 14 come from computer-generated poses, not from real people.
+- **Any sideways arm movement at chest height is a swipe.** Pointing at something or stretching can move a wrist 1.0 SW sideways inside the band, and by the rule's definition that is a swipe. Lowering the threshold from 1.5 to 1.0 SW made real swipes work, but it also makes this easier. Possible fixes, to be tested with recordings: raise the bottom of the band, or require the forearm to point up.
+- **Fast swipes may still be lost.** One blurred frame is tolerated, but if MoveNet misses the wrist in two or more frames in a row in the middle of a swipe, the track restarts and the swipe does not fire ([13.4](#134-a-track-for-each-wrist)).
+- **`open_palm` is reported only when the hand is lowered.** This is a deliberate trade-off ([13.7](#137-open-palm)): it removes the false stop signs before every swipe, but the dialog opens when the hand comes down, not while it is up, and a hand that stays up forever, or goes down too slowly, reports nothing.
+- **Mostly synthetic tests.** The timings in sections 13 and 14 come from computer-generated poses. The thresholds were tuned on one small set of recordings of real gestures on the device ([22](#22-gesture-decision-log)), not on many people.
 
 ## 15. MQTT Messages for Gestures
 
@@ -2989,7 +3077,7 @@ A reader must accept two forms of `offline`:
 
 So a reader can count only on `v` and `state`.
 
-The timestamps come from the clock of the computer that runs the service. During development that is the Podman virtual machine, whose clock can differ from the Windows clock that FactoryTalk Optix reads. That is one reason why the planned age check is generous ([16.2](#162-the-gestureeventmanager-netlogic)).
+The timestamps come from the clock of the computer that runs the service. During development that is the Podman virtual machine, whose clock can differ from the Windows clock that FactoryTalk Optix reads. That is one reason why the age check is generous ([16.2](#162-the-gestureeventmanager-netlogic)).
 
 ### 15.3 QoS 1 and duplicates
 
@@ -3004,12 +3092,12 @@ MQTT offers three delivery guarantees, called **QoS** (Quality of Service) level
 The service uses **QoS 1** on both topics:
 
 - **Not 0**, because a lost swipe would leave the operator wondering whether the HMI ignored them, and a lost status change would hide a problem.
-- **Not 2**, because it doubles the packets of every message to solve a problem that is cheaper to solve at the receiver. Every event has its own `event_id`, and the planned NetLogic remembers the last 64 IDs and ignores a repeat. A receiver that gives the same result whether a message arrives once or twice is called **idempotent**.
+- **Not 2**, because it doubles the packets of every message to solve a problem that is cheaper to solve at the receiver. Every event has its own `event_id`, and the NetLogic remembers the last 64 IDs and ignores a repeat. A receiver that gives the same result whether a message arrives once or twice is called **idempotent**.
 
 Two MQTT rules matter for the FactoryTalk Optix side:
 
-1. **QoS applies hop by hop.** A message travels from the service to the broker with the QoS the service chose, then from the broker to FactoryTalk Optix with the lower of that QoS and the QoS of the subscription. If the Optix subscriptions were set to QoS 0, events would travel the last hop as postcards. That is why both planned subscriptions use QoS 1 ([16.1](#161-what-the-hmi-will-need)).
-2. **Copies can also come from reconnects.** If the connection breaks right after an event was sent, paho (the MQTT library) may send it again after reconnecting, so it can arrive twice, or late. The planned NetLogic handles "twice" with the list of IDs and "late" with the 5 s age check ([16.2](#162-the-gestureeventmanager-netlogic)). An event that is late by less than 5 s can still act once ([25.2](#252-limitations)).
+1. **QoS applies hop by hop.** A message travels from the service to the broker with the QoS the service chose, then from the broker to FactoryTalk Optix with the lower of that QoS and the QoS of the subscription. If the Optix subscriptions were set to QoS 0, events would travel the last hop as postcards. That is why both subscriptions use QoS 1 ([16.1](#161-what-the-hmi-will-need)).
+2. **Copies can also come from reconnects.** If the connection breaks right after an event was sent, paho (the MQTT library) may send it again after reconnecting, so it can arrive twice, or late. The NetLogic handles "twice" with the list of IDs and "late" with the 5 s age check ([16.2](#162-the-gestureeventmanager-netlogic)). An event that is late by less than 5 s can still act once ([25.2](#252-limitations)).
 
 Notice the division of labour. The latch in the service stops the operator's movement from producing two events ([14](#14-one-gesture-one-event)). It cannot help against a copy made by the network after publishing; only the receiver can recognize that, by its ID.
 
@@ -3064,7 +3152,7 @@ The clean stop in code:
             self._client.loop_stop()
 ```
 
-The keepalive does **not** catch a frozen main loop: paho's network thread keeps the connection alive even when the main thread hangs. That case belongs to the watchdog ([17.4](#174-internal-watchdog)) and to the planned heartbeat check in FactoryTalk Optix ([16.2](#162-the-gestureeventmanager-netlogic)).
+The keepalive does **not** catch a frozen main loop: paho's network thread keeps the connection alive even when the main thread hangs. That case belongs to the watchdog ([17.4](#174-internal-watchdog)) and to the heartbeat check in FactoryTalk Optix ([16.2](#162-the-gestureeventmanager-netlogic)).
 
 **Coming back.** If the connection was lost long enough for the broker to publish the will, the retained status says `offline` even after paho has reconnected. So on every successful connection, `_on_connect` publishes the last known status again, with a fresh timestamp:
 
@@ -3107,7 +3195,7 @@ The check runs before the event is handed to paho. An event that paho had alread
 
 ### 15.6 Example sequence
 
-FactoryTalk Optix is shown as planned ([16](#16-factorytalk-optix-integration-planned)).
+FactoryTalk Optix is shown as planned ([16](#16-factorytalk-optix-integration)).
 
 ```mermaid
 sequenceDiagram
@@ -3137,11 +3225,14 @@ What to notice:
 3. A camera state change is reported immediately, without waiting for the 2-second tick.
 4. After the kill, the broker speaks for the service.
 
-## 16. FactoryTalk Optix Integration (Planned)
+## 16. FactoryTalk Optix Integration
 
-> 📝 **Planned.** Nothing in this section has been built or run yet. It is the design for the FactoryTalk Optix side of the project. The service it relies on is finished ([9.2](#92-what-is-built-and-what-is-not)).
+> 📝 **Written, not yet run.** Two NetLogics in `FTOptix/paper_clip_machine/ProjectFiles/NetSolution/` implement this section: `GestureModelBuilder.cs` (design time) and `GestureEventManager.cs` (runtime). Both compile against the FactoryTalk Optix Studio 1.7.5.13 assemblies (`dotnet build`, 0 warnings, 0 errors), but neither has run in Studio or in the runtime yet. The service they rely on runs on the device ([9.2](#92-what-is-built-and-what-is-not)).
 
-The work splits in two: settings made by hand in FactoryTalk Optix Studio (variables, MQTT subscriptions, pages, a dialog), and the C# code of one NetLogic. The code below is pseudo-code: it shows the logic, not the final C#.
+The work splits in two, like the NPU panel of Part 1 (`NpuModelBuilder` and `NpuStatusManager`):
+
+- **`GestureModelBuilder`**, a design-time NetLogic: run once in Studio, it creates the variables, the two MQTT subscriptions, the pages, the dialog and the widgets on `MainWindow` ([16.1](#161-what-the-hmi-will-need)). It only adds what is missing, so running it twice is safe.
+- **`GestureEventManager`**, a runtime NetLogic: it reads the messages and acts on them ([16.2](#162-the-gestureeventmanager-netlogic)). The block in 16.2 is pseudo-code: it shows the logic; the C# file has the details.
 
 The FactoryTalk Optix terms used here:
 
@@ -3168,6 +3259,7 @@ The FactoryTalk Optix terms used here:
 | `Message` | String | NetLogic | Banner text for `palm_up`; empty when there is nothing to show |
 | `ServiceState` | String | NetLogic | The state of the service, shown on screen; `unknown` until the first status arrives |
 | `CurrentPage` | NodeId | NetLogic | The page the PanelLoader shows |
+| `Accelerator`, `Fps`, `InferenceMs`, `PersonPresent` | String, Double, Double, Boolean | NetLogic | Copied from the status message: where MoveNet runs and how fast, and whether someone stands in front of the camera |
 
 **MQTT.** Two `PlainTextSubscription`s on the project's MQTT client, both with **QoS 1** ([15.3](#153-qos-1-and-duplicates)):
 
@@ -3183,7 +3275,18 @@ FactoryTalk Optix and the gesture service must use the **same broker**. The serv
 - A dialog type `GesturePalmDialog` with a title and a Close button.
 - A banner label linked to `Message`, and status labels linked to `ServiceState` and `LastGesture`.
 
-**NetLogic.** A runtime NetLogic `GestureEventManager` in the project's `NetLogic` folder. Its own variables are linked to the six Model variables, and two node pointers point at `GesturePalmDialog` and at the `GesturePages` folder.
+The builder places the PanelLoader (300 × 300) and the three labels in the right-hand column of `MainWindow`, under the camera picture (`WebBrowser2`, 300 × 300 at 1610, 10). The dialog type is `UI/Screens/GesturePalmDialog`; its Close button calls the dialog's own `Close` method.
+
+**NetLogic.** A runtime NetLogic `GestureEventManager` in the project's `NetLogic` folder. It finds everything by fixed path (`Model/Gestures`, `UI/Screens/GesturePages`, `UI/Screens/GesturePalmDialog`), like `NpuStatusManager` finds `Model/NPU`, so it needs no settings of its own.
+
+**Setting it up in Studio** (with the project open; nothing to edit by hand in the YAML files):
+
+1. `NetLogic` folder → **New → Design-time NetLogic**, name it `GestureModelBuilder`. Studio opens `GestureModelBuilder.cs`: keep the file from the repository (same name, same folder).
+2. Right-click `GestureModelBuilder` → **Execute `CreateGestureModel`**. The output pane shows `Gesture model ready`; `Model/Gestures`, the two subscriptions under `MQTT/MQTTClient1/MQTTSubscriber1`, `UI/Screens/GesturePages`, `UI/Screens/GesturePalmDialog` and the widgets on `MainWindow` appear.
+3. `NetLogic` folder → **New → Runtime NetLogic**, name it `GestureEventManager`; again keep the repository file.
+4. Save, start the emulator or deploy, and open the HMI in two browsers for the tests of [25.3](#253-roadmap), phase 1.
+
+If a step logs an error (for example `'UI/MainWindow' not found`), that part was skipped and can be added by hand as described above. In the project as it is today, the `URL` of `WebBrowser2` is `"http://10.0.0.42:8081/ "`, with a trailing space: remove it if the picture does not load.
 
 The idea behind this layout is **state, not commands**. The NetLogic never tells a screen what to do: it changes `CurrentPage`, and the PanelLoader of every session follows the link by itself. There is only one variable to change, and a browser that connects later should show the current page right away.
 
@@ -3191,7 +3294,7 @@ The idea behind this layout is **state, not commands**. The NetLogic never tells
 
 ```text
 Start():
-    find the six variables and the two node pointers
+    find Model/Gestures, GesturePalmDialog and the pages in GesturePages (sorted by name)
     if anything is missing: log an error and return          (fail visibly)
     EventJson.VariableChange  += OnEvent
     StatusJson.VariableChange += OnStatus
@@ -3218,7 +3321,8 @@ OnStatus(text):
     parse the JSON; ServiceState = state; remember when it arrived
 
 CheckHeartbeat(), every 1 s:
-    if no status arrived for 6 s: ServiceState = "offline (no heartbeat)"
+    if no status arrived for 6 s and ServiceState is not "offline":
+        ServiceState = "offline (no heartbeat)"
 
 Stop():
     EventJson.VariableChange  -= OnEvent
@@ -3275,7 +3379,7 @@ sequenceDiagram
 A demo script that exercises every part:
 
 1. The operator steps onto a floor mark in front of the camera. The status now has `person_present: true`.
-2. The operator raises one hand to shoulder or face height, forearm up, and holds it still for 1 s. The dialog opens once, even if the hand stays up.
+2. The operator raises one hand to shoulder or face height, forearm up, holds it still for about 1 s, then lowers it. The dialog opens once, when the hand comes down.
 3. The operator lowers the hand, and the dialog is closed with its Close button.
 4. Swipe right, lower the hand, then raise it on the left and swipe right again: Page 1 → Page 2 → Page 3. A swipe made less than 1 s after the previous gesture is ignored (the cooldown, [14.1](#141-the-latch-and-its-release)).
 5. Hold the hand still for a little more than 1.5 s, then swipe left: Page 2. A left swipe that starts sooner counts as the return stroke and is ignored ([14.3](#143-the-return-stroke)).
@@ -3293,6 +3397,18 @@ A demo script that exercises every part:
 
 Ideas for new gestures, and for larger extensions, are in [25.4](#254-adding-gestures-in-the-future).
 
+### 16.5 The camera picture in a WebBrowser object
+
+> ✅ **The stream is built and verified** in Chromium against the device. The project already has a WebBrowser object for it, `WebBrowser2` in `MainWindow` (300 × 300 at 1610, 10); its URL has a trailing space to remove ([16.1](#161-what-the-hmi-will-need)). 📝 Not yet seen inside a running FactoryTalk Optix session.
+
+The service serves what it sees, with the detected body drawn on it, so the operator can check where to stand:
+
+- **Address:** `http://<device LAN address>:8081/`, for example `http://10.0.0.42:8081/`. Put it in the `URL` property of a **WebBrowser** object. Use the device's LAN address, not `localhost`: in a web client session the picture is fetched by the remote browser, which must reach the device itself.
+- **What the page contains:** one picture that fills the object and keeps its proportions (black bars where needed). If the stream breaks, for example while the service restarts, the page tries again every 2 s by itself. The bare stream is at `/stream.mjpg`.
+- **What is drawn** (`src/stream.py`, `annotate`): the yellow body points and green skeleton lines whose score reaches `min_keypoint_score`, mapped back from the padded square that MoveNet looks at to the camera picture ([12.3](#123-preparing-the-image-for-the-model)), the accelerator with frame rate and inference time at the top left, and the name of the last gesture at the bottom left for 2 s. The picture is mirrored like the gestures (`camera.mirror`), so it moves the way the operator moves.
+- **Cost:** pictures are drawn and compressed to JPEG only while at least one viewer is connected, at most 640 pixels wide, once for all viewers (`stream.jpeg_quality`, default 70). While the camera is lost, viewers see a grey picture with the camera state.
+- **No password.** Anyone who can reach port 8081 can watch the camera, like the broker ([25.2](#252-limitations)). Pictures are never stored.
+
 ## 17. Health Monitoring and Camera Loss
 
 At a trade show, nobody is standing by to restart a service. Cables get kicked, cameras get unplugged, networks stall. The service is built to recover by itself where it can, and to say what is wrong where it cannot, so the HMI can show it. Six mechanisms work together:
@@ -3304,7 +3420,7 @@ At a trade show, nobody is standing by to restart a service. Cables get kicked, 
 | Heartbeat file and healthcheck | The main loop rewrites a file every 2 s; the container runtime checks how old the file is | [17.3](#173-heartbeat-file-and-container-healthcheck) |
 | Watchdog | Ends the process if the main loop stops making progress, so the container can be restarted | [17.4](#174-internal-watchdog) |
 | Last will | If the service disappears, the broker announces `offline` on its behalf | [15.4](#154-retained-status-and-the-last-will) |
-| Heartbeat check in FactoryTalk Optix (planned) | Shows `offline (no heartbeat)` when no status has arrived for 6 s | [16.2](#162-the-gestureeventmanager-netlogic) |
+| Heartbeat check in FactoryTalk Optix (written, not yet run) | Shows `offline (no heartbeat)` when no status has arrived for 6 s | [16.2](#162-the-gestureeventmanager-netlogic) |
 
 ### 17.1 Service states
 
@@ -3555,7 +3671,7 @@ How the main loop feeds the watchdog:
 - A stub camera that delivered 10 frames and then nothing, while still reporting `running`, made the process log the `CRITICAL` line and exit with code 1.
 - A stub camera reporting `camera_lost` kept the process alive for more than 8 s.
 
-In the real container, 30 s without a camera did not trigger the watchdog ([17.2](#172-camera-loss-and-reconnect)). The 60 unit tests do not cover the watchdog.
+In the real container, 30 s without a camera did not trigger the watchdog ([17.2](#172-camera-loss-and-reconnect)). The unit tests do not cover the watchdog.
 
 ### 17.5 Who notices what
 
@@ -3576,11 +3692,11 @@ The three ways the service can stop, and what the broker does in each case, are 
 Two notes on the table:
 
 - On the device, the service and the broker run on the same machine and talk over `127.0.0.1`, so no cable can fail between them. The silent-network row matters when the broker runs on another computer.
-- The planned 6 s heartbeat check in FactoryTalk Optix is what makes the hang and network rows visible quickly. Without it, the HMI would keep showing the last status it received, possibly `running`, until the will arrives ([16.2](#162-the-gestureeventmanager-netlogic)).
+- The 6 s heartbeat check in FactoryTalk Optix is what makes the hang and network rows visible quickly. Without it, the HMI would keep showing the last status it received, possibly `running`, until the will arrives ([16.2](#162-the-gestureeventmanager-netlogic)).
 
 ## 18. Containers and the Laptop Setup
 
-Part 1 explains what a container is ([2.4](#24-what-is-docker-briefly)). This section shows how the gesture service is packaged into one, and how the programs on a Windows laptop find each other.
+Part 1 explains what a container is ([2.4](#24-what-is-docker)). This section shows how the gesture service is packaged into one, and how the programs on a Windows laptop find each other.
 
 The laptop runs **Podman** instead of Docker. Podman runs the same images and the same compose files, and its commands mirror Docker's: `podman build`, `podman ps`, `podman compose up`. `podman compose` is a thin wrapper: it runs an external compose program, such as `docker-compose` or `podman-compose`, and connects it to Podman.
 
@@ -3588,39 +3704,57 @@ Linux containers need a Linux kernel, so on Windows Podman runs them inside a sm
 
 ### 18.1 The image
 
-`gesture_recognition/Dockerfile`:
+`gesture_recognition/Dockerfile`, without its header comments. The same file builds the laptop image (x86-64) and the OptixEdge image (ARM64, built on the PC with `--platform linux/arm64`):
 
 ```dockerfile
-ARG IMAGE_PLATFORM=linux/amd64
-FROM --platform=${IMAGE_PLATFORM} python:3.11-slim
+FROM python:3.12-slim-trixie
 
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends patchelf \
+ && pip install --no-cache-dir -r requirements.txt \
+ && find /usr/local/lib/python3*/site-packages/ai_edge_litert -name "*.so*" -type f \
+        -exec patchelf --clear-execstack {} + \
+ && apt-get purge -y patchelf && apt-get autoremove -y \
+ && rm -rf /var/lib/apt/lists/*
 
 COPY config.yaml .
 COPY src/ src/
-# The model is not in Git: run "python tools/fetch_model.py" once before building.
-COPY models/ models/
+COPY models/movenet_lightning_int8.tflite models/
+COPY tools/npu_entrypoint.sh tools/
+RUN sed -i 's/\r$//' tools/npu_entrypoint.sh
 
-# WHY non-root: the service only opens outgoing connections (camera, broker).
-RUN useradd --system gesture
+RUN useradd --system gesture \
+ && mkdir -p /opt/npu /var/cache/npu \
+ && chown gesture /opt/npu /var/cache/npu
 USER gesture
 
+ENV PYTHONUNBUFFERED=1 \
+    OPENCV_FFMPEG_CAPTURE_OPTIONS="rtsp_transport;tcp"
+
+EXPOSE 8081
+ENTRYPOINT ["sh", "tools/npu_entrypoint.sh"]
 CMD ["python", "src/main.py"]
 ```
 
 | Lines | What they do | Why |
 |---|---|---|
-| `ARG IMAGE_PLATFORM=linux/amd64` and `FROM --platform=… python:3.11-slim` | Start from the official slim Python 3.11 image, for 64-bit Intel and AMD processors | A small Debian Linux image with Python already installed. The argument lets the same file build for another processor; the ARM64 build for the device is planned ([25.3](#253-roadmap)) |
+| `FROM python:3.12-slim-trixie` | Start from the official slim Python 3.12 image on Debian 13 "trixie" | The same base as Part 1's NPU image, for the same two reasons: the NPU libraries borrowed from the device need a C library (glibc) at least as new as the device's 2.39 (trixie has 2.41), and the device's `tflite_runtime` is compiled for Python 3.12 ([19.4](#194-how-the-npu-will-be-used)) |
 | `WORKDIR /app` | Makes `/app` the working folder inside the image | All the following paths are relative to it |
-| `COPY requirements.txt .`, then `RUN pip install --no-cache-dir -r requirements.txt` | Installs the Python libraries | Each instruction produces a **layer**, and a layer is rebuilt only when its inputs change. Because the library list is copied **before** the code, a change in the code reuses the slow installation layer. `--no-cache-dir` stops pip from keeping its download cache inside the image |
-| `COPY config.yaml .`, `COPY src/ src/`, `COPY models/ models/` | Copies the settings, the code and the model | With the model inside, the image is complete: it can be saved to a file and imported on the device, which then needs no download. The model is not in Git (`.gitignore` excludes `gesture_recognition/models/`), so `tools/fetch_model.py` must run once before the first build; without the folder, the build stops at this line ([23.2](#232-download-the-model)) |
-| `RUN useradd --system gesture` and `USER gesture` | Creates an ordinary user and runs the service as that user | The service only opens outgoing connections, to the camera and to the broker, so it needs no administrator rights. Anyone who exploited a flaw in it would get an unprivileged user |
-| `CMD ["python", "src/main.py"]` | The command the container runs when it starts | |
+| `COPY requirements.txt .`, then the long `RUN` | Installs the Python libraries | Each instruction produces a **layer**, and a layer is rebuilt only when its inputs change. Because the library list is copied **before** the code, a change in the code reuses the slow installation layer. `--no-cache-dir` stops pip from keeping its download cache inside the image |
+| `patchelf --clear-execstack` | Removes one flag from LiteRT's compiled files | The LiteRT wheel marks its libraries as needing an executable stack, which they do not. glibc 2.41 refuses to load such a library ("cannot enable executable stack"). Clearing the flag fixes that and is safer. `patchelf` is removed again afterwards |
+| `COPY config.yaml .`, `COPY src/ src/`, `COPY models/movenet_lightning_int8.tflite models/` | Copies the settings, the code and the model, and nothing else from `models/` | With the model inside, the image is complete: it can be saved to a file and loaded on the device, which has no internet. The model is not in Git, so `tools/fetch_model.py` must run once before the first build ([23.2](#232-download-the-model)) |
+| `COPY tools/npu_entrypoint.sh tools/` and `sed` | The start script that borrows the device's NPU libraries; `sed` removes Windows line endings, which `sh` rejects | Same script as Part 1 ([19.4](#194-how-the-npu-will-be-used)) |
+| `useradd`, `mkdir`, `chown`, `USER gesture` | Creates an ordinary user that owns the two folders it writes to, and runs the service as that user | The service needs no administrator rights. Anyone who exploited a flaw in it would get an unprivileged user |
+| `ENV … OPENCV_FFMPEG_CAPTURE_OPTIONS="rtsp_transport;tcp"` | Makes OpenCV receive RTSP video over TCP | Video over UDP does not cross the container network's address translation ([11.1](#111-production-on-the-imx-8m-plus)) |
+| `EXPOSE 8081` | Documents the MJPEG port | Publishing it is the compose file's job |
+| `ENTRYPOINT` and `CMD` | Run `npu_entrypoint.sh`, which then starts `python src/main.py` | Without the NPU settings the script only prints why the NPU is off and starts the service |
 
-`podman images` reports the built image as 466 MB. The base image `python:3.11-slim` accounts for 163 MB and the model for 2.9 MB, so most of the rest is the Python libraries.
+`.dockerignore` keeps the tests, the laptop tools, `deploy_tools/`, saved images (`*.tar`) and `.env` (the camera password) out of the image.
+
+The ARM64 image is 375 MB (`podman images`). The earlier Python 3.11 image for the laptop was 466 MB.
 
 The libraries, from `gesture_recognition/requirements.txt`:
 
@@ -3670,6 +3804,8 @@ services:
     # with isolate=true, and two isolated networks cannot reach each other, so
     # a broker started by another stack (e.g. anomaly_detection) would time out.
     network_mode: bridge
+    ports:
+      - "8081:8081"     # MJPEG with the skeleton drawn on it
     environment:
       - PYTHONUNBUFFERED=1
       - TF_CPP_MIN_LOG_LEVEL=3
@@ -3695,6 +3831,7 @@ The healthcheck comes next ([17.3](#173-heartbeat-file-and-container-healthcheck
 | `build: context: .` | Build the image from the folder that contains the compose file, `gesture_recognition` |
 | `image: gesture_recognition-gesture:local` | The name of the built image. `podman images` lists it as `localhost/gesture_recognition-gesture:local` |
 | `network_mode: bridge` | Use Podman's default network instead of a separate network for this project ([18.4](#184-networking-between-windows-podman-and-containers)) |
+| `ports: "8081:8081"` | The annotated picture at `http://localhost:8081/` on the laptop ([16.5](#165-the-camera-picture-in-a-webbrowser-object)) |
 | `PYTHONUNBUFFERED=1` | Python writes every log line at once. Without it, Python collects its output in a buffer when it is not writing to a terminal, and log lines would show up late |
 | `TF_CPP_MIN_LOG_LEVEL=3` | Reduces the messages that TensorFlow-based libraries print from their C++ code. Part 1's detector uses the same setting |
 | `CAMERA_URL=${CAMERA_URL:-…}` | `${NAME:-default}` takes the variable `NAME` from the shell that runs `podman compose`, or the default written after `:-` if the variable is not set or is empty. This is how `$env:CAMERA_URL` in PowerShell reaches the container |
@@ -3767,7 +3904,32 @@ Who uses which address:
 
 **One port, three places.** The port that the broker publishes on Windows, the `BrokerPort` of the FactoryTalk Optix MQTT client, and the `MQTT_PORT` of the gesture service must be the same number. For example, a broker published as `"1884:1883"` needs `BrokerPort` 1884 and `$env:MQTT_PORT = "1884"`.
 
-None of this applies on the device. There, the containers share the device's own network (`network_mode: host`, [11.1](#111-production-on-the-imx-8m-plus)), and the camera is a real network device.
+None of this applies on the device. There, the camera is a real network device on the WAN port, and the container reaches the broker at the device's own address ([11.1](#111-production-on-the-imx-8m-plus)).
+
+### 18.5 The edge compose files
+
+The device uses two compose files instead of `docker-compose.yml`. Both are in `gesture_recognition/`, and `deploy_tools/deploy_edge.ps1` uses them for you ([23.10](#2310-run-on-the-optixedge)).
+
+**`docker-compose.edge.yml`**, the service on the CPU. Compared with the laptop file:
+
+| Key | Value | Why |
+|---|---|---|
+| `image`, `pull_policy: never` | `localhost/gesture_recognition-gesture:edge` | The image is built on the PC and loaded on the device from a file; it is in no registry, so Docker must not try to download it |
+| `platform` | `linux/arm64` | The device's processor |
+| `ports` | `"8081:8081"` | The MJPEG stream. Port 8080 is FactoryTalk Optix itself |
+| `CAMERA_URL` | `${CAMERA_URL:?…}` | `:?` stops compose with a message if the variable is missing. It comes from `gesture_recognition/.env`, which compose reads on the PC; the password never enters Git or the image |
+| `MQTT_HOST` | `${MQTT_HOST:?…}` | Required too; the deploy script sets it to the device's address ([11.1](#111-production-on-the-imx-8m-plus)) |
+| `USE_NPU` | `false` | This file must also work on a device without the NPU |
+| healthcheck `start_period` | `120s` | The same time the watchdog allows for startup ([17.4](#174-internal-watchdog)) |
+
+**`docker-compose.npu.yml`**, an **override**: compose merges it on top of the edge file when both are given with `-f`. It adds only what the NPU needs, the same recipe as Part 1's `anomaly_detection/docker-compose.npu.yml`:
+
+| Key | Why |
+|---|---|
+| `devices: /dev/galcore` | The NPU driver's door. Without it on the device, Docker refuses to create the container: that is why this is a separate file |
+| `volumes: /usr/lib:/host/usr/lib:ro` | The device's NPU libraries, read-only. `tools/npu_entrypoint.sh` links only the NPU ones into `/opt/npu` ([19.4](#194-how-the-npu-will-be-used)) |
+| `volumes: npu-graph-cache:/var/cache/npu` and the two `VIV_VX_…` variables | Keep the compiled NPU graph (`.nb` file) between restarts. Its appearance is also evidence that MoveNet was compiled for the NPU |
+| `USE_NPU=true` | Try the NPU; the CPU takes over if it fails, and the status says `"accelerator": "cpu"` |
 
 ## 19. Performance and the NPU Plan
 
@@ -3777,7 +3939,7 @@ Three questions decide whether gesture control feels good on a machine:
 - **Throughput:** how many frames per second the service analyses. With too few, a fast movement falls between two samples.
 - **CPU left over:** on the device, the same processor runs FactoryTalk Optix, so every bit of CPU the gesture service uses is taken from the HMI.
 
-Times are given as p50 and p95 ([11.4](#114-one-frames-journey)). **Every measurement in this guide was taken on the laptop. Nothing has run on the i.MX 8M Plus yet.** Laptop numbers do not carry over to the device: it has a much smaller processor, a different instruction set (ARM64 instead of x86-64) and an accelerator the laptop does not have.
+Times are given as p50 and p95 ([11.4](#114-one-frames-journey)). **The measurements in 19.1 were taken on the laptop; those in 19.3 on the OptixEdge test device, on its CPU. Nothing has run on the NPU yet.** Laptop numbers do not carry over to the device: it has a much smaller processor, a different instruction set (ARM64 instead of x86-64) and an accelerator the laptop does not have.
 
 ### 19.1 Measured on the laptop
 
@@ -3790,7 +3952,7 @@ Times are given as p50 and p95 ([11.4](#114-one-frames-journey)). **Every measur
 | Frame received → decision made | p95 33 to 35 ms | `processing p95` in the service log; mostly the frame waiting for the rate cap ([12.2](#122-the-rate-cap)) |
 | Gesture rules | about 20 to 30 µs per frame | `GestureEngine.update` timed while the 41 gesture tests ran, two runs |
 | Model file | 2,894,840 bytes (2.9 MB) | File size, checked by `tools/fetch_model.py` |
-| Container image | 466 MB | `podman image ls` ([18.1](#181-the-image)) |
+| Container image | 466 MB | `podman image ls`, the earlier Python 3.11 image ([18.1](#181-the-image)) |
 | Webcam stopped → `camera_lost` published | about 2 s | Bridge stopped during a compose run ([17.2](#172-camera-loss-and-reconnect)) |
 | Container killed → `offline` will published | about 1 s | `podman kill` on the running container ([15.4](#154-retained-status-and-the-last-will)) |
 
@@ -3811,18 +3973,31 @@ A **wheel** is a ready-built package file. pip copies it into place instead of c
 
 **Why the container uses LiteRT.** On the same laptop with the same model, LiteRT took 3.0 ms (p50) and `tflite-runtime` 2.14 about 33 ms, about 11 times longer. We did not investigate the cause; the measurement decided.
 
-**Natively on Windows.** LiteRT also works outside the container. In a fresh virtual environment, `pip install -r gesture_recognition\requirements.txt` installed LiteRT 2.2.0, and all 60 tests passed with it ([23.1](#231-prerequisites)). Our first native Windows runs, before that test, used full TensorFlow 2.21.0, the third choice in `pose.py`.
+**Natively on Windows.** LiteRT also works outside the container. In a fresh virtual environment, `pip install -r gesture_recognition\requirements.txt` installed LiteRT 2.2.0, and all 60 tests of the suite at that time passed with it ([23.1](#231-prerequisites)); the current 77 pass natively too. Our first native Windows runs, before that test, used full TensorFlow 2.21.0, the third choice in `pose.py`.
 
 **Why `tflite_runtime` is still in the list.** On the device, the runtime must work with NXP's VX delegate. A delegate is compiled code that plugs into the runtime's internals, so NXP builds each delegate together with one runtime:
 
 - NXP's own Python example for the VX delegate imports `tflite_runtime` and loads the delegate with `load_delegate` ([label_image.py](https://github.com/nxp-imx/tflite-vx-delegate-imx/blob/lf-6.18.20_2.0.0/examples/python/label_image.py)).
 - A recent NXP Linux release (`lf-6.18.20_2.0.0`) also builds LiteRT 2.1.0, installing the same `ai_edge_litert` package our container uses, plus a LiteRT VX delegate built against it ([NXP LiteRT recipes](https://github.com/nxp-imx/meta-imx/tree/wrynose-6.18.20-2.0.0/meta-imx-ml/recipes-libraries/litert)).
 
-Which runtime the device offers depends on the NXP release it runs, and we do not know that yet ([19.4](#194-how-the-npu-will-be-used)). Our image brings its own LiteRT 2.2.0 from PyPI. Whether NXP's delegate, built for the device's runtime, loads into it must be tested on the device. If it does not, `pose.py` needs no change: it already falls back to `tflite_runtime` when LiteRT is missing. What changes is how the image gets the matching runtime, which is the choice in [19.4](#194-how-the-npu-will-be-used).
+Which runtime the device offers depends on the NXP release it runs, and we do not know that yet ([19.4](#194-how-the-npu-will-be-used)). Our image brings its own LiteRT from PyPI (2.3.0 in the current ARM64 image). Whether NXP's delegate, built for the device's runtime, loads into it must be tested on the device. If it does not, `pose.py` needs no change: it already falls back to `tflite_runtime` when LiteRT is missing. What changes is how the image gets the matching runtime, which is the choice in [19.4](#194-how-the-npu-will-be-used).
 
 ### 19.3 Expected on the i.MX 8M Plus
 
-> 📝 **Not measured.** The times in this section are rough planning estimates, not derived from any measurement. NXP's MoveNet page gives no speed figure ([10.5](#105-movenet)).
+> ✅ **CPU measured** on the OptixEdge test device: the table right below. 📝 The NPU figures further down are still rough planning estimates; NXP's MoveNet page gives no speed figure ([10.5](#105-movenet)).
+
+Measured on the OptixEdge (i.MX 8M Plus, CPU only, 2 threads for MoveNet), Tapo C310 `/stream2` over RTSP, no person in the picture, one MJPEG viewer connected:
+
+| What | Result | How it was measured |
+|---|---|---|
+| Image preparation + MoveNet | about 50.5 to 52 ms per frame (p50) | `inference_ms` in the MQTT status, and the service log |
+| Frames analysed per second | 15 to 16 fps | `fps` in the MQTT status; the 20 fps cap is not reached |
+| Frame received → decision made | p95 61 ms | `processing p95` in the service log |
+| Model load on the CPU | under 0.1 s | Timestamps in the service log |
+| Container start → camera open | about 2 s | Timestamps in the service log |
+| Image size | 375 MB | `podman images`, ARM64 |
+
+So the CPU estimate below (40 to 90 ms) was right, and the service works on the CPU, with fewer samples per swipe than at 20 fps. CPU load next to FactoryTalk Optix, memory and temperature were not measured yet.
 
 The chip in short ([10.7](#107-cpu-npu-runtime-and-delegates), [10.8](#108-video-basics)):
 
@@ -3837,17 +4012,17 @@ The chip in short ([10.7](#107-cpu-npu-runtime-and-delegates), [10.8](#108-video
 | NPU | 10 to 30 ms | Fits in the 50 ms; the CPU still decodes the video and prepares the image |
 | CPU, the fallback | 40 to 90 ms | Between about 11 and 20 fps, with MoveNet keeping the CPU busy most of the time, next to FactoryTalk Optix |
 
-**At lower frame rates.** The rules use time windows in seconds, not frame counts (a swipe must happen within 0.6 s), so they should still work at fewer frames per second. This is untested: all tests feed 20 fps. There is a hard floor. When frames are 0.3 s or more apart (about 3.3 fps or fewer), every frame starts a new wrist track (`max_gap_s`, [13.4](#134-a-track-for-each-wrist)), and no gesture can fire.
+**At lower frame rates.** The rules use time windows in seconds, not frame counts (a swipe must happen within 0.6 s), so they should still work at fewer frames per second. This is untested: the tests feed 20 fps, apart from one that feeds a burst of frames 0.02 s apart. There is a hard floor. When frames are 0.3 s or more apart (about 3.3 fps or fewer), every frame starts a new wrist track (`max_gap_s`, [13.4](#134-a-track-for-each-wrist)), and no gesture can fire.
 
-**The 100 ms goal.** The requirement is a latency below about 100 ms. We count it from "frame received" to "HMI reacts". Two delays are outside it: the gesture itself (holding a palm for 1 s takes 1 s) and the camera's own delay before the frame arrives.
+**The 100 ms goal.** The requirement is a latency below about 100 ms. We count it from "frame received" to "HMI reacts". Two delays are outside it: the gesture itself (holding a palm for 1 s and lowering it takes over 1 s) and the camera's own delay before the frame arrives.
 
 - On the laptop, frame received → decision takes 33 to 35 ms at p95, mostly waiting for the rate cap. Setting the camera to about `target_fps` removes most of the wait ([12.2](#122-the-rate-cap)).
 - On the device, MoveNet on the NPU is estimated at 10 to 30 ms. Image preparation on the A53, the MQTT hop and the HMI update have not been measured. An end-to-end measurement is on the roadmap ([25.3](#253-roadmap)).
-- A swipe fires as soon as the wrist has moved 1.5 SW, often while the hand is still moving ([13.5](#135-swipe-left-and-swipe-right)). Part of the delay therefore overlaps the end of the movement.
+- A swipe fires as soon as the wrist has moved 1.0 SW, often while the hand is still moving ([13.5](#135-swipe-left-and-swipe-right)). Part of the delay therefore overlaps the end of the movement.
 
 ### 19.4 How the NPU will be used
 
-> 📝 **Planned.** The code path and the two tools below exist, but none of them has run on the device yet.
+> ⚠️ **Ready, never run on an NPU.** The image now takes path N1 below, exactly like Part 1: `docker-compose.npu.yml` passes `/dev/galcore` and mounts the device's `/usr/lib` read-only, and `tools/npu_entrypoint.sh` links only the NPU libraries (and the device's own `tflite_runtime`, built for the same TFLite as the delegate) into `/opt/npu`. `pose.py` tries `tflite_runtime` first, then LiteRT, and loads the delegate from `/opt/npu/lib/libvx_delegate.so`. On the test device, which has no NPU enabled, the service falls back to the CPU as designed. The rest of this section is the original plan and the measuring tools.
 
 The chain from our code down to the NPU:
 
@@ -3960,7 +4135,7 @@ export VIV_VX_ENABLE_CACHE_GRAPH_BINARY="1"
 export VIV_VX_CACHE_BINARY_GRAPH_DIR=$HOME
 ```
 
-NXP's comment on these lines: "Store on disk .nb files that contains the result of the OpenVX graph compilation", and "This feature is only available for iMX8MPlus to get the warmup time only once" ([common_utils.sh](https://github.com/nxp-imx/nxp-nnstreamer-examples/blob/main/common/common_utils.sh)). Planned: the edge compose file sets both variables and keeps the folder on a named volume, so the cache survives container restarts.
+NXP's comment on these lines: "Store on disk .nb files that contains the result of the OpenVX graph compilation", and "This feature is only available for iMX8MPlus to get the warmup time only once" ([common_utils.sh](https://github.com/nxp-imx/nxp-nnstreamer-examples/blob/main/common/common_utils.sh)). Done in `docker-compose.npu.yml`: it sets both variables and keeps the folder on the named volume `npu-graph-cache`, so the cache survives container restarts ([18.5](#185-the-edge-compose-files)).
 
 ### 19.5 Bottlenecks
 
@@ -4000,21 +4175,29 @@ This section is a map of the code. [20.1](#201-file-by-file-guide) lists every f
 |---|---|---|
 | `config.yaml` | Every setting, with comments: camera, model, MQTT and the gesture thresholds | [24](#24-tuning-the-gesture-parameters) |
 | `requirements.txt` | The Python packages installed in the image | [18.1](#181-the-image) |
-| `Dockerfile` | The recipe for the container image | [18.1](#181-the-image) |
+| `Dockerfile` | The recipe for the container image, laptop and device | [18.1](#181-the-image) |
+| `.dockerignore` | What stays out of the image: tests, laptop tools, `deploy_tools/`, `*.tar`, `.env` | [18.1](#181-the-image) |
 | `docker-compose.yml` | How the container is started on the laptop. Its header comments repeat the run recipe | [18.2](#182-the-compose-file), [23](#23-how-to-run-the-gesture-service) |
+| `docker-compose.edge.yml` | The service on the OptixEdge, CPU only | [18.5](#185-the-edge-compose-files) |
+| `docker-compose.npu.yml` | Override that adds the NPU: `/dev/galcore`, the device's libraries, the graph cache | [18.5](#185-the-edge-compose-files), [19.4](#194-how-the-npu-will-be-used) |
+| `deploy_tools/deploy_edge.ps1` | Windows script: builds the ARM64 image, uploads it to the device and starts, watches or removes the service | [23.10](#2310-run-on-the-optixedge) |
+| `.env` | Not in Git: `CAMERA_URL` with the camera password, read by compose on the PC | [23.10](#2310-run-on-the-optixedge) |
 | `src/main.py` | Starts everything in the right order, runs the main loop, sends the status, holds the watchdog | [11.3](#113-inside-the-service-four-threads), [12.2](#122-the-rate-cap), [17](#17-health-monitoring-and-camera-loss), [20.2](#202-the-most-important-lines) |
 | `src/camera.py` | The camera thread: newest-frame slot, timeouts, reconnect | [12.1](#121-keeping-only-the-newest-frame), [17.2](#172-camera-loss-and-reconnect) |
-| `src/pose.py` | Everything about MoveNet: chooses the runtime (LiteRT, then `tflite_runtime`, then TensorFlow), tries the NPU and falls back to the CPU, prepares the image, runs the model, warms it up | [12.3](#123-preparing-the-image-for-the-model), [12.4](#124-running-movenet-and-reading-the-result) |
+| `src/pose.py` | Everything about MoveNet: chooses the runtime (the device's `tflite_runtime` when the NPU override provides it, then LiteRT, then TensorFlow), tries the NPU and falls back to the CPU, prepares the image, runs the model, warms it up | [12.3](#123-preparing-the-image-for-the-model), [12.4](#124-running-movenet-and-reading-the-result) |
 | `src/gestures.py` | The gesture rules and the repeat protection | [13](#13-from-keypoints-to-gestures), [14](#14-one-gesture-one-event) |
 | `src/mqtt_client.py` | Builds and publishes the MQTT messages | [15](#15-mqtt-messages-for-gestures) |
-| `tests/test_gestures.py` | 41 tests of the gesture rules | [21](#21-testing-the-gesture-service) |
-| `tests/test_pose.py` | 6 tests of image preparation and the model | [21.2](#212-what-the-60-tests-cover) |
-| `tests/test_camera.py` | 5 tests of the camera thread | [21.2](#212-what-the-60-tests-cover) |
-| `tests/test_mqtt_payloads.py` | 8 tests of the messages and the publisher | [21.2](#212-what-the-60-tests-cover) |
+| `src/stream.py` | Draws the body on the picture and serves it as MJPEG on port 8081 | [16.5](#165-the-camera-picture-in-a-webbrowser-object) |
+| `tests/test_gestures.py` | 50 tests of the gesture rules | [21](#21-testing-the-gesture-service) |
+| `tests/test_pose.py` | 6 tests of image preparation and the model | [21.2](#212-what-the-77-tests-cover) |
+| `tests/test_camera.py` | 5 tests of the camera thread | [21.2](#212-what-the-77-tests-cover) |
+| `tests/test_mqtt_payloads.py` | 8 tests of the messages and the publisher | [21.2](#212-what-the-77-tests-cover) |
+| `tests/test_stream.py` | 8 tests of the drawing and the MJPEG server | [21.2](#212-what-the-77-tests-cover) |
 | `tools/fetch_model.py` | Downloads MoveNet and checks its fingerprint | [20.2](#202-the-most-important-lines), [23.2](#232-download-the-model) |
 | `tools/webcam_bridge.py` | Laptop only: serves the webcam as an MJPEG stream | [18.3](#183-why-the-webcam-needs-a-bridge) |
 | `tools/bench_pose.py` | Times MoveNet on the CPU or the NPU | [19.4](#194-how-the-npu-will-be-used) |
 | `tools/npu_probe.sh` | Collects facts about the device's NPU driver and libraries | [19.4](#194-how-the-npu-will-be-used) |
+| `tools/npu_entrypoint.sh` | Container start script: borrows the device's NPU libraries, then starts the service | [18.1](#181-the-image), [19.4](#194-how-the-npu-will-be-used) |
 | `models/movenet_lightning_int8.tflite` | The model, 2,894,840 bytes. Downloaded by `fetch_model.py`; the root `.gitignore` keeps the folder out of Git | [10.5](#105-movenet) |
 
 ### 20.2 The most important lines
@@ -4025,7 +4208,7 @@ Most key lines were already shown where their idea is explained:
 |---|---|---|
 | The newest-frame slot and `latest()` | `src/camera.py` | [12.1](#121-keeping-only-the-newest-frame) |
 | The rate cap | `src/main.py` | [12.2](#122-the-rate-cap) |
-| Cropping, resizing and color order for the model | `src/pose.py` | [12.3](#123-preparing-the-image-for-the-model) |
+| Letterboxing, resizing and color order for the model | `src/pose.py` | [12.3](#123-preparing-the-image-for-the-model) |
 | Choosing the runtime, trying the NPU, running MoveNet | `src/pose.py` | [12.4](#124-running-movenet-and-reading-the-result) |
 | Presence gate, body coordinates, wrist tracks | `src/gestures.py` | [13.2](#132-the-presence-gate), [13.3](#133-body-coordinates-in-shoulder-widths), [13.4](#134-a-track-for-each-wrist) |
 | The three detectors and the choice between them | `src/gestures.py` | [13.5](#135-swipe-left-and-swipe-right) to [13.8](#138-confidence-and-which-gesture-wins) |
@@ -4093,7 +4276,7 @@ def load_config(path):
 Read it from top to bottom:
 
 1. **Stop requests.** A `threading.Event` is a flag that one thread can set and others can check or wait for. A **signal** is a short notice that the operating system delivers to a running program. `SIGINT` is what Ctrl+C sends. `SIGTERM` is the polite "please stop" that `podman stop` sends first: "By default, containers are stopped with SIGTERM and then SIGKILL after the timeout", and "The default is 10 seconds" ([podman-stop](https://docs.podman.io/en/latest/markdown/podman-stop.1.html)). Both handlers only set the flag. The main loop checks it on every pass and then leaves through the clean shutdown (point 4).
-2. **Settings.** `ROOT` is the `gesture_recognition` folder (`/app` in the container), so the paths in `config.yaml` work from any working directory. `GestureConfig(**config["gestures"])` hands every key of the `gestures` section to `GestureConfig` as a named argument; `**` unpacks a dictionary. `GestureConfig` is a **dataclass**, a Python class that mainly holds named values. It has a default for every field and is *frozen*: its values cannot change while the service runs. A key missing from the file keeps the code's default. A misspelled key stops the service at once, for example with `TypeError: GestureConfig.__init__() got an unexpected keyword argument 'palm_hold'`. A unit test keeps the file's values equal to the code's defaults ([21.2](#212-what-the-60-tests-cover)).
+2. **Settings.** `ROOT` is the `gesture_recognition` folder (`/app` in the container), so the paths in `config.yaml` work from any working directory. `GestureConfig(**config["gestures"])` hands every key of the `gestures` section to `GestureConfig` as a named argument; `**` unpacks a dictionary. `GestureConfig` is a **dataclass**, a Python class that mainly holds named values. It has a default for every field and is *frozen*: its values cannot change while the service runs. A key missing from the file keeps the code's default. A misspelled key stops the service at once, for example with `TypeError: GestureConfig.__init__() got an unexpected keyword argument 'palm_hold'`. A unit test keeps the file's values equal to the code's defaults ([21.2](#212-what-the-77-tests-cover)).
 3. **MQTT first.** `publisher.start()` returns at once and connects in the background ([15.4](#154-retained-status-and-the-last-will)). The connection is made while the model loads, and a broker that is not up yet does not block the start.
 4. **Watchdog before the model.** Its first deadline is 120 s away, so a hang while MoveNet loads, or while it is compiled for the NPU, also ends in a restart ([17.4](#174-internal-watchdog)).
 5. **Model.** `PoseEstimator(...)` loads MoveNet. If `use_npu` is on, it tries the NPU with one test inference and falls back to the CPU if that fails ([12.4](#124-running-movenet-and-reading-the-result)). `accelerator` then says which one is used, `npu` or `cpu`.
@@ -4151,7 +4334,7 @@ def redact(source):
   - `[^/@]+` matches one or more characters that are neither `/` nor `@`; here, `user:password`.
   - `@` matches the at sign that ends the credentials.
 - The result is `rtsp://***@192.0.2.10/stream`. A URL without `@` comes back unchanged, and a webcam number such as `0` becomes the text `"0"`.
-- The test `test_credentials_are_redacted` checks three cases: an RTSP URL with credentials, a URL without them, and the webcam number `0` ([21.2](#212-what-the-60-tests-cover)).
+- The test `test_credentials_are_redacted` checks three cases: an RTSP URL with credentials, a URL without them, and the webcam number `0` ([21.2](#212-what-the-77-tests-cover)).
 
 **6. A download that cannot leave a broken model** (`tools/fetch_model.py`, inside `fetch()`):
 
@@ -4188,7 +4371,7 @@ def redact(source):
 
 ## 21. Testing the Gesture Service
 
-A **unit test** is a small program that runs one piece of the real code with known input and checks the result. The gesture service has 60 of them, written with Python's built-in `unittest` module. On the laptop they all run in under a second, without a camera, a broker or a person. How to run them is in [23.3](#233-run-the-unit-tests).
+A **unit test** is a small program that runs one piece of the real code with known input and checks the result. The gesture service has 77 of them, written with Python's built-in `unittest` module. On the laptop they all run in a few seconds, without a camera, a broker or a person. How to run them is in [23.3](#233-run-the-unit-tests).
 
 Every test file first puts the `src` folder on Python's search path, so that `import gestures` finds the real code:
 
@@ -4222,7 +4405,7 @@ ABOVE_HEAD = (0.4, 1.4)
 | `sw` | 0.25 | How wide the shoulders appear, as a fraction of the picture. A smaller value is a person further away |
 | `mirror` | `True` | Whether the picture is mirrored, like `camera.mirror` |
 
-`right_hand(positions)` turns a list of positions into a list of poses with the right hand at each position. Extra settings, such as `sw=0.08`, are passed on to `make_pose`.
+`right_hand(positions)` turns a list of positions into a list of poses with the right hand at each position. Extra settings, such as `sw=0.05`, are passed on to `make_pose`.
 
 **Idea 3: a movement is a list of positions, 20 per second.** `move(start, end, seconds)` returns positions along a straight line, one per frame at 20 fps. The start itself is left out, because the previous movement already ended there. `stay(position, seconds)` repeats one position. Adding lists strings movements together. A swipe to the right:
 
@@ -4244,9 +4427,9 @@ class Session:
         self.t = 100.0
         self.events = []
 
-    def play(self, poses):
+    def play(self, poses, dt=DT):
         for kps in poses:
-            self.t += DT
+            self.t += dt
             event = self.engine.update(self.t, kps)
             if event is not None:
                 self.events.append(event)
@@ -4260,7 +4443,13 @@ class Session:
         return [e.gesture for e in self.events]
 ```
 
-No gesture test waits for a real clock. The 41 gesture tests replay 2,525 frames, about 126 seconds of movement, in about 0.06 s on the laptop.
+`dt` is the time between two poses, 1/20 s unless a test asks for something else. One test plays frames only 0.02 s apart, like the bursts in which frames arrive on the device ([13.4](#134-a-track-for-each-wrist)):
+
+```python
+        s.play(right_hand(move(CHEST_L, CHEST_R, 0.15)), dt=0.02)
+```
+
+No gesture test waits for a real clock. The 50 gesture tests replay 3,196 frames, about 160 seconds of movement, in about 0.1 s on the laptop.
 
 **Reading a test.** One complete test:
 
@@ -4279,27 +4468,29 @@ Read it as a story. The operator stands with the hands down for 0.5 s (`rest()`)
 - `FakeClient` stands in for paho's MQTT client. It records the last will, every publish, and every connect, loop and disconnect call, so a test can check exactly what would have been sent. The test decides whether the fake is "connected".
 - `unittest.mock.patch.object` replaces a name inside a module for the duration of one `with` block. `test_pose.py` uses it to swap in an interpreter that raises `RuntimeError("graph compilation failed")` at its first inference on the NPU, and a `load_delegate` that pretends to load the NPU library. That is how the NPU fallback is tested on a laptop that has no NPU.
 
-### 21.2 What the 60 tests cover
+### 21.2 What the 77 tests cover
 
 | File | Group | Tests | What they check |
 |---|---|---|---|
-| `test_gestures.py` | `TestRecognition` | 7 | Each of the four gestures fires when performed properly. `open_palm` fires only after the hold time, and the hold starts again after a single frame in which the wrist was not seen clearly. With the mirror off, the same movement is the opposite swipe. The confidence is the mean keypoint score: wrist scores of 0.8 and body scores of 0.9 give 0.85 ([13.8](#138-confidence-and-which-gesture-wins)) |
-| | `TestNoRepeatActivation` | 17 | One movement gives one event. A palm held for 10 s fires once. So does a palm whose wrist is not seen for a moment, or one that moves to another spot and is held there. A palm fires again only after the hand was lowered. Raising the hand to the hold position is not `palm_up`; holding it above the head after `palm_up` is not `open_palm`; a hand raised slowly above the head is neither. Return strokes do not fire: fast, slow, long, or after the cooldown. A swipe after the hand was lost is a new swipe, not a return stroke. A second swipe within the cooldown is ignored; two swipes after it fire twice. An opposite swipe fires after the block time, also after the hand held still. Both hands swiping together fire once |
+| `test_gestures.py` | `TestRecognition` | 16 | Each of the four gestures fires when performed properly. `open_palm` fires only when the hand is lowered after a full hold, not after a hold that is too short, and not when the hand comes down too late. The hold survives one missed frame and starts again after two. A swipe or a palm-up made from a held hand is only that gesture, and an arm held out after a swipe is not `open_palm`. A swipe and a palm-up still fire across one missed frame, and a fast swipe fires in frames arriving 0.02 s apart. With the mirror off, the same movement is the opposite swipe. The confidence is the mean keypoint score: wrist scores of 0.8 and body scores of 0.9 give 0.85 ([13.8](#138-confidence-and-which-gesture-wins)) |
+| | `TestNoRepeatActivation` | 17 | One movement gives one event. A palm held for 10 s, then lowered, fires once. So does a palm whose wrist is not seen for a moment, or one that moves to another spot and is held there. A second palm needs a new hold and a new lowering. Raising the hand to the hold position is not `palm_up`; holding it above the head after `palm_up` is not `open_palm`; a hand raised slowly above the head is neither. Return strokes do not fire: fast, slow, long, or after the cooldown. A swipe after the hand was lost is a new swipe, not a return stroke. A second swipe within the cooldown is ignored; two swipes after it fire twice. An opposite swipe fires after the block time, also after the hand held still. Both hands swiping together fire once |
 | | `TestFalsePositives` | 12 | Movements that must not fire: walking across the picture; an arm swinging at hip height, or through hip height like a pendulum; low wrist scores; a swipe or a rise that happened while the wrist or the person was not seen clearly; crossed arms; the model swapping the left and right wrist for a moment; a waving hand. A palm with random jitter of up to ±0.05 SW still fires exactly once |
-| | `TestPresence` | 4 | The presence gate ([13.2](#132-the-presence-gate)): a person too far away (`sw=0.08`) or off-center (`center` x at 0.9) is ignored. Another person stepping in (the shoulder center jumps 1.2 SW) or losing the person restarts a palm hold |
+| | `TestPresence` | 4 | The presence gate ([13.2](#132-the-presence-gate)): a person too far away (`sw=0.05`) or off-center (`center` x at 0.9) is ignored. Another person stepping in (the shoulder center jumps 1.2 SW) or losing the person restarts a palm hold |
 | | `TestConfigFile` | 1 | The `gestures` values in `config.yaml` equal the code defaults, so the tests check the deployed thresholds |
-| `test_pose.py` | `TestPreprocessing` | 3 | The center square of a landscape and of a portrait picture. The model input is one 192 × 192 RGB picture of `uint8` values, and a blue pixel stays blue after the BGR-to-RGB swap ([12.3](#123-preparing-the-image-for-the-model)) |
+| `test_pose.py` | `TestPreprocessing` | 3 | The letterbox of a landscape picture (black bands above and below) and of a portrait picture (bands left and right). The model input is one 192 × 192 RGB picture of `uint8` values, and a blue pixel stays blue after the BGR-to-RGB swap ([12.3](#123-preparing-the-image-for-the-model)) |
 | | `TestRealModel` | 3 | With the real model file: CPU inference returns 17 keypoints with values from 0 to 1. A missing NPU library falls back to the CPU with a warning; so does an NPU that fails at its first inference. Skipped when the model has not been downloaded |
 | `test_camera.py` | `TestCamera` | 5 | `latest()` returns only the newest frame. A lost camera is opened again, with the state `camera_lost` meanwhile. An error inside a read is handled like a lost camera. The reconnect pause starts again from the minimum after frames arrived. Passwords are hidden ([20.2](#202-the-most-important-lines), point 5) |
 | `test_mqtt_payloads.py` | `TestPayloads` | 3 | An event has exactly the five fields, a valid UUID and a UTC timestamp with milliseconds. Two events get different IDs. The status rounds its numbers to one decimal |
 | | `TestPublisher` | 5 | The last will is a retained `offline`. Events are dropped while disconnected. Events use QoS 1 and are not retained. The status is retained and sent again after a reconnect. Stopping sends the final status, then disconnects |
+| `test_stream.py` | `TestAnnotate` | 5 | A body point is mapped from the padded square back to the right pixel of the camera picture, and to the opposite side with the mirror on. A large picture is shrunk to 640 pixels wide. A point below `min_keypoint_score` is not drawn. The camera's own frame is never changed ([16.5](#165-the-camera-picture-in-a-webbrowser-object)) |
+| | `TestMjpegServer` | 3 | The page contains the picture element. A real HTTP client receives a JPEG from `/stream.mjpg` and is counted as a viewer while connected. Any other path gets 404 |
 
 **Not covered by the unit tests:**
 
 - The watchdog thread. It was checked separately with stand-ins ([17.4](#174-internal-watchdog)).
-- `main()`, which wires the pieces together. It was checked by running the service in its container with the webcam bridge ([19.1](#191-measured-on-the-laptop)).
+- `main()`, which wires the pieces together. It was checked by running the service in its container with the webcam bridge ([19.1](#191-measured-on-the-laptop)), and on the OptixEdge with the IP camera ([19.3](#193-expected-on-the-imx-8m-plus)).
 - The webcam bridge. It was checked by running it.
-- Real people. The thresholds are reasoned design values, not yet tuned on recordings ([25.2](#252-limitations)).
+- Real people. The thresholds were tuned by replaying one set of keypoints recorded on the device, 120 s with 13 labelled gestures ([22](#22-gesture-decision-log)). Those recordings are not part of the unit tests, and they come from a single small session ([25.2](#252-limitations)).
 
 ### 21.3 Test-first and the mutation check
 
@@ -4311,7 +4502,7 @@ The first runs of this check found gaps, which led to four new tests, for exampl
 
 | Mutant | Why it survived | Fix |
 |---|---|---|
-| `opposite_swipe_block_s` set to 0, so no return-stroke block | The return stroke in the test was too short to fire anyway. After the trim at the latch release ([14.2](#142-trimming)), it covered only 1.4875 SW, just under the 1.5 SW a swipe needs | The test's return stroke now covers 2.0 SW instead of 1.7 SW, so only the block can stop it |
+| `opposite_swipe_block_s` set to 0, so no return-stroke block | The return stroke in the test was too short to fire anyway. After the trim at the latch release ([14.2](#142-trimming)), it covered only 1.4875 SW, just under the 1.5 SW a swipe then needed | The test's return stroke now covers 2.0 SW instead of 1.7 SW, so only the block can stop it |
 | `palm_zone_max_y` set to 100, so the hold zone has no upper limit | The test that holds a hand above the head for 3 s first fires `palm_up`. After that, the latch blocked `open_palm`, not the zone | New test: a hand raised slowly above the head is neither gesture. The rise is too slow for `palm_up`, so nothing but the zone stops `open_palm` |
 
 The check also runs the tests on the unbroken code, as a reference. There, one of the four new tests failed because the test itself was wrong: it moved the person by exactly 1.0 SW, but the rule reacts only to *more than* 1 SW. It now uses 1.2 SW. After these changes, all 14 mutants were caught.
@@ -4332,19 +4523,19 @@ The same format as Part 1's [decision log](#6-decision-log): one row per decisio
 | Pose model | MoveNet SinglePose Lightning, int8, version 4 ([10.5](#105-movenet)) | The faster MoveNet variant, with a 192 × 192 input and a 2.9 MB file. NXP's eIQ Model Zoo uses the same file and says it "has been tested on i.MX 8MP". Its 17 body keypoints include the wrists, elbows and shoulders that the rules need | Thunder: a 256 × 256 input, "intended for applications that require high accuracy", so more computation per frame. MultiPose: up to 6 people, while one operator is expected ([25.4](#254-adding-gestures-in-the-future)) |
 | Recognizing gestures | Hand-written rules on the keypoints ([13.1](#131-why-rules-instead-of-a-second-model)) | No training data exists, and the four gestures are simple geometry. Rules can be explained and unit-tested, and take tens of microseconds per frame | A small learned classifier on keypoint sequences: needs many labelled recordings. Planned for when the list of gestures grows ([25.4](#254-adding-gestures-in-the-future)) |
 | Open palm | A stand-in based on the pose: a wrist held still at shoulder or face height, forearm up, for 1 s ([13.7](#137-open-palm)) | MoveNet has no finger keypoints, so it cannot see whether a hand is open. A hand model would add a second model to run, a second NPU graph and code to find the hand: more that can go wrong in a demo | A hand-landmark model run around the wrist, only while a palm is likely ([25.4](#254-adding-gestures-in-the-future)) |
-| Language | Python 3.11 | The language of Part 1 and of NXP's Python example for the VX delegate ([19.2](#192-why-litert)). The heavy work (video decoding, resizing, MoveNet) runs in compiled code inside OpenCV and the runtime; the rules, in Python, take about 20 to 30 µs per frame ([19.1](#191-measured-on-the-laptop)) | C++: less overhead, but slower to write, read and change. The measurements so far give no reason for it |
+| Language | Python (3.12 in the image) | The language of Part 1 and of NXP's Python example for the VX delegate ([19.2](#192-why-litert)). The heavy work (video decoding, resizing, MoveNet) runs in compiled code inside OpenCV and the runtime; the rules, in Python, take about 20 to 30 µs per frame ([19.1](#191-measured-on-the-laptop)) | C++: less overhead, but slower to write, read and change. The measurements so far give no reason for it |
 | Frames | One slot that holds only the newest frame ([12.1](#121-keeping-only-the-newest-frame)) | MoveNet always gets the most recent picture. When the loop is slower than the camera, old frames are dropped instead of piling up, so the delay cannot grow | A queue of frames: nothing is dropped, but after any slowdown the service works on the past |
 | Frame rate | At most 20 analysed frames per second, `target_fps` ([12.2](#122-the-rate-cap)) | A swipe of 0.3 to 0.6 s still gives 6 to 12 samples. CPU or NPU time is left for FactoryTalk Optix, and the device stays cooler | As many frames as possible: more samples than the rules need, paid for with CPU time and heat |
 | MQTT topics | One events topic for all gestures, plus a retained status topic with a last will ([15.1](#151-topics), [15.4](#154-retained-status-and-the-last-will)) | One subscription in FactoryTalk Optix covers every future gesture. The latest status is always available, and the broker announces `offline` when the service dies | One topic per gesture: a new subscription and new HMI configuration for each new gesture |
 | Delivery | QoS 1, events not retained, a unique `event_id` in every event ([15.3](#153-qos-1-and-duplicates)) | QoS 1 sends a message again when its receipt is missing, and a copy is recognised by its `event_id`. A retained event would be replayed to FactoryTalk Optix at every restart | QoS 0: a lost message is gone. QoS 2: exactly once, but with a four-step exchange that adds nothing when copies are recognised anyway |
-| Repeat protection | In the service: latch, cooldown and return-stroke block ([14](#14-one-gesture-one-event)) | Only the service sees the hand, so only it can tell when a gesture has ended. FactoryTalk Optix adds a second layer that drops copies and old events (planned, [16.2](#162-the-gestureeventmanager-netlogic)) | Only in FactoryTalk Optix: it would have to guess from the timing of the messages |
-| HMI side *(planned)* | One global NetLogic, `GestureEventManager`; pages switched by a dynamic link from the PanelLoader's `Panel` to a model variable ([16.2](#162-the-gestureeventmanager-netlogic)) | One place handles every gesture. Every browser session should follow the same variable, so no code per session is needed. To be checked with two browsers | Calling the PanelLoader's `ChangePanel` method from NetLogic, as in Rockwell's sample: the fallback if the link does not switch every session |
+| Repeat protection | In the service: latch, cooldown and return-stroke block ([14](#14-one-gesture-one-event)) | Only the service sees the hand, so only it can tell when a gesture has ended. FactoryTalk Optix adds a second layer that drops copies and old events (written, not yet run, [16.2](#162-the-gestureeventmanager-netlogic)) | Only in FactoryTalk Optix: it would have to guess from the timing of the messages |
+| HMI side *(written, not yet run)* | One global NetLogic, `GestureEventManager`; pages switched by a dynamic link from the PanelLoader's `Panel` to a model variable ([16.2](#162-the-gestureeventmanager-netlogic)) | One place handles every gesture. Every browser session should follow the same variable, so no code per session is needed. To be checked with two browsers | Calling the PanelLoader's `ChangePanel` method from NetLogic, as in Rockwell's sample: the fallback if the link does not switch every session |
 | Container user | A normal user, `gesture`, instead of root ([18.1](#181-the-image)) | The service only opens outgoing connections, to the camera and the broker, so it needs no special rights | Root, the user a container gets when the image names none ([Docker run reference](https://docs.docker.com/engine/containers/run/#user)): more rights than the service needs |
 | Stuck service | An internal watchdog ends the process; the restart policy `unless-stopped` should then restart the container (not tested) ([17.4](#174-internal-watchdog)) | A restart policy acts when a container exits, not when it is unhealthy ([17.3](#173-heartbeat-file-and-container-healthcheck)). The watchdog turns a hang into an exit | The healthcheck alone: the container would be labelled unhealthy and go on hanging |
 | NPU | Tried first when `use_npu` is on; the CPU takes over if the NPU cannot be used ([12.4](#124-running-movenet-and-reading-the-result)) | The demo always runs, and the status reports which one is in use (`accelerator`) | NPU only: a missing or mismatched NPU library would stop the service |
 | Quantization on the device | Keep the original file, with its per-channel scales, and measure first ([19.4](#194-how-the-npu-will-be-used)) | A reference project for this chip found that a per-tensor version of MoveNet runs on the NPU, but its keypoint confidence collapses to about 0 | Re-quantizing to per-tensor: possibly faster on the NPU; considered only together with an accuracy check |
-| Device network *(planned)* | `network_mode: host` ([11.1](#111-production-on-the-imx-8m-plus)) | The broker is at `127.0.0.1:1883`, as for FactoryTalk Optix, and RTSP video sent over UDP does not pass through address translation (NAT), which can block it. The service opens no listening ports, so sharing the device's network exposes nothing new | A separate container network: more isolation, but the broker gets a different address than the one FactoryTalk Optix uses, and UDP video may not get through the NAT |
-| Device camera stream *(planned)* | A low-resolution substream, for example 640 × 360 at about 20 fps ([19.5](#195-bottlenecks)) | The CPU decodes every frame the camera sends, and MoveNet uses only a 192 × 192 picture anyway | The full-resolution main stream: more decoding work for pixels that are thrown away when the picture is shrunk |
+| Device network | The compose project's own network, port 8081 published, broker at the device's address ([11.1](#111-production-on-the-imx-8m-plus)) | Changed while deploying: the plan was `network_mode: host`, but Docker on the OptixEdge runs rootless, where "host" is rootless Docker's private network. RTSP is read over TCP, which crosses the address translation that blocks UDP video | `network_mode: host`, the plan: the published port would not reach the device's network under rootless Docker |
+| Device camera stream | The Tapo C310's substream `/stream2` ([19.5](#195-bottlenecks)) | The CPU decodes every frame the camera sends, and MoveNet uses only a 192 × 192 picture anyway | The 3-megapixel main stream `/stream1`: more decoding work for pixels that are thrown away when the picture is shrunk |
 
 **Decisions made or changed while building and testing.** Rows marked "review" fix problems that the two code reviews found ([21.3](#213-test-first-and-the-mutation-check)):
 
@@ -4352,23 +4543,40 @@ The same format as Part 1's [decision log](#6-decision-log): one row per decisio
 |---|---|---|---|
 | Runtime | LiteRT (`ai-edge-litert`), with `tflite_runtime` and full TensorFlow as fallbacks ([19.2](#192-why-litert)) | Measured on the laptop: 3.0 ms (p50), against about 33 ms for `tflite-runtime` 2.14.0, the newest release of the old package on PyPI. A recent NXP Linux release also builds LiteRT | `tflite-runtime`, the plan's first choice and the package in NXP's Python example. It stays in the import list for the device ([12.4](#124-running-movenet-and-reading-the-result)) |
 | Clock | `time.perf_counter()` ([12.1](#121-keeping-only-the-newest-frame)) | On Windows with Python older than 3.13, `time.monotonic()` advances in steps of about 16 ms (measured: 0.015625 s), while frames are only 50 ms apart at 20 fps | `time.monotonic()`, which Python 3.13 moved to the same high-resolution clock on Windows |
-| Wrist smoothing | None; the rules measure movement over time windows ([13.4](#134-a-track-for-each-wrist)) | Smoothing makes the position lag behind the hand, and the teleport check (`max_wrist_speed`) must see the raw jumps. The time windows already even out jitter (`test_jittery_palm_still_fires_once`) | A running average of each wrist position that weights recent frames more (an exponential moving average), which the plan had |
-| Unseen movement (review) | Movement counts only across consecutive frames that saw the wrist. A frame without it, or 0.3 s without any frame (`max_gap_s`), starts a new track ([13.4](#134-a-track-for-each-wrist)) | A jump that was never seen may be MoveNet swapping the wrists. With a time limit alone, 1 to 5 missed frames slipped under it | Requiring a minimum number of samples: still samples before and after the gap fill the count |
-| Return-stroke block (review) | The block is measured from the start of the new stroke, and a blocked stroke stays blocked while it keeps moving the same way ([14.3](#143-the-return-stroke)) | A slow return stroke that reaches 1.5 SW only after the block time, or a long one, must not fire | Measuring the block up to the moment the new stroke reaches 1.5 SW: a slow return stroke that began inside the block could fire after it. Downside of the choice: a deliberate opposite swipe that starts within 1.5 s is ignored ([25.2](#252-limitations)) |
+| Wrist smoothing | None; the rules measure movement over time windows ([13.4](#134-a-track-for-each-wrist)) | Smoothing makes the position lag behind the hand, and the teleport check (`max_wrist_jump`) must see the raw jumps. The time windows already even out jitter (`test_jittery_palm_still_fires_once`) | A running average of each wrist position that weights recent frames more (an exponential moving average), which the plan had |
+| Unseen movement (review) | Movement counts only across frames that saw the wrist. 0.3 s without any frame (`max_gap_s`) starts a new track ([13.4](#134-a-track-for-each-wrist)). The review version also restarted after a single missed frame; the recordings on the device changed that to two missed frames in a row (see below) | A jump that was never seen may be MoveNet swapping the wrists. With a time limit alone, 1 to 5 missed frames slipped under it | Requiring a minimum number of samples: still samples before and after the gap fill the count |
+| Return-stroke block (review) | The block is measured from the start of the new stroke, and a blocked stroke stays blocked while it keeps moving the same way ([14.3](#143-the-return-stroke)) | A slow return stroke that reaches the swipe distance only after the block time, or a long one, must not fire | Measuring the block up to the moment the new stroke reaches the swipe distance: a slow return stroke that began inside the block could fire after it. Downside of the choice: a deliberate opposite swipe that starts within 1.5 s is ignored ([25.2](#252-limitations)) |
 | Swipe band (review) | Every sample of a swipe must be inside the chest-to-head band ([13.5](#135-swipe-left-and-swipe-right)) | A pendulum swing has both ends in the band but its middle at hip height | Checking only the ends of the movement |
 | Camera errors (review) | Any error while opening or reading is logged and handled like a lost camera ([17.2](#172-camera-loss-and-reconnect)) | Otherwise an unexpected error would end the camera thread silently, and frames would stop arriving | Letting the error end the camera thread |
 | NPU acceptance (review) | One test inference right after the NPU delegate loads ([12.4](#124-running-movenet-and-reading-the-result)) | The NPU compiles the network at the first inference. A failure there would end the service instead of falling back to the CPU | Accepting the NPU as soon as the delegate loads |
 | Watchdog timing (review) | A deadline: 120 s for startup, then 15 s, renewed on every frame and while the camera is not `running` ([17.4](#174-internal-watchdog)) | Loading the model and the first NPU compilation may take long, and a reconnect loop must survive. A camera that reports `running` but delivers nothing must end the process | One fixed 15 s limit from the start, which a slow NPU startup could exceed |
 | Reconnect pause (review) | Back to 1 s whenever frames arrived during the last connection ([17.2](#172-camera-loss-and-reconnect)) | A camera that streamed and then failed is retried after 1 s, not after a doubled pause | Doubling the pause after every failure, whatever happened in between |
-| Model delivery | `tools/fetch_model.py` downloads the model before the build, and the image contains it ([18.1](#181-the-image)) | One self-contained image to import into Portainer; nothing to copy onto the device | Mounting the model from the device as a volume: one more file to manage on every device |
+| Model delivery | `tools/fetch_model.py` downloads the model before the build, and the image contains it ([18.1](#181-the-image)) | One self-contained image to upload to the device; nothing to copy onto it | Mounting the model from the device as a volume: one more file to manage on every device |
 | Healthcheck location | In `docker-compose.yml` ([17.3](#173-heartbeat-file-and-container-healthcheck)) | Podman builds OCI images by default. They have no field for a healthcheck, so Buildah drops a `HEALTHCHECK` line | A `HEALTHCHECK` line in the `Dockerfile`: lost in Podman's default image format |
 | Webcam address on the laptop | The bridge listens on the WSL adapter address, looked up every time ([18.4](#184-networking-between-windows-podman-and-containers)) | `host.containers.internal` points at the Podman machine, not at Windows. Only this PC can reach the WSL adapter address | Podman's user-mode networking for WSL, `podman machine set --user-mode-networking=true`: not tried. It changes the networking of every running WSL distribution ([podman machine set](https://docs.podman.io/en/latest/markdown/podman-machine-set.1.html)) |
 | Laptop container network | `network_mode: bridge`, Podman's default network ([18.4](#184-networking-between-windows-podman-and-containers)) | The network compose created for each project was isolated, so the gesture container could not reach a broker from another compose project | The per-project network that compose creates: connections to the broker timed out |
 | Laptop latency target | At most one camera frame interval plus inference ([12.2](#122-the-rate-cap)) | Measured p95: 33 to 35 ms with a 30 fps webcam, mostly a frame waiting while the loop sleeps for the rate cap | The plan's 20 ms, which left out that wait |
+| Model on the i.MX | The same `movenet_lightning_int8.tflite` ([10.5](#105-movenet)) | The MoveNet of NXP's eIQ Model Zoo is downloaded from the same TensorFlow Hub address: it is the same file | Converting or re-quantizing a separate i.MX model: nothing to gain before the NPU has been measured |
+| Showing the camera | An MJPEG server inside the service, drawing the skeleton on the pictures it already analysed ([16.5](#165-the-camera-picture-in-a-webbrowser-object)) | A WebBrowser object (Chromium) shows MJPEG with a plain `<img>`: no plug-in, no extra container. Only analysed pictures are drawn, so the skeleton always matches the picture, and nothing is drawn or compressed when nobody watches | Showing the camera's own RTSP stream: browsers cannot play RTSP, the skeleton could not be drawn on it, and the LAN would need a NAT rule to the camera |
+| NPU settings on the device | A separate override file, `docker-compose.npu.yml` ([18.5](#185-the-edge-compose-files)) | Docker refuses to create a container that asks for a missing `/dev/galcore`, so one file cannot serve devices with and without the NPU | One compose file with the device line: fails on the current test device |
+| Image base | `python:3.12-slim-trixie`, one Dockerfile for laptop and device ([18.1](#181-the-image)) | The borrowed NPU libraries need glibc 2.39 or newer, and the device's `tflite_runtime` is built for Python 3.12: the same rules as Part 1 | `python:3.11-slim` (Debian 12, glibc 2.36): too old for the device's libraries |
+| Deploying to the device | Build on the PC, upload the image file and run compose through the device's Docker API at port 2375 (`deploy_tools/deploy_edge.ps1`, [23.10](#2310-run-on-the-optixedge)) | The device has no internet, and the API needs no SSH login. Port 2375 has no password or encryption: acceptable on a test bench LAN only | Portainer's web interface: fine for a person, but cannot be scripted the same way. SSH, as Part 1's script does: needs a login on the device |
+
+**Decisions from the recordings on the device.** On the OptixEdge, with the Tapo C310 at 640 × 360, swipes were never detected, `palm_up` only sometimes and `open_palm` never. To find out why, the keypoints of a real operator were recorded on the device: 120 s with 13 labelled gestures. They were replayed offline through the real `GestureEngine`, and a small script counted hits and false events. Before the changes below: **3 of 13 gestures detected, 5 false events**. After them: **13 of 13, 0 false events**. Two passive recordings, a person standing and a person walking without gestures, give 0 events. This is one small set of recordings ([25.2](#252-limitations)).
+
+| Decision | Choice | Why | Alternative Considered |
+|---|---|---|---|
+| Fitting the frame into the square | A letterbox: shrink the whole frame, pad the rest with black ([12.3](#123-preparing-the-image-for-the-model)) | The centre square of a 16:9 frame loses more than 40 % of its width. The operator's outstretched arm and the end points of every swipe were outside it. Google's MoveNet tutorial pads the same way | The centre-square crop, the earlier choice: the person looks larger, but the sides are lost. Squeezing: changes the body's proportions |
+| Distance limit | `min_shoulder_width` 0.07 of the padded square, was 0.12 ([13.2](#132-the-presence-gate)) | In the letterbox the same person covers less of the square, so the old value would have rejected operators at the same distance | Keeping 0.12: the presence gate would drop the operator |
+| Missed frames | One missed wrist frame is tolerated; two or more in a row start a new track ([13.4](#134-a-track-for-each-wrist)) | During fast moves MoveNet often misses the wrist in a single, blurred frame. Restarting the track there broke real swipes into pieces too short to count | Restarting after any missed frame, the earlier rule. Tolerating more frames: a left–right wrist swap could then look like a swipe |
+| Teleport check | A jump per sighting, `max_wrist_jump` 1.5 SW, replaced the earlier speed limit of 15 SW per second ([13.4](#134-a-track-for-each-wrist)) | Frames arrive in bursts, 0.02 to 0.12 s apart, so a real fast swipe exceeded 15 SW per second. Measured: largest real move between two sightings 1.36 SW, the only glitch 2.18 SW. Any value from 1.0 to 2.0 SW works on the recordings | A higher speed limit: still depends on the timing of the bursts |
+| `open_palm` on release | A still hold only arms the gesture; `open_palm` fires when the hand drops below −1.0 SW within 0.5 s (`palm_lower_s`). A swipe or palm-up from the held hand wins ([13.7](#137-open-palm)) | The pose before a swipe, a hand raised and held still, is exactly a stop sign. Only what follows tells them apart | Firing as soon as the hold is complete, the earlier rule: false `open_palm` events before swipes. Downside of the choice: the dialog opens when the hand comes down ([25.2](#252-limitations)) |
+| Palm in front of the body | New `palm_max_abs_x` 1.0 SW ([13.7](#137-open-palm)) | The end of a swipe, the arm held out to the side, also looked like a stop sign. Real stop signs were held at 0.3 to 0.5 SW from the middle | No sideways limit |
+| Thresholds | `swipe_min_dx` 1.5 → 1.0 SW; `up_min_rise` 1.2 → 0.9 SW; `up_window_s` 0.7 → 0.5 s; `up_end_y` 1.0 → 0.8 SW ([13.5](#135-swipe-left-and-swipe-right), [13.6](#136-palm-up)) | Real swipes travelled 1.0 to 1.3 SW. Real palm-ups rose at least 1.44 SW in 0.35 s, from about y = −0.1 to between +0.9 and +1.5. The shorter window keeps a slow raise from counting. On the recordings, `swipe_min_dx` from 0.7 to 1.2 and `up_end_y` from 0.6 to 1.0 all gave 13 of 13; `up_min_rise` worked from 0.7 to 1.1 | The reasoned design values: too strict for natural movement |
 
 ## 23. How to Run the Gesture Service
 
-These steps run the gesture chain on a Windows laptop with Podman and the built-in webcam: webcam, bridge, gesture container and broker. A third terminal prints the MQTT messages, so you can watch every gesture arrive. FactoryTalk Optix is not needed, because its part is planned but not built yet ([16](#16-factorytalk-optix-integration-planned)).
+These steps run the gesture chain on a Windows laptop with Podman and the built-in webcam: webcam, bridge, gesture container and broker. A third terminal prints the MQTT messages, so you can watch every gesture arrive. FactoryTalk Optix is not needed: the messages are enough to watch every gesture, and the HMI side is described in [16](#16-factorytalk-optix-integration)). To run the service on the OptixEdge with the IP camera instead, go to [23.10](#2310-run-on-the-optixedge).
 
 Every command is a PowerShell command, run from the repository root: the folder that contains this `README.md`. Do the steps in order. The tests in 23.3 are optional.
 
@@ -4466,7 +4674,7 @@ python -m unittest discover -s gesture_recognition\tests -v
 `unittest` is Python's built-in test runner ([21](#21-testing-the-gesture-service)). `discover -s` searches the given folder for test files and runs every test in them, and `-v` (verbose) prints one line per test. The run ends like this (the time varies):
 
 ```text
-Ran 60 tests in 0.661s
+Ran 77 tests in 2.363s
 
 OK
 ```
@@ -4489,7 +4697,7 @@ podman run --rm -v "${root}\tests:/app/tests:ro" gesture_recognition-gesture:loc
 
 - `$root` is the full path of the `gesture_recognition` folder.
 - Podman's `-v` mounts the test folder at `/app/tests` in the container, read-only (`ro`), and `--rm` deletes the container when the command ends.
-- This run does not pass unittest's own `-v`, so it prints one dot per passing test, then the same `Ran 60 tests` and `OK`.
+- This run does not pass unittest's own `-v`, so it prints one dot per passing test, then a `Ran … tests` line and `OK`. (An earlier version of the suite passed this way; the current 77 tests have not been run in the container yet.)
 
 ### 23.4 Start an MQTT broker
 
@@ -4505,7 +4713,7 @@ podman compose -f anomaly_detection\docker-compose.yml up -d mqtt-broker
 
 The broker publishes port 1883 for MQTT and 9001 for MQTT over WebSocket, and accepts clients without a password ([25.2](#252-limitations)).
 
-> ⚠️ **Not used in our tests on this laptop.** Here, the local image `eclipse-mosquitto:2` is the ARM64 version, which an x86-64 laptop cannot run. Running it printed `WARNING: image platform (linux/arm64/v8) does not match the expected platform (linux/amd64)` and then failed with `Exec format error`. The probable cause is the ARM64 download in Part 1's edge steps ([2B](#2b-deploy-on-edge-device-with-portainer-stack)), which stores the image under the same name.
+> ⚠️ **Not used in our tests on this laptop.** Here, the local image `eclipse-mosquitto:2` is the ARM64 version, which an x86-64 laptop cannot run. Running it printed `WARNING: image platform (linux/arm64/v8) does not match the expected platform (linux/amd64)` and then failed with `Exec format error`. The probable cause is the ARM64 download in Part 1's edge steps ([7.8](#78-deploy-on-the-optixedge-with-portainer)), which stores the image under the same name.
 
 Check which architecture your local copy has:
 
@@ -4598,9 +4806,9 @@ The word between `[INFO]` and the colon names the part of the service that wrote
 
 | Gesture | How to make it | The rule |
 |---|---|---|
-| `open_palm` | Raise one hand between chest and face height, forearm up like a "stop" sign, and hold it still for 1 s. Lower the arm to your side before the next one | [13.7](#137-open-palm), [14.1](#141-the-latch-and-its-release) |
+| `open_palm` | Raise one hand in front of your body, between chest and face height, forearm up like a "stop" sign, and hold it still for about 1 s. Then lower the arm to your side: the gesture is reported as the hand comes down | [13.7](#137-open-palm), [14.1](#141-the-latch-and-its-release) |
 | `palm_up` | With the arm hanging at your side, push the hand quickly straight up, above your head, in about half a second | [13.6](#136-palm-up) |
-| `swipe_right`, `swipe_left` | With one hand at chest height, sweep it quickly sideways, over at least one and a half shoulder widths: towards your right for `swipe_right`, towards your left for `swipe_left`. Wait a little more than 1.5 s before swiping the other way | [13.5](#135-swipe-left-and-swipe-right), [14.3](#143-the-return-stroke) |
+| `swipe_right`, `swipe_left` | With one hand at chest height, sweep it quickly sideways, over at least one shoulder width: towards your right for `swipe_right`, towards your left for `swipe_left`. Wait a little more than 1.5 s before swiping the other way | [13.5](#135-swipe-left-and-swipe-right), [14.3](#143-the-return-stroke) |
 
 **Run it in the background instead.** Add `-d`, and read the log with `podman logs`:
 
@@ -4681,7 +4889,7 @@ Either way, the service receives a stop signal and publishes `offline` before it
 | No `Connected to MQTT broker` line, and `MQTT offline: dropped … event` after a gesture | The broker cannot be reached. It is not running, or the host or the port is wrong | Start the broker ([23.4](#234-start-an-mqtt-broker)), and check `MQTT_HOST` and `MQTT_PORT` ([15.5](#155-why-events-are-dropped-while-offline)) |
 | `MQTT connection refused: …` | The broker answers but refuses the service, for example because it requires a user name and password | Use a broker without a login. The service has no login settings |
 | `MQTT disconnected (…); reconnecting`, again and again | Two programs connect with the same client ID, `gesture-recognizer`, and keep pushing each other off the broker | Run only one copy of the service ([15.1](#151-topics)) |
-| `Exec format error` | The image was built for ARM64 | See [23.4](#234-start-an-mqtt-broker) |
+| `Exec format error` | On the laptop: the image was built for ARM64. During the device build: Podman's ARM64 emulation was lost when the Podman machine restarted | Laptop: see [23.4](#234-start-an-mqtt-broker). Device build: `deploy_edge.ps1` registers the emulation again by itself ([23.10](#2310-run-on-the-optixedge)) |
 | The build stops at `COPY models/ models/` | The model was not downloaded | [23.2](#232-download-the-model) |
 | `Checksum mismatch: …` | The download was damaged, or the file on the server changed | Nothing was saved. Try again. If it keeps happening, the file on the server has probably changed |
 | `person=False` in the log, `"person_present": false` in the status | You are too far away or off-centre, or your shoulders are hidden | Come closer, to the middle of the picture ([13.2](#132-the-presence-gate)) |
@@ -4698,9 +4906,93 @@ podman compose -f gesture_recognition\docker-compose.yml up --no-build
 
 `--from` "Overrides the first FROM instruction within the Containerfile" ([podman build](https://docs.podman.io/en/latest/markdown/podman-build.1.html)), so the build uses the local image instead of downloading one. `--no-build` makes compose start the image that was just built. The image on our test laptop was built this way.
 
+### 23.10 Run on the OptixEdge
+
+One script, `gesture_recognition\deploy_tools\deploy_edge.ps1`, does everything from the Windows PC: it builds the ARM64 image, uploads it to the device and starts the service there. The OptixEdge has a closed operating system and no internet, so nothing is built or downloaded on it. The script talks to the device's Docker API at `tcp://10.0.0.42:2375`, over the LAN cable.
+
+> ⚠️ **Port 2375 has no password and no encryption.** Whoever reaches it controls every container on the device. Keep it on the LAN of a test bench, never on a plant or office network.
+
+**The network.** The camera sits on the device's WAN port (Tapo C310 at 192.168.8.66, device WAN 192.168.8.1); the PC sits on the LAN port (device LAN 10.0.0.42). **No 1:1 NAT rule is needed.** The container runs on the device, which reaches the camera directly through its WAN port. The PC never talks to the camera: it sees only the MJPEG stream on port 8081 and the MQTT broker on port 1883, both on the device's LAN address ([11.1](#111-production-on-the-imx-8m-plus)).
+
+**What the PC needs**
+
+| What | Why | Check |
+|---|---|---|
+| The model in `gesture_recognition\models\` | The image contains it ([23.2](#232-download-the-model)) | `python gesture_recognition\tools\fetch_model.py` |
+| Podman (or Docker Desktop with `-Engine docker`) | Builds the ARM64 image with QEMU emulation | `podman --version` |
+| `docker-compose` or `docker` | Starts the service on the device. Podman Desktop installs `docker-compose` | `docker-compose --version` |
+| `curl.exe` | Uploads the image. Part of Windows 10 and 11 | `curl.exe --version` |
+| The LAN cable to the device | The Docker API answers on the LAN side only | `curl.exe http://10.0.0.42:2375/_ping` prints `OK` |
+| The broker on the device | Part 1's stack already runs `eclipse-mosquitto:2` on port 1883 ([7.8](#78-deploy-on-the-optixedge-with-portainer)) | |
+
+**1. Write the camera address in `gesture_recognition\.env`.** This file holds the camera password, so Git ignores it and `.dockerignore` keeps it out of the image. Compose reads it on the PC and passes the address to the container. One line, with your user name and password:
+
+```text
+CAMERA_URL=rtsp://USER:PASSWORD@192.168.8.66:554/stream2
+```
+
+`/stream2` is the camera's low-resolution substream ([19.5](#195-bottlenecks)). The service writes the address in its log with the user name and password replaced by `***`.
+
+**2. Run the script** from the repository root:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File gesture_recognition\deploy_tools\deploy_edge.ps1
+```
+
+It checks the prerequisites, then:
+
+1. starts the Podman machine if needed, and turns the ARM64 emulation back on if a restart of the Podman machine lost it;
+2. builds the image `localhost/gesture_recognition-gesture:edge`. The first build takes 10 to 20 minutes; later builds reuse the cached layers;
+3. saves it to a file of about 360 MB, uploads it to the device and deletes the file;
+4. starts the service with `docker-compose.edge.yml` ([18.5](#185-the-edge-compose-files)), with `MQTT_HOST` set to the device's address;
+5. waits 20 s, prints the last 20 log lines and checks that the MJPEG page answers.
+
+**3. Read the log.** On our CPU-only test device, a good start looked like this (dates and the XNNPACK line removed):
+
+```text
+[npu] /host/usr/lib is not mounted: NPU libraries unavailable, CPU only
+[npu] /dev/galcore is missing (run with --device /dev/galcore): CPU only
+[INFO] stream: MJPEG stream on http://0.0.0.0:8081/ (stream: /stream.mjpg)
+[INFO] pose: MoveNet 192x192 loaded on CPU (runtime: ai_edge_litert)
+[INFO] mqtt_client: Connected to MQTT broker 10.0.0.42:1883
+[INFO] gesture-recognizer: state=starting fps=0.0 inference p50=0.0 ms processing p95=0.0 ms person=False accelerator=cpu
+[INFO] camera: Camera opened: rtsp://***@192.168.8.66:554/stream2
+[INFO] gesture-recognizer: state=running fps=15.0 inference p50=50.6 ms processing p95=79.2 ms person=False accelerator=cpu
+```
+
+The two `[npu]` lines are expected without `-Npu`. A `state=running` line follows every 30 s ([19.3](#193-expected-on-the-imx-8m-plus)).
+
+**4. Check the results from the PC.**
+
+- **The picture:** open `http://10.0.0.42:8081/` in a browser. It shows the camera with the skeleton drawn on it. The same address goes into the FactoryTalk Optix WebBrowser object ([16.5](#165-the-camera-picture-in-a-webbrowser-object)).
+- **The messages:** subscribe to `gesture/paperclip/#` on `10.0.0.42:1883`, for example with MQTT Explorer or `mosquitto_sub -h 10.0.0.42 -t "gesture/paperclip/#" -v` ([23.7](#237-watch-the-messages)). The retained status shows `"state": "running"` and `"accelerator": "cpu"`.
+
+**Options**
+
+| Command (add to the line in step 2) | What it does |
+|---|---|
+| `-Npu` | Adds `docker-compose.npu.yml`: the NPU device, the device's libraries and the graph cache ([18.5](#185-the-edge-compose-files)). **Only on a device with the NPU enabled**: without `/dev/galcore`, Docker refuses to create the container. If the NPU cannot be used, the service falls back to the CPU: the status keeps `"accelerator": "cpu"`, and the log says why with `NPU delegate … unusable (…); falling back to CPU` |
+| `-SkipBuild` | Does not build or upload: only restarts the service with the image already on the device. Combine with `-Npu` to move a device to the NPU |
+| `-Action Logs` | Follows the log. Ctrl+C stops following, not the service |
+| `-Action Status` | Container state, last 10 log lines, and whether the MJPEG page answers |
+| `-Action Down` | Stops and removes the container. The image and the NPU cache stay |
+| `-Action Remove` | After asking, removes the container, the NPU cache volume and the image from the device |
+| `-DeviceIp 10.0.0.50` | Another device. The broker address follows it, unless `-MqttHost` says otherwise |
+| `-Engine docker` | Builds with Docker Desktop instead of Podman |
+
+**Common problems**
+
+| What you see | Likely cause | What to do |
+|---|---|---|
+| `Docker API not reachable at http://10.0.0.42:2375` | No LAN cable, a wrong address, or the API is not enabled on the device | Check the cable and `-DeviceIp` |
+| `Put CAMERA_URL=… in gesture_recognition\.env` | The `.env` file is missing, or has no `CAMERA_URL` line | Step 1 |
+| `Camera … lost; retrying` in the log, never `Camera opened` | Wrong password or address, or the camera is off | Test the same address in VLC from a PC on the camera's network |
+| Compose stops with an error about the device `/dev/galcore` | `-Npu` on a device without the NPU enabled | Deploy again without `-Npu` |
+| `Exec format error` during the build | The ARM64 emulation is missing | The script turns it on by itself. If it still fails, run `podman machine stop`, `podman machine start` and try again |
+
 ## 24. Tuning the Gesture Parameters
 
-Every setting of the gesture service is in `gesture_recognition\config.yaml`, with a comment on each line. This section lists them all, says what each one does, and shows how to change them safely. The gesture values are reasoned design values: none of them has been tuned on recordings of real people yet ([25.2](#252-limitations)).
+Every setting of the gesture service is in `gesture_recognition\config.yaml`, with a comment on each line. This section lists them all, says what each one does, and shows how to change them safely. The gesture values started as reasoned design values. Several were then tuned on one set of keypoints recorded on the device ([22](#22-gesture-decision-log)); that is still a small sample ([25.2](#252-limitations)).
 
 **When a change takes effect.** The service reads the file once, when it starts.
 
@@ -4736,7 +5028,7 @@ Every setting of the gesture service is in `gesture_recognition\config.yaml`, wi
 |---|---|---|---|
 | `model_path` | `models/movenet_lightning_int8.tflite` | The model file, relative to the `gesture_recognition` folder (`/app` in the container) | [23.2](#232-download-the-model) |
 | `use_npu` | `false` | Try the NPU first, and fall back to the CPU if it cannot be used. Usually replaced by `USE_NPU` | [12.4](#124-running-movenet-and-reading-the-result) |
-| `vx_delegate_path` | `/usr/lib/libvx_delegate.so` | Where the NPU delegate file is on the device | [19.4](#194-how-the-npu-will-be-used) |
+| `vx_delegate_path` | `/opt/npu/lib/libvx_delegate.so` | Where the NPU delegate file is inside the container. The entrypoint links it there from the device ([18.1](#181-the-image)) | [19.4](#194-how-the-npu-will-be-used) |
 | `num_threads` | `2` | How many CPU cores the model may use, leaving the others for FactoryTalk Optix | [12.4](#124-running-movenet-and-reading-the-result) |
 | `target_fps` | `20` | The most frames analysed per second: the rate cap. Setting the camera to about this rate saves decoding work and waiting time | [12.2](#122-the-rate-cap), [19.3](#193-expected-on-the-imx-8m-plus) |
 
@@ -4754,17 +5046,24 @@ Every setting of the gesture service is in `gesture_recognition\config.yaml`, wi
 Two warnings about the MQTT settings:
 
 - If you rename a topic, FactoryTalk Optix must subscribe to the new name ([16.1](#161-what-the-hmi-will-need)).
-- `status_interval_s` does more than its name says. It is also the time window for `fps` and `inference_ms`, and it sets how often the heartbeat file is written, which the healthcheck wants younger than 10 s ([17.3](#173-heartbeat-file-and-container-healthcheck)). The planned HMI check expects a status at least every 6 s ([16.2](#162-the-gestureeventmanager-netlogic)), and the log prints every 15th status. Leave it at 2 s unless you adjust those too.
+- `status_interval_s` does more than its name says. It is also the time window for `fps` and `inference_ms`, and it sets how often the heartbeat file is written, which the healthcheck wants younger than 10 s ([17.3](#173-heartbeat-file-and-container-healthcheck)). The HMI heartbeat check expects a status at least every 6 s ([16.2](#162-the-gestureeventmanager-netlogic)), and the log prints every 15th status. Leave it at 2 s unless you adjust those too.
+
+**Picture stream** (`stream:`)
+
+| Setting | Default | What it does | More |
+|---|---|---|---|
+| `port` | `8081` | The port of the MJPEG page and stream. If you change it, change the published port in the compose files too | [16.5](#165-the-camera-picture-in-a-webbrowser-object), [18.5](#185-the-edge-compose-files) |
+| `jpeg_quality` | `70` | From 1 to 100. Lower means fewer bytes on the network and less CPU, but a blockier picture | [16.5](#165-the-camera-picture-in-a-webbrowser-object) |
 
 **Gesture rules: who counts as the operator, and tracking** (`gestures:`)
 
 | Setting | Default | What it does | More |
 |---|---|---|---|
 | `min_keypoint_score` | `0.3` | Keypoints with a lower score are ignored | [10.4](#104-pose-estimation-and-keypoints), [13.2](#132-the-presence-gate) |
-| `min_shoulder_width` | `0.12` | The narrowest shoulder width, as a fraction of the picture. Narrower shoulders mean the person is too far away | [13.2](#132-the-presence-gate) |
-| `max_center_offset` | `0.35` | How far, sideways, the middle of the shoulders may be from the middle of the picture. Farther means a passer-by | [13.2](#132-the-presence-gate) |
-| `max_wrist_speed` | `15.0` | In SW per second. A faster jump is a tracking glitch, and starts a new track. At 20 fps, that is 0.75 SW from one frame to the next | [13.4](#134-a-track-for-each-wrist) |
-| `max_gap_s` | `0.3` | A pause this long between frames, for example a camera hiccup, starts a new track. A frame that misses the wrist always does | [13.4](#134-a-track-for-each-wrist) |
+| `min_shoulder_width` | `0.07` | The narrowest shoulder width, as a fraction of the padded square that MoveNet sees. Narrower shoulders mean the person is too far away | [12.3](#123-preparing-the-image-for-the-model), [13.2](#132-the-presence-gate) |
+| `max_center_offset` | `0.35` | How far, sideways, the middle of the shoulders may be from the middle of the padded square, which is also the middle of the picture. Farther means a passer-by | [13.2](#132-the-presence-gate) |
+| `max_wrist_jump` | `1.5` | In SW, between two sightings of the wrist, whatever the time between them. A longer jump is a tracking glitch, and starts a new track. Measured on the device: real moves up to 1.36 SW, a glitch 2.18 SW | [13.4](#134-a-track-for-each-wrist) |
+| `max_gap_s` | `0.3` | A pause this long between frames, for example a camera hiccup, starts a new track. So do two or more frames in a row that miss the wrist; a single missed frame is tolerated | [13.4](#134-a-track-for-each-wrist) |
 | `lost_s` | `0.5` | A person not seen for this long is forgotten. A hand not seen for this long counts as lowered | [14.1](#141-the-latch-and-its-release), [14.4](#144-forgetting-a-person-or-the-camera) |
 
 **Gesture rules: repeat protection**
@@ -4773,27 +5072,29 @@ Two warnings about the MQTT settings:
 |---|---|---|---|
 | `cooldown_s` | `1.0` | The shortest time between two gestures | [14.1](#141-the-latch-and-its-release) |
 | `opposite_swipe_block_s` | `1.5` | An opposite swipe that starts this soon after a swipe is ignored: it is probably the return stroke | [14.3](#143-the-return-stroke) |
-| `release_y` | `-1.0` | `open_palm` and `palm_up` can fire again only after the hand goes below this height | [14.1](#141-the-latch-and-its-release) |
+| `release_y` | `-1.0` | `open_palm` and `palm_up` can fire again only after the hand goes below this height. `open_palm` itself fires when the held hand drops below it | [13.7](#137-open-palm), [14.1](#141-the-latch-and-its-release) |
 | `max_off_axis_ratio` | `0.5` | Swipes must be mostly sideways and palm-up mostly vertical: the movement in the other direction may be at most half of the main one | [13.5](#135-swipe-left-and-swipe-right), [13.6](#136-palm-up) |
 
 **Gesture rules: the gestures**
 
 | Setting | Default | What it does | More |
 |---|---|---|---|
-| `palm_hold_s` | `1.0` | How long the hand must be held still for `open_palm` | [13.7](#137-open-palm) |
+| `palm_hold_s` | `1.0` | How long the hand must be held still to arm `open_palm` | [13.7](#137-open-palm) |
+| `palm_lower_s` | `0.5` | After the hold, the hand must drop below `release_y` within this time for `open_palm` to fire | [13.7](#137-open-palm) |
 | `palm_zone_min_y`, `palm_zone_max_y` | `-0.6`, `0.8` | The lowest and the highest height of the held hand | [13.7](#137-open-palm) |
+| `palm_max_abs_x` | `1.0` | How far sideways from the middle of the shoulders the held hand may be. Keeps an arm held out after a swipe from counting | [13.7](#137-open-palm) |
 | `palm_still_radius` | `0.2` | How far the held hand may wander from its average position | [13.7](#137-open-palm) |
 | `palm_min_forearm_rise` | `0.3` | How far the wrist must be above the elbow | [13.7](#137-open-palm) |
-| `up_min_rise` | `1.2` | How far the hand must rise for `palm_up` | [13.6](#136-palm-up) |
-| `up_window_s` | `0.7` | The time in which it must rise that far | [13.6](#136-palm-up) |
-| `up_end_y` | `1.0` | The height the hand must reach | [13.6](#136-palm-up) |
-| `swipe_min_dx` | `1.5` | How far the hand must move sideways for a swipe | [13.5](#135-swipe-left-and-swipe-right) |
+| `up_min_rise` | `0.9` | How far the hand must rise for `palm_up` | [13.6](#136-palm-up) |
+| `up_window_s` | `0.5` | The time in which it must rise that far | [13.6](#136-palm-up) |
+| `up_end_y` | `0.8` | The height the hand must reach | [13.6](#136-palm-up) |
+| `swipe_min_dx` | `1.0` | How far the hand must move sideways for a swipe | [13.5](#135-swipe-left-and-swipe-right) |
 | `swipe_window_s` | `0.6` | The time in which it must move that far | [13.5](#135-swipe-left-and-swipe-right) |
 | `swipe_band_min_y`, `swipe_band_max_y` | `-1.2`, `1.0` | The height band that the whole stroke must stay in | [13.5](#135-swipe-left-and-swipe-right) |
 
 The heights side by side are in the table at the end of [13.3](#133-body-coordinates-in-shoulder-widths).
 
-**How to tune.** No recordings exist yet; making them is planned work ([25.3](#253-roadmap)). The steps below are the intended method.
+**How to tune.** The values in the tables were last tuned by recording the keypoints of a real operator on the device and replaying them offline through the real `GestureEngine` ([22](#22-gesture-decision-log)). The script that did this is not part of the repository. The steps below use video files instead, which the service can read directly.
 
 **1. Change one value at a time**, and write down what you changed. Otherwise you cannot tell which change helped.
 
@@ -4823,12 +5124,11 @@ This section gathers in one place what works, what is missing and what comes nex
 
 ### 25.1 Status
 
-In one sentence: the gesture service works on the laptop, and the HMI side and the device come next. The full table is in [9.2](#92-what-is-built-and-what-is-not). In short:
+In one sentence: the gesture service works on the laptop and on the OptixEdge's CPU with the IP camera, and the HMI side and the NPU come next. The full table is in [9.2](#92-what-is-built-and-what-is-not). In short:
 
-- ✅ **Done and verified:** the service on the laptop, from the webcam through MoveNet and the rules to MQTT. It reports its health and recovers from a lost camera. Its 60 unit tests pass, natively and in the container.
-- ⚠️ **Partly verified:** the gestures themselves. The rules are tested with synthetic poses only, and the thresholds are not yet tuned on recordings of real people.
-- 📝 **Designed or written, not run:** the FactoryTalk Optix side ([16](#16-factorytalk-optix-integration-planned)), and the NPU code path with its two device tools ([19.4](#194-how-the-npu-will-be-used)).
-- ❌ **Not started:** the ARM64 image, the edge compose file and the Ethernet IP camera.
+- ✅ **Done and verified:** the service on the laptop, from the webcam through MoveNet and the rules to MQTT. It reports its health and recovers from a lost camera. Its 77 unit tests pass natively; an earlier version of the suite also passed in the container, and the current 77 were not run there again. On the OptixEdge, without NPU: the ARM64 image, the edge compose file and the one-command deploy, with the Tapo C310 on the WAN port, 15 to 16 analysed frames per second and the MJPEG picture with the skeleton on port 8081 ([19.3](#193-expected-on-the-imx-8m-plus), [16.5](#165-the-camera-picture-in-a-webbrowser-object)).
+- ⚠️ **Partly verified:** the gestures themselves. The unit tests use synthetic poses. On the device, one recording of a real operator (120 s, 13 labelled gestures) now gives 13 of 13 gestures and 0 false events, and two recordings without gestures give none ([22](#22-gesture-decision-log)). That is one small set of recordings, not a field test.
+- 📝 **Designed or written, not run:** the FactoryTalk Optix side, two NetLogics that compile but have not run ([16](#16-factorytalk-optix-integration)), and the NPU path with its override file and two device tools ([19.4](#194-how-the-npu-will-be-used)). The test device has no NPU enabled.
 
 ### 25.2 Limitations
 
@@ -4838,34 +5138,36 @@ These limits are known and accepted for now.
 
 - **No fingers.** "Open palm" means a raised, still hand with the forearm up. A fist held the same way also counts ([10.4](#104-pose-estimation-and-keypoints), [13.7](#137-open-palm)). A hand model could fix this ([25.4](#254-adding-gestures-in-the-future)).
 - **One person at a time.** MoveNet SinglePose reports one person, preferring people near the middle of the frame. The presence gate ignores people who are far away or off-centre ([13.2](#132-the-presence-gate)). What happens when two people stand close together in the middle has not been tested.
-- **Fast swipes may be lost.** If motion blur hides the wrist in the middle of a swipe, the track restarts and the swipe does not fire ([13.4](#134-a-track-for-each-wrist), [14.5](#145-known-gaps)).
+- **Fast swipes may still be lost.** One blurred frame is tolerated, but if MoveNet misses the wrist in two or more frames in a row in the middle of a swipe, the track restarts and the swipe does not fire ([13.4](#134-a-track-for-each-wrist), [14.5](#145-known-gaps)).
 
 **Rules**
 
-- **Synthetic tests only.** Every timing and height in the rules comes from computer-generated poses. For example, the rules assume that 1 SW above the shoulder line is about the top of the head, and nobody has checked this on real people ([13.3](#133-body-coordinates-in-shoulder-widths)).
+- **Few real recordings.** The unit tests use computer-generated poses. The thresholds were tuned on one 120 s recording made on the device ([22](#22-gesture-decision-log)); other people, distances, clothing and light have not been tried ([13.3](#133-body-coordinates-in-shoulder-widths)).
+- **`open_palm` is reported only when the hand is lowered.** A deliberate trade-off: it stops the hold before a swipe from firing as a stop sign, but the dialog opens when the hand comes down, not while it is up ([13.7](#137-open-palm), [14.5](#145-known-gaps)).
 - **A quick "back" is ignored.** An opposite swipe that starts within 1.5 s of a swipe is treated as the return stroke, and "next, back" can even become "next, next" ([14.3](#143-the-return-stroke), [14.5](#145-known-gaps)). Operators must pause about 1.5 s before reversing.
 - **Any sideways arm movement at chest height is a swipe**, for example pointing at something or stretching ([14.5](#145-known-gaps)).
 
 **Messages and safety**
 
-- **A late event can still act once.** After a reconnect, an event can arrive twice or late. The planned NetLogic ignores repeats and events older than 5 s, but an event that is late by less than 5 s still acts once ([15.3](#153-qos-1-and-duplicates)).
-- **The broker accepts anyone.** In Part 1's edge stack ([2B](#2b-deploy-on-edge-device-with-portainer-stack)), the broker listens on `0.0.0.0` (every network interface), its ports 1883 and 9001 are published on the device, and `allow_anonymous` is `true`, so no password is needed. Once the HMI side exists, any computer that can reach the broker could send a gesture event that the HMI accepts, for example to turn pages during a demo. There are two possible fixes. One is to make the broker reachable only from the device itself. The other is to require a user name and password, sent over an encrypted **TLS** connection. The service has no login settings yet, so the second fix also needs a code change. The decision is planned for phase 3 ([25.3](#253-roadmap)).
+- **A late event can still act once.** After a reconnect, an event can arrive twice or late. The NetLogic ignores repeats and events older than 5 s, but an event that is late by less than 5 s still acts once ([15.3](#153-qos-1-and-duplicates)).
+- **The broker accepts anyone.** In Part 1's edge stack ([7.8](#78-deploy-on-the-optixedge-with-portainer)), the broker listens on `0.0.0.0` (every network interface), its ports 1883 and 9001 are published on the device, and `allow_anonymous` is `true`, so no password is needed. Once the HMI side exists, any computer that can reach the broker could send a gesture event that the HMI accepts, for example to turn pages during a demo. There are two possible fixes. One is to make the broker reachable only from the device itself. The other is to require a user name and password, sent over an encrypted **TLS** connection. The service has no login settings yet, so the second fix also needs a code change. The decision is planned for phase 3 ([25.3](#253-roadmap)).
 
 **Health and device**
 
-- **Nothing has run on the i.MX 8M Plus yet.** All device times are estimates ([19.3](#193-expected-on-the-imx-8m-plus)), and the NPU path has never been tried ([19.4](#194-how-the-npu-will-be-used)).
+- **The NPU has never run.** The test device has no NPU enabled, so the NPU times are estimates ([19.3](#193-expected-on-the-imx-8m-plus)) and the NPU path has never been tried ([19.4](#194-how-the-npu-will-be-used)). CPU load, memory and temperature next to FactoryTalk Optix were not measured.
 - **A real hang was never observed.** The watchdog was checked with stand-in code (stubs). That the restart policy then restarts the container was not tested ([17.4](#174-internal-watchdog), [17.5](#175-who-notices-what)).
 - **A hang while opening the camera is not caught.** If opening hangs while the state is `starting` or `camera_lost`, the watchdog does not fire ([17.4](#174-internal-watchdog)).
-- **Two startup limits disagree.** The healthcheck allows 60 s for startup, the watchdog 120 s. Both should be aligned once the startup time on the device is measured ([17.3](#173-heartbeat-file-and-container-healthcheck)).
+- **Two startup limits differ on the laptop.** The laptop healthcheck allows 60 s for startup, the watchdog 120 s. On the device both allow 120 s ([18.5](#185-the-edge-compose-files)).
+- **The picture stream has no password.** Anyone on the LAN who can reach port 8081 can watch the camera ([16.5](#165-the-camera-picture-in-a-webbrowser-object)). The same holds for the device's Docker API on port 2375, which the deploy script uses ([23.10](#2310-run-on-the-optixedge)): it gives full control of the device's containers, so it belongs on a test bench only.
 - **The probe does not look for LiteRT.** Check it by hand ([19.4](#194-how-the-npu-will-be-used)).
 - **Two failure cases were not measured:** the last will after a silent network failure, expected after 22.5 s ([15.4](#154-retained-status-and-the-last-will)), and a stopped broker while the whole chain runs ([17.5](#175-who-notices-what)).
 
 **Laptop**
 
 - **The webcam number was not tried.** Directly on Windows, the service ran only with a video file, not with `CAMERA_URL=0` ([23.6](#236-build-and-start-the-container)).
-- **Lower frame rates are untested.** All tests feed 20 fps ([19.3](#193-expected-on-the-imx-8m-plus)).
+- **Lower frame rates are untested.** The tests feed 20 fps, apart from one burst of frames 0.02 s apart ([19.3](#193-expected-on-the-imx-8m-plus)).
 - **The repository's broker did not run on our laptop.** The local `eclipse-mosquitto:2` image was the ARM64 version, so our tests used another broker ([23.4](#234-start-an-mqtt-broker)).
-- **No recordings exist yet.** The tuning method of [24](#24-tuning-the-gesture-parameters) is planned, and replaying recordings inside the container would need a folder mounted into it.
+- **No recording tools in the repository.** The keypoint recordings used for tuning were made with a script that is not part of the repository ([24](#24-tuning-the-gesture-parameters)). Replaying video recordings inside the container would need a folder mounted into it.
 
 ### 25.3 Roadmap
 
@@ -4874,8 +5176,8 @@ The remaining work comes in four phases. Phase 1 builds on the page test of phas
 | Phase | Goal | Work | Done when |
 |---|---|---|---|
 | 0. Open questions | Settle the two questions the design depends on | **On the device:** run `npu_probe.sh` and `bench_pose.py`, then choose path N1, N2 or N3 ([19.4](#194-how-the-npu-will-be-used)). **In FactoryTalk Optix Studio:** a PanelLoader with two pages, its `Panel` linked to a NodeId variable, and a temporary button that changes the variable. Test it with two browsers open ([16.2](#162-the-gestureeventmanager-netlogic)) | A path is chosen, with measured numbers. Both browsers switch pages, or the `ChangePanel` fallback is chosen |
-| 1. HMI on the laptop | The whole chain on the laptop: gesture → MQTT → FactoryTalk Optix → action | The Studio settings ([16.1](#161-what-the-hmi-will-need)) and the `GestureEventManager` NetLogic ([16.2](#162-the-gestureeventmanager-netlogic)). The dialog question of 16.2 is answered here, because it needs the NetLogic. End-to-end tests with two browsers open | Each gesture gives exactly one action in both browsers. A palm held for 10 s opens one dialog. A swipe and its return stroke turn one page. An event sent again with the same `event_id`, and an event whose timestamp is 60 s old, are ignored. A lost camera and a stopped broker show on the HMI |
-| 2. On the device | The same on the i.MX 8M Plus, with MoveNet on the NPU | An ARM64 image and an edge compose file with `network_mode: host` ([11.1](#111-production-on-the-imx-8m-plus)), the NPU settings and a volume for the graph cache ([19.4](#194-how-the-npu-will-be-used)). The NPU path chosen in phase 0. The Ethernet camera, with a low-resolution H.264 substream ([19.5](#195-bottlenecks)). Measurements: frame rate, times, CPU and memory use, and temperature during a 60-minute run next to FactoryTalk Optix. End-to-end latency, by filming the operator and the screen together in slow motion (this also includes the camera's own delay) | The status shows `"accelerator": "npu"`. MoveNet fits in the 50 ms between frames, and frame received → HMI reaction stays below about 100 ms ([19.3](#193-expected-on-the-imx-8m-plus)). Or the differences are measured and documented |
+| 1. HMI on the laptop | The whole chain on the laptop: gesture → MQTT → FactoryTalk Optix → action | **Written:** `GestureModelBuilder` creates the Studio settings ([16.1](#161-what-the-hmi-will-need)) and `GestureEventManager` acts on the messages ([16.2](#162-the-gestureeventmanager-netlogic)); both compile. **Still to do:** run the builder in Studio, then the end-to-end tests. The dialog question of 16.2 is answered here, because it needs the NetLogic. End-to-end tests with two browsers open | Each gesture gives exactly one action in both browsers. A palm held for 10 s, then lowered, opens one dialog. A swipe and its return stroke turn one page. An event sent again with the same `event_id`, and an event whose timestamp is 60 s old, are ignored. A lost camera and a stopped broker show on the HMI |
+| 2. On the device | The same on the i.MX 8M Plus, with MoveNet on the NPU | **Done on the CPU:** the ARM64 image, the edge compose files ([18.5](#185-the-edge-compose-files)), the deploy script ([23.10](#2310-run-on-the-optixedge)), the Tapo C310 on its `/stream2` substream ([19.5](#195-bottlenecks)). **Still to do, on a device with the NPU enabled:** deploy with `-Npu` and check the path chosen in phase 0 ([19.4](#194-how-the-npu-will-be-used)). Measurements: frame rate, times, CPU and memory use, and temperature during a 60-minute run next to FactoryTalk Optix. End-to-end latency, by filming the operator and the screen together in slow motion (this also includes the camera's own delay) | The status shows `"accelerator": "npu"`. MoveNet fits in the 50 ms between frames, and frame received → HMI reaction stays below about 100 ms ([19.3](#193-expected-on-the-imx-8m-plus)). Or the differences are measured and documented |
 | 3. Ready for a trade show | No false gestures in front of visitors | Recordings of each gesture by several people, and of movements that are not gestures: walking past, talking with the hands, two people in the frame. Tuning with these recordings ([24](#24-tuning-the-gesture-parameters)). A booth guide: camera height and angle, a floor mark, lighting, a printed gesture card, the pause before reversing a swipe. The broker access decision ([25.2](#252-limitations)). A folder mount to replay recordings in the container. This README updated with the device numbers | Recordings without gestures give no event, and each gesture recording gives exactly one |
 
 ### 25.4 Adding gestures in the future
@@ -4959,14 +5261,14 @@ The terms of Part 2, grouped by topic and sorted alphabetically within each grou
 | **Mirror** | The setting `mirror: true` flips x, so that positive x is the operator's own right ([13.3](#133-body-coordinates-in-shoulder-widths)). |
 | **MoveNet** | Google's pose-estimation model, published in May 2021. We use SinglePose Lightning, int8, version 4 ([10.5](#105-movenet)). |
 | **Pose estimation** | Finding where a person's body parts are in a picture ([10.4](#104-pose-estimation-and-keypoints)). |
-| **Presence gate** | The three checks a frame must pass before it counts: both shoulders visible (score at least 0.3), at least 0.12 of the picture apart, and the point midway between them at most 0.35 from the middle (x between 0.15 and 0.85). A frame that fails any of them adds nothing to the tracks ([13.2](#132-the-presence-gate)). |
-| **Release line** | `release_y`, −1.0: a line 1 SW below the shoulders. After the cooldown, the latch of a palm gesture is released only when the hand that made it is below this line or has not been seen for 0.5 s (`lost_s`). A swipe's latch is released right after the cooldown ([14.1](#141-the-latch-and-its-release)). |
+| **Presence gate** | The three checks a frame must pass before it counts: both shoulders visible (score at least 0.3), at least 0.07 of the padded square apart, and the point midway between them at most 0.35 from the middle (x between 0.15 and 0.85 of the padded square). A frame that fails any of them adds nothing to the tracks ([13.2](#132-the-presence-gate)). |
+| **Release line** | `release_y`, −1.0: a line 1 SW below the shoulders. After the cooldown, the latch of a palm gesture is released only when the hand that made it is below this line or has not been seen for 0.5 s (`lost_s`). `open_palm` itself fires when a held hand drops below it ([13.7](#137-open-palm)). A swipe's latch is released right after the cooldown ([14.1](#141-the-latch-and-its-release)). |
 | **Return stroke** | The movement back after a swipe. An opposite swipe that starts within 1.5 s of a swipe is treated as one and blocked (`opposite_swipe_block_s`) ([14.3](#143-the-return-stroke)). |
 | **Sample** | One entry of a track: `t` (the time), `x` and `y` in shoulder widths, `quality`, `forearm_up` and `frame` (the number of the `update()` call) ([13.4](#134-a-track-for-each-wrist)). |
 | **Score** | A number from 0 to 1 that says how sure the model is about a point ([10.4](#104-pose-estimation-and-keypoints)). |
 | **Shoulder width (SW)** | The unit of the body coordinates: the distance between the operator's own shoulders. Zero is the middle of the shoulders, and y points up ([13.3](#133-body-coordinates-in-shoulder-widths)). |
 | **SinglePose, MultiPose** | SinglePose finds one person: it picks the highest-scoring person centre, giving more weight to people near the middle of the frame. MultiPose "detects up to 6 poses". We use SinglePose ([10.5](#105-movenet)). |
-| **Track** | The last 1.5 s of one wrist's samples. A new track starts when the previous frame did not see the wrist, when 0.3 s or more passed since the last sample (`max_gap_s`), or when the wrist moved faster than 15 SW per second (`max_wrist_speed`) ([13.4](#134-a-track-for-each-wrist)). |
+| **Track** | The last 1.5 s of one wrist's samples. A new track starts when the wrist was missed in 2 or more frames in a row, when 0.3 s or more passed since the last sample (`max_gap_s`), or when the wrist jumped more than 1.5 SW between two sightings (`max_wrist_jump`) ([13.4](#134-a-track-for-each-wrist)). |
 | **Trimming** | Throwing away every sample of a track except the newest one (`_trim_to_newest`). It happens when a gesture fires, when the latch is released and when a return stroke is blocked, so every new gesture must be made in full ([14.2](#142-trimming)). |
 
 **Model and runtime**
@@ -5006,6 +5308,7 @@ The terms of Part 2, grouped by topic and sorted alphabetically within each grou
 | **FFmpeg** | A widely used video library that OpenCV can use as its backend. The service opens addresses and files through it, with a 5 s open timeout and a 2 s read timeout ([17.2](#172-camera-loss-and-reconnect)). |
 | **Frame, fps** | A frame is one picture of a video; fps (frames per second) says how many arrive each second ([10.8](#108-video-basics)). |
 | **H.264** | A video format that stores mostly the differences between frames: much less bandwidth than MJPEG, but a more complex decoder ([10.8](#108-video-basics)). |
+| **Letterbox** | Fitting a picture into a square without cutting or stretching it: shrink it until its long side fits, then fill the rest with black bands. `pose.py` does this before MoveNet, so MoveNet's x and y are fractions of the padded square ([12.3](#123-preparing-the-image-for-the-model)). |
 | **MJPEG** | Motion JPEG: a video stream in which every frame is a separate JPEG picture. The webcam bridge serves one over HTTP ([10.8](#108-video-basics)). |
 | **OpenCV** | The library that reads the camera. `cv2.VideoCapture` accepts a webcam number, an HTTP MJPEG address, an RTSP address or a file ([10.8](#108-video-basics)). |
 | **Pixel** | One dot of a picture: three numbers (red, green, blue), each from 0 to 255 ([10.3](#103-what-a-computer-sees-in-an-image)). |
@@ -5052,7 +5355,7 @@ The terms of Part 2, grouped by topic and sorted alphabetically within each grou
 | **Buildah** | The tool Podman uses to build images. It drops a Dockerfile's `HEALTHCHECK` when it builds an OCI image ([17.3](#173-heartbeat-file-and-container-healthcheck)). |
 | **Compose file** | A YAML file that describes how to build and run containers: build, image, network mode, environment, healthcheck and restart policy ([18.2](#182-the-compose-file)). |
 | **Compose provider** | The program that actually reads compose files. Podman's documentation calls `podman compose` "a thin wrapper around an external compose provider such as docker-compose or podman-compose" ([23.1](#231-prerequisites)). |
-| **Docker** | A tool that packages an application with everything it needs into containers, explained in [2.4](#24-what-is-docker-briefly). Podman runs the same images and compose files ([18](#18-containers-and-the-laptop-setup)). |
+| **Docker** | A tool that packages an application with everything it needs into containers, explained in [2.4](#24-what-is-docker). Podman runs the same images and compose files ([18](#18-containers-and-the-laptop-setup)). |
 | **Dockerfile** | The recipe for a container image: base image, `pip install`, `COPY`, `CMD` ([18.1](#181-the-image)). |
 | **Environment variable** | A named setting handed to a program from outside. `CAMERA_URL`, `MQTT_HOST`, `MQTT_PORT` and `USE_NPU`, when set and not empty, replace `camera.url`, `mqtt.broker_host`, `mqtt.broker_port` and `model.use_npu` ([24](#24-tuning-the-gesture-parameters)). |
 | **`host.containers.internal`** | A name that containers can use to reach their host. With Podman on Windows, it points at the Podman machine, not at Windows ([18.4](#184-networking-between-windows-podman-and-containers)). |
@@ -5065,7 +5368,7 @@ The terms of Part 2, grouped by topic and sorted alphabetically within each grou
 | **Podman** | A container tool whose commands mirror Docker's. This project uses it on the laptop ([18](#18-containers-and-the-laptop-setup)). |
 | **Podman machine** | The small Linux virtual machine that Podman creates with WSL2 on Windows. The containers run inside it ([18](#18-containers-and-the-laptop-setup)). |
 | **Port, published port** | A port is a numbered door for network connections. When a container publishes a port, such as the broker's `"1883:1883"`, Podman forwards it to Windows ([18.4](#184-networking-between-windows-podman-and-containers)). |
-| **Portainer** | A web interface for managing containers. Part 1 uses it on the edge device to import images (**Images** → **Import**), add stacks (**Stacks** → **Add stack**) and check logs ([2B](#2b-deploy-on-edge-device-with-portainer-stack)). |
+| **Portainer** | A web interface for managing containers. Part 1 uses it on the edge device to import images (**Images** → **Import**), add stacks (**Stacks** → **Add stack**) and check logs ([7.8](#78-deploy-on-the-optixedge-with-portainer)). |
 | **WSL adapter address** | The address of Windows on the virtual adapter `vEthernet (WSL…)`. Only this PC can reach it, and it can change after a reboot ([18.4](#184-networking-between-windows-podman-and-containers)). |
 | **WSL2** | Windows Subsystem for Linux, version 2. The Podman machine runs on it. It does not see the laptop's USB devices ([18](#18-containers-and-the-laptop-setup), [18.3](#183-why-the-webcam-needs-a-bridge)). |
 | **x86-64, ARM64** | Two processor families with different instruction sets. The laptop is x86-64 (`linux/amd64`: 64-bit Intel and AMD); the device is ARM64. An image is built for one of them: here, the laptop could not run the ARM64 Mosquitto image ([18.1](#181-the-image), [23.4](#234-start-an-mqtt-broker)). |
@@ -5074,15 +5377,15 @@ The terms of Part 2, grouped by topic and sorted alphabetically within each grou
 
 | Term | Definition |
 |---|---|
-| **Dialog** | A popup window, defined as a `DialogType`. `UICommands.OpenDialog` opens it in one session ([16](#16-factorytalk-optix-integration-planned)). |
-| **Dynamic link** | A connection that makes a variable or property follow another one: change the source, and the linked value follows ([16](#16-factorytalk-optix-integration-planned)). |
-| **GestureEventManager** | The planned NetLogic that reads the gesture and status messages. It checks each event, then opens the dialog, shows the message or changes the page, and it watches the service's heartbeat ([16.2](#162-the-gestureeventmanager-netlogic)). |
-| **Model variable** | A named value in the project's `Model` folder. Screens can show it; logic can read and write it ([16](#16-factorytalk-optix-integration-planned)). |
-| **NodeId** | The unique identifier of a node: a variable, an object, a screen ([16](#16-factorytalk-optix-integration-planned)). |
-| **PanelLoader** | A container that shows one of several panels at a time. Its `Panel` property, a NodeId, says which one; its `ChangePanel` method switches to another ([16](#16-factorytalk-optix-integration-planned)). |
-| **`PlainTextSubscription`** | Part of the MQTT client built into FactoryTalk Optix since version 1.6. It writes the text of each message on one topic into a Model variable ([16](#16-factorytalk-optix-integration-planned)). |
-| **Session** | One running copy of the HMI user interface. The Web Presentation Engine can have several at once, for example one per connected browser ([16](#16-factorytalk-optix-integration-planned)). |
-| **Web Presentation Engine** | The part of FactoryTalk Optix that shows the HMI in web browsers. In this project it also serves the 3-D twin page on port 8080 ([4](#4-architecture--data-flow), [16](#16-factorytalk-optix-integration-planned)). |
+| **Dialog** | A popup window, defined as a `DialogType`. `UICommands.OpenDialog` opens it in one session ([16](#16-factorytalk-optix-integration)). |
+| **Dynamic link** | A connection that makes a variable or property follow another one: change the source, and the linked value follows ([16](#16-factorytalk-optix-integration)). |
+| **GestureEventManager** | The runtime NetLogic that reads the gesture and status messages. It checks each event, then opens the dialog, shows the message or changes the page, and it watches the service's heartbeat ([16.2](#162-the-gestureeventmanager-netlogic)). |
+| **Model variable** | A named value in the project's `Model` folder. Screens can show it; logic can read and write it ([16](#16-factorytalk-optix-integration)). |
+| **NodeId** | The unique identifier of a node: a variable, an object, a screen ([16](#16-factorytalk-optix-integration)). |
+| **PanelLoader** | A container that shows one of several panels at a time. Its `Panel` property, a NodeId, says which one; its `ChangePanel` method switches to another ([16](#16-factorytalk-optix-integration)). |
+| **`PlainTextSubscription`** | Part of the MQTT client built into FactoryTalk Optix since version 1.6. It writes the text of each message on one topic into a Model variable ([16](#16-factorytalk-optix-integration)). |
+| **Session** | One running copy of the HMI user interface. The Web Presentation Engine can have several at once, for example one per connected browser ([16](#16-factorytalk-optix-integration)). |
+| **Web Presentation Engine** | The part of FactoryTalk Optix that shows the HMI in web browsers. In this project it also serves the 3-D twin page on port 8080 ([4](#4-architecture--data-flow), [16](#16-factorytalk-optix-integration)). |
 
 **The i.MX 8M Plus and its NPU software**
 
@@ -5111,10 +5414,10 @@ The terms of Part 2, grouped by topic and sorted alphabetically within each grou
 | **SHA-256** | A fingerprint (hash) of a file, 64 hexadecimal characters long. Checking it makes sure that every machine runs a byte-identical model file ([20.2](#202-the-most-important-lines)). |
 | **Signal** | A short notice the operating system delivers to a program. Ctrl+C sends `SIGINT`; `podman stop` first sends `SIGTERM` ([20.2](#202-the-most-important-lines)). |
 | **Stub** | A minimal stand-in. Stubs for the camera, the model and the publisher were used to check the watchdog ([17.4](#174-internal-watchdog)). |
-| **Synthetic pose** | A pose made up by the test code instead of coming from a camera. All timings in sections 13 and 14 come from synthetic poses ([21.1](#211-synthetic-poses-and-injected-time)). |
+| **Synthetic pose** | A pose made up by the test code instead of coming from a camera. The timings in sections 13 and 14 come from synthetic poses; the thresholds were tuned on keypoints recorded on the device ([21.1](#211-synthetic-poses-and-injected-time), [22](#22-gesture-decision-log)). |
 | **Test-first** | Writing the tests before the code, also called test-driven development. The first run failed with an `ImportError`, as it should: the "red" step ([21.3](#213-test-first-and-the-mutation-check)). |
 | **Traceback** | Python's error report: the chain of calls that led to the error ([23.3](#233-run-the-unit-tests)). |
-| **Unit test** | A small automatic check of one piece of code. The service has 60, written with Python's `unittest` ([21](#21-testing-the-gesture-service)). |
+| **Unit test** | A small automatic check of one piece of code. The service has 77, written with Python's `unittest` ([21](#21-testing-the-gesture-service)). |
 | **Virtual environment** | A folder with its own set of installed Python packages, separate from the main Python installation ([23.1](#231-prerequisites)). |
 | **Wheel** | A ready-built package file: pip copies it into place instead of compiling source code ([19.2](#192-why-litert)). |
 
@@ -5194,6 +5497,6 @@ The outside pages that Part 2 relies on, grouped by topic. Each entry says what 
 
 **FactoryTalk Optix**
 
-- [NetLogic cheat sheet](https://github.com/FactoryTalk-Optix/NetLogic_CheatSheet): the MQTT client since version 1.6 and `PlainTextSubscription`; `VariableChange` handlers and the mandatory `-=` in `Stop()`; FactoryTalk Optix tasks instead of `async`/`await`; the warning for a `Start()` over 2000 ms; opening a dialog in every web session ([16](#16-factorytalk-optix-integration-planned), [16.2](#162-the-gestureeventmanager-netlogic)).
-- [PanelLoader reference](https://help.optix.cloud.rockwellautomation.com/1.4.1.7/en/Reference/FTOptix-UI/ObjectTypes/PanelLoader.html) (FactoryTalk Optix help): the `Panel` property and the `ChangePanel` method ([16](#16-factorytalk-optix-integration-planned)).
+- [NetLogic cheat sheet](https://github.com/FactoryTalk-Optix/NetLogic_CheatSheet): the MQTT client since version 1.6 and `PlainTextSubscription`; `VariableChange` handlers and the mandatory `-=` in `Stop()`; FactoryTalk Optix tasks instead of `async`/`await`; the warning for a `Start()` over 2000 ms; opening a dialog in every web session ([16](#16-factorytalk-optix-integration), [16.2](#162-the-gestureeventmanager-netlogic)).
+- [PanelLoader reference](https://help.optix.cloud.rockwellautomation.com/1.4.1.7/en/Reference/FTOptix-UI/ObjectTypes/PanelLoader.html) (FactoryTalk Optix help): the `Panel` property and the `ChangePanel` method ([16](#16-factorytalk-optix-integration)).
 - [Optix_Sample_PanelLoaderChangePanelNetLogic](https://github.com/FactoryTalk-Optix/Optix_Sample_PanelLoaderChangePanelNetLogic) (Rockwell sample): switching pages with `ChangePanel` from NetLogic, the fallback ([16.2](#162-the-gestureeventmanager-netlogic), [22](#22-gesture-decision-log)).

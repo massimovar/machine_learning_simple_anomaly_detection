@@ -14,7 +14,7 @@ WHY THIS FILE EXISTS:
     - for this tiny model the CPU may well win: moving data to the NPU and
       back costs more than ~3,500 multiply-adds. That is the lesson, not a bug.
 
-HOW A BENCHMARK CALL FLOWS (README §30.4):
+HOW A BENCHMARK CALL FLOWS:
     FTOptix button -> NpuStatusManager.RequestBenchmark() publishes
     {"cmd":"benchmark","runs":N} on anomaly/paperclip/cmd -> main.handle_command
     starts a worker thread -> run_benchmark() below -> the result is published
@@ -41,6 +41,7 @@ WHY MORE RUNS DO NOT MAKE THE NPU WIN:
     (ours: 3,328).
 """
 
+import os
 import time
 
 import numpy as np
@@ -79,29 +80,22 @@ def time_runs(engine, vector: np.ndarray, runs: int) -> dict:
     }
 
 
-def run_benchmark(main_engine, cpu_engine, vector: np.ndarray, runs: int, read_counters=None) -> dict:
-    """Time cpu_engine, then main_engine (the NPU one when available).
-
-    read_counters: optional callable returning the driver counters; it is
-    called right before and right after the main engine's runs.
-    """
+def run_benchmark(main_engine, cpu_engine, vector: np.ndarray, runs: int) -> dict:
+    """Time cpu_engine, then main_engine (the NPU one when available)."""
     # Never trust the request: at least 1 run, at most MAX_RUNS.
     runs = max(1, min(int(runs), MAX_RUNS))
     vector = np.asarray(vector, dtype=np.float32)
 
     # CPU first, then the main engine, one after the other (never in parallel,
-    # so they do not compete for the CPU). The counters bracket ONLY the main
-    # engine's runs: any NPU activity between them belongs to this benchmark.
+    # so they do not compete for the CPU).
     cpu = time_runs(cpu_engine, vector, runs)
-    before = read_counters() if read_counters else None
     main = time_runs(main_engine, vector, runs)
-    after = read_counters() if read_counters else None
 
-    # Same model, same input: the outputs must almost match. 0.0 on this model
-    # (README §31); a large value would mean the NPU computes something else.
+    # Same model, same input: the outputs must almost match. 0.0 on this model;
+    # a large value would mean the NPU computes something else.
     difference = float(np.max(np.abs(cpu.pop("_output") - main.pop("_output"))))
     result = {
-        "model": main_engine.describe()["model"],
+        "model": os.path.basename(main_engine.model_path),
         "precision": main_engine.precision,
         "runs": runs,
         "cpu": cpu,
@@ -109,8 +103,6 @@ def run_benchmark(main_engine, cpu_engine, vector: np.ndarray, runs: int, read_c
         "npu_unavailable": None if main_engine.accelerator == "npu" else (
             main_engine.npu_error or "NPU not requested (USE_NPU=false)"),
         "max_output_difference": round(difference, 6),
-        "counters_before": before,
-        "counters_after": after,
     }
     if result["npu"]:
         # > 1 means the NPU is slower than the CPU for one inference of this model.

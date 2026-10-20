@@ -32,6 +32,9 @@ data/
 # Exported image archives (hundreds of MB; never part of an image)
 *.tar
 
+# Deploy scripts run on the PC, never inside the container
+deploy_tools/
+
 # Editor / OS noise
 .venv/
 *.env

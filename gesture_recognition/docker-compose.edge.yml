@@ -1,0 +1,48 @@
+# ============================================================================
+# docker-compose.edge.yml — the gesture service on the OptixEdge (arm64, CPU)
+# ============================================================================
+# The image is built on the PC and shipped as a file (the device has no
+# internet); for the NPU add docker-compose.npu.yml on top of this file.
+#
+# Easiest: deploy_tools/deploy_edge.ps1 (build, ship, start, logs, status).
+# By hand, from this folder (Docker API of the device, LAN side only):
+#   $env:DOCKER_HOST = "tcp://10.0.0.42:2375"
+#   $env:MQTT_HOST   = "10.0.0.42"
+#   docker-compose -p gesture_recognition -f docker-compose.edge.yml up -d
+#
+# CAMERA_URL holds the camera password, so it is never written here: put it
+# in gesture_recognition/.env (ignored by Git and by the image), e.g.
+#   CAMERA_URL=rtsp://user:password@192.168.8.66:554/stream2
+# docker-compose reads that file on the PC and sends only the value.
+# ============================================================================
+services:
+  gesture:
+    # localhost/ prefix: Podman names local builds this way and `docker load`
+    # keeps the name.  `never`: the image is not in any registry.
+    image: localhost/gesture_recognition-gesture:edge
+    pull_policy: never
+    platform: linux/arm64
+    ports:
+      - "8081:8081"     # MJPEG for the FT Optix WebBrowser object (8080 is FT Optix itself)
+    environment:
+      - CAMERA_URL=${CAMERA_URL:?put CAMERA_URL in gesture_recognition/.env}
+      # WHY the device's own IP: rootless Docker on the OptixEdge cannot reach
+      # the host through host-gateway; the broker's published port on the
+      # device's IP works from every container.
+      - MQTT_HOST=${MQTT_HOST:?set MQTT_HOST to the broker address, e.g. the device IP}
+      - MQTT_PORT=${MQTT_PORT:-1883}
+      - USE_NPU=false
+    # WHY here and not in the Dockerfile: Podman builds OCI images, which
+    # drop a Dockerfile HEALTHCHECK.  main.py rewrites the file every 2 s.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,tempfile,time; sys.exit(time.time() - os.path.getmtime(os.path.join(tempfile.gettempdir(), 'gesture_heartbeat')) > 10)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

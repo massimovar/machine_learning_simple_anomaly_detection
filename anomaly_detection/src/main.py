@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import sys
@@ -9,10 +10,9 @@ import yaml
 
 import npu_evidence
 from benchmark import run_benchmark
-from detector import detect, load_threshold
-from model import InferenceEngine, resolve_model_settings
-from mqtt_client import create_client, publish_alert, publish_json, publish_status
-from preprocessing import SampleBuffer, aggregate_window, load_scaler, normalise
+from model import InferenceEngine
+from mqtt_client import create_client, publish
+from preprocessing import SampleBuffer, load_scaler, normalise
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,29 +22,40 @@ logging.basicConfig(
 logger = logging.getLogger("anomaly-detector")
 
 
+def alert_payload(score: float, threshold: float, engine) -> dict:
+    # The first three keys are the V1 contract; the evidence keys are appended after them.
+    return {
+        "is_anomaly": score > threshold,
+        "anomaly_score": round(score, 6),
+        "threshold": round(threshold, 6),
+        "accelerator": engine.accelerator,
+        "precision": engine.precision,
+        "inference_ms": round(engine.inference_ms, 4),
+    }
+
+
 def main():
     with open("config.yaml", "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
+    mqtt_cfg, prep_cfg, model_cfg = config["mqtt"], config["preprocessing"], config["model"]
 
-    mqtt_cfg = config["mqtt"]
-    prep_cfg = config["preprocessing"]
-    model_cfg = config["model"]
-
-    settings = resolve_model_settings(model_cfg)
-    engine = InferenceEngine(settings["model_path"], use_npu=settings["use_npu"],
-                             vx_delegate_path=settings["vx_delegate_path"])
+    use_npu = os.environ.get("USE_NPU", str(model_cfg["use_npu"])).strip().lower() in ("1", "true", "yes", "on")
+    # The NPU computes in integers, so it gets the int8 model; the CPU the float32 original.
+    # If the NPU then fails, the SAME int8 model runs on the CPU, so the threshold still matches.
+    variant = model_cfg["int8" if use_npu else "float32"]
+    engine = InferenceEngine(variant["model_path"], use_npu=use_npu,
+                             vx_delegate_path=os.environ.get("VX_DELEGATE_PATH", model_cfg["vx_delegate_path"]))
+    # Benchmark reference: the SAME model file, forced to the CPU.
+    cpu_engine = InferenceEngine(variant["model_path"], use_npu=False)
+    with open(variant["threshold_path"], "r", encoding="utf-8") as f:
+        threshold = float(json.load(f)["threshold"])
     scaler = load_scaler(model_cfg["scaler_path"])
-    threshold = load_threshold(settings["threshold_path"])
     buffer = SampleBuffer(prep_cfg["window_size"], prep_cfg["tag_names"])
     started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-    # Benchmark state, shared by the MQTT thread and the benchmark thread:
-    #   cpu_engine  - a second interpreter on the SAME model file, forced to CPU;
-    #                 created on the first benchmark (costs RAM only if used).
-    #   running     - True while a benchmark thread is alive; one at a time.
-    #   last_vector - the last real, normalised window: benchmarking real data.
-    # bench_lock protects "running" (check-and-set must be one atomic step).
-    bench = {"cpu_engine": None, "running": False, "last_vector": None}
+    # The benchmark times the last real window; before the first one, the middle of the normal range.
+    last_vector = np.full(len(prep_cfg["tag_names"]), 0.5, dtype=np.float32)
+    # Held while a benchmark runs: two quick clicks must not start two benchmarks
+    # that would compete for the CPU and distort each other.
     bench_lock = threading.Lock()
 
     def status_payload() -> dict:
@@ -58,40 +69,24 @@ def main():
         }
 
     def handle_sensor_message(sensor_data: dict) -> None:
-        window = buffer.add(sensor_data)
-        if window is None:
+        nonlocal last_vector
+        window_mean = buffer.add(sensor_data)
+        if window_mean is None:
             return
-
-        feature_vector = aggregate_window(window)
-        normalised = normalise(feature_vector, scaler)
-        bench["last_vector"] = normalised
-        result = detect(engine, normalised, threshold)
-
-        message = f"score={result.score:.6f} threshold={result.threshold:.6f} on {engine.accelerator}"
-        if result.is_anomaly:
+        last_vector = normalise(window_mean, scaler)
+        alert = alert_payload(engine.score(last_vector), threshold, engine)
+        message = f"score={alert['anomaly_score']:.6f} threshold={alert['threshold']:.6f} on {engine.accelerator}"
+        if alert["is_anomaly"]:
             logger.warning("Anomaly detected: %s", message)
         else:
             logger.info("Normal: %s", message)
-
-        evidence = {
-            "accelerator": engine.accelerator,
-            "precision": engine.precision,
-            "inference_ms": round(engine.inference_ms, 4),
-        }
-        publish_alert(mqtt_client, mqtt_cfg["alert_topic"], result.to_alert_json(evidence))
+        publish(mqtt_client, mqtt_cfg["alert_topic"], alert)
 
     def benchmark_worker(runs: int) -> None:
-        """Runs in its own thread: time CPU vs main engine, publish the result, free the slot."""
         try:
-            if bench["cpu_engine"] is None:
-                bench["cpu_engine"] = InferenceEngine(settings["model_path"], use_npu=False)
-            vector = bench["last_vector"]
-            if vector is None:
-                # No window seen yet: the middle of the normal range.
-                vector = np.full(model_cfg["input_size"], 0.5, dtype=np.float32)
             # Meanwhile the sensor handler keeps running: each reconstruct() takes
             # the engine lock, so a window arriving mid-benchmark waits < 1 ms.
-            result = run_benchmark(engine, bench["cpu_engine"], vector, runs, npu_evidence.read_counters)
+            result = run_benchmark(engine, cpu_engine, last_vector, runs)
             result["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             logger.info("Benchmark: cpu p50 %.4f ms, npu %s", result["cpu"]["p50_ms"],
                         f"p50 {result['npu']['p50_ms']:.4f} ms" if result["npu"] else result["npu_unavailable"])
@@ -99,28 +94,21 @@ def main():
             logger.error("Benchmark failed: %s", exc)
             result = {"error": str(exc)}
         finally:
-            # Always free the slot, even after an error, or no benchmark could run again.
-            with bench_lock:
-                bench["running"] = False
-        publish_json(mqtt_client, mqtt_cfg["benchmark_topic"], result)
+            bench_lock.release()
+        publish(mqtt_client, mqtt_cfg["benchmark_topic"], result)
         # The first NPU compile may have just written a graph-cache file.
-        publish_status(mqtt_client, mqtt_cfg["status_topic"], status_payload())
+        publish(mqtt_client, mqtt_cfg["status_topic"], status_payload(), retain=True)
 
     def handle_command(command: dict) -> None:
-        """Called by the MQTT client for every JSON message on the cmd topic."""
         if command.get("cmd") != "benchmark":
             logger.warning("Unknown command ignored: %s", command)
             return
-        # Check-and-set under the lock: two quick clicks must not start two
-        # benchmarks that would compete for the CPU and distort each other.
-        with bench_lock:
-            if bench["running"]:
-                publish_json(mqtt_client, mqtt_cfg["benchmark_topic"], {"error": "benchmark already running"})
-                return
-            bench["running"] = True
+        if not bench_lock.acquire(blocking=False):
+            publish(mqtt_client, mqtt_cfg["benchmark_topic"], {"error": "benchmark already running"})
+            return
         # WHY a thread: the MQTT loop must keep receiving the 1 Hz sensor data.
         # daemon=True: a running benchmark never blocks the container from stopping.
-        # "runs" is clamped later by run_benchmark (1..MAX_RUNS).
+        # "runs" is clamped by run_benchmark (1..MAX_RUNS).
         threading.Thread(target=benchmark_worker, args=(command.get("runs", 1000),), daemon=True).start()
 
     mqtt_client = create_client(
@@ -129,12 +117,11 @@ def main():
         client_id=mqtt_cfg["client_id"],
         sensor_topic=mqtt_cfg["sensor_topic"],
         on_sensor_message=handle_sensor_message,
-        status_topic=mqtt_cfg["status_topic"],
-        status_payload=status_payload,
         command_topic=mqtt_cfg["command_topic"],
         on_command=handle_command,
+        status_topic=mqtt_cfg["status_topic"],
+        status_payload=status_payload,
     )
-
     logger.info("Anomaly detector running")
     mqtt_client.loop_forever()
 

@@ -4,16 +4,15 @@ services:
     ports:
       - "1883:1883"
       - "9001:9001"
-    environment:
-      - MOSQUITTO_LISTENER=1883 0.0.0.0
-      - MOSQUITTO_ALLOW_ANONYMOUS=true
+    # WHY inline and not a mounted mosquitto.conf: a Portainer web-editor stack,
+    # or a compose run against a remote DOCKER_HOST, has no local file to mount.
     command:
       - /bin/sh
       - -c
       - |
         cat > /tmp/mosquitto.conf <<EOF
-        listener $${MOSQUITTO_LISTENER}
-        allow_anonymous $${MOSQUITTO_ALLOW_ANONYMOUS}
+        listener 1883 0.0.0.0
+        allow_anonymous true
         listener 9001 0.0.0.0
         protocol websockets
         EOF

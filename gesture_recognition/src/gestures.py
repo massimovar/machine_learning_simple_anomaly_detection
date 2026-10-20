@@ -7,7 +7,8 @@ WHY THIS FILE EXISTS:
     watches the two wrists over time and decides when the person made one
     of four gestures:
 
-        open_palm    hand held still at shoulder/face height ("stop sign")
+        open_palm    hand held still at shoulder/face height ("stop sign"),
+                     reported when the hand is lowered
         palm_up      hand pushed up above the head
         swipe_left   hand moved quickly to the user's left
         swipe_right  hand moved quickly to the user's right
@@ -56,9 +57,9 @@ class GestureConfig:
     Each field is documented in config.yaml (section "gestures").
     """
     min_keypoint_score: float = 0.3
-    min_shoulder_width: float = 0.12
+    min_shoulder_width: float = 0.07
     max_center_offset: float = 0.35
-    max_wrist_speed: float = 15.0
+    max_wrist_jump: float = 1.5
     max_gap_s: float = 0.3
     lost_s: float = 0.5
     cooldown_s: float = 1.0
@@ -68,12 +69,14 @@ class GestureConfig:
     palm_hold_s: float = 1.0
     palm_zone_min_y: float = -0.6
     palm_zone_max_y: float = 0.8
+    palm_max_abs_x: float = 1.0
     palm_still_radius: float = 0.2
     palm_min_forearm_rise: float = 0.3
-    up_min_rise: float = 1.2
-    up_window_s: float = 0.7
-    up_end_y: float = 1.0
-    swipe_min_dx: float = 1.5
+    palm_lower_s: float = 0.5
+    up_min_rise: float = 0.9
+    up_window_s: float = 0.5
+    up_end_y: float = 0.8
+    swipe_min_dx: float = 1.0
     swipe_window_s: float = 0.6
     swipe_band_min_y: float = -1.2
     swipe_band_max_y: float = 1.0
@@ -114,6 +117,7 @@ class GestureEngine:
         self._latch: Optional[tuple] = None        # (gesture, side, t)
         self._last_swipe: Optional[tuple] = None   # (gesture, t)
         self._blocked_stroke = {side: 0 for side in ARMS}   # +1/-1: blocked stroke moving right/left
+        self._palm_held = {side: None for side in ARMS}     # (t, window) of the last valid palm hold
 
     @property
     def person_present(self) -> bool:
@@ -149,7 +153,7 @@ class GestureEngine:
 
         best = None
         for side in fresh:
-            found = self._detect(self._tracks[side])
+            found = self._detect(side)
             if found is None:
                 continue
             gesture, window = found
@@ -167,6 +171,7 @@ class GestureEngine:
 
         gesture, side, confidence = best
         self._latch = (gesture, side, t)
+        self._palm_held = {s: None for s in ARMS}
         if gesture in OPPOSITE_SWIPE:
             self._last_swipe = (gesture, t)
         self._trim_to_newest(*ARMS)   # the same motion can never trigger twice
@@ -205,14 +210,18 @@ class GestureEngine:
             last = track[-1]
             dt = t - last.t
             # WHY: a movement must be seen to count.  Motion is measured only
-            # across consecutive frames that saw this wrist: a wrist missed in
-            # a frame (blur, low score, person not gated) or after a camera
-            # hiccup may reappear elsewhere (e.g. MoveNet swapping left and
-            # right), and a wrist that "teleports" between two frames is the
-            # same glitch.  The last sighting stays in the track until then,
-            # so a hand unseen for a moment does not count as lowered.
-            if (last.frame != self._frame - 1 or dt >= c.max_gap_s
-                    or math.hypot(x - last.x, y - last.y) > c.max_wrist_speed * max(dt, 1e-3)):
+            # across frames that saw this wrist, with at most ONE frame missed
+            # in between: a single blurred frame during a fast move is normal
+            # (measured on the device), but a wrist missed for longer (low
+            # score, person not gated) or after a camera hiccup may reappear
+            # elsewhere (e.g. MoveNet swapping left and right), and a wrist
+            # that "teleports" between two sightings is the same glitch.  The
+            # jump is measured per sighting, not per second, because frames
+            # arrive in bursts (0.02-0.12 s apart on the device).  The
+            # last sighting stays in the track until then, so a hand unseen
+            # for a moment does not count as lowered.
+            if (last.frame < self._frame - 2 or dt >= c.max_gap_s
+                    or math.hypot(x - last.x, y - last.y) > c.max_wrist_jump):
                 track.clear()
             if dt >= c.lost_s:
                 self._blocked_stroke[side] = 0   # a lost hand has ended its stroke (see below)
@@ -264,11 +273,11 @@ class GestureEngine:
     # --- detectors --------------------------------------------------------------
     # Each returns (gesture, samples used) or None.  They are mutually
     # exclusive: a swipe is mostly horizontal, palm_up mostly vertical and
-    # ends above the head, open_palm is still and below the head.
+    # ends above the head, open_palm is a still hold followed by a drop.
 
-    def _detect(self, track):
-        samples = list(track)
-        return self._swipe(samples) or self._palm_up(samples) or self._open_palm(samples)
+    def _detect(self, side):
+        samples = list(self._tracks[side])
+        return self._swipe(samples) or self._palm_up(samples) or self._open_palm(side, samples)
 
     def _swipe(self, samples):
         c = self.config
@@ -299,16 +308,35 @@ class GestureEngine:
                 return "palm_up", samples[i:]
         return None
 
-    def _open_palm(self, samples):
+    def _open_palm(self, side, samples):
+        # WHY on release: a hand raised still before a swipe looks exactly
+        # like a stop sign (measured on the device), so the hold only arms
+        # the gesture.  A swipe or palm_up that follows wins; lowering the
+        # hand soon after the hold fires open_palm.
+        c = self.config
+        newest = samples[-1]
+        window = self._palm_hold(samples)
+        if window is not None:
+            self._palm_held[side] = (newest.t, window)
+            return None
+        held = self._palm_held[side]
+        if held is not None and newest.y < c.release_y and newest.t - held[0] <= c.palm_lower_s:
+            self._palm_held[side] = None
+            return "open_palm", held[1]
+        return None
+
+    def _palm_hold(self, samples):
+        """Return the samples of a still, raised hand held long enough, else None."""
         c = self.config
         newest = samples[-1]
         if newest.t - samples[0].t < c.palm_hold_s:
             return None
         window = [s for s in samples if s.t >= newest.t - c.palm_hold_s]
-        if not all(s.forearm_up and c.palm_zone_min_y <= s.y <= c.palm_zone_max_y for s in window):
+        if not all(s.forearm_up and c.palm_zone_min_y <= s.y <= c.palm_zone_max_y and abs(s.x) <= c.palm_max_abs_x
+                   for s in window):
             return None
         mx = sum(s.x for s in window) / len(window)
         my = sum(s.y for s in window) / len(window)
         if any(math.hypot(s.x - mx, s.y - my) > c.palm_still_radius for s in window):
             return None
-        return "open_palm", window
+        return window

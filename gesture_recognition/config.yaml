@@ -16,7 +16,11 @@
 camera:
   # Where frames come from.  OpenCV accepts:
   #   http://.../stream.mjpg   MJPEG over HTTP (laptop: tools/webcam_bridge.py)
-  #   rtsp://...               Ethernet IP camera (edge; never commit credentials)
+  #   rtsp://...               Ethernet IP camera (edge; never commit credentials:
+  #                            the device's CAMERA_URL lives in gesture_recognition/.env).
+  #                            Prefer the camera's low-resolution sub-stream (Tapo
+  #                            C310: /stream2): MoveNet sees only 192x192 anyway,
+  #                            and decoding the 3-megapixel main stream costs a core.
   #   0                        a local webcam index (running outside a container)
   #   clips/test.mp4           a recorded video (replayed at its own speed, looped)
   url: "http://host.containers.internal:8090/stream.mjpg"
@@ -29,9 +33,10 @@ camera:
 model:
   model_path: "models/movenet_lightning_int8.tflite"   # downloaded by tools/fetch_model.py
   # NPU acceleration (NXP i.MX 8M Plus VX delegate).  Falls back to the CPU
-  # automatically if the delegate cannot be loaded.
+  # automatically if the delegate cannot be loaded.  The path is where
+  # tools/npu_entrypoint.sh links the device's delegate inside the container.
   use_npu: false
-  vx_delegate_path: "/usr/lib/libvx_delegate.so"
+  vx_delegate_path: "/opt/npu/lib/libvx_delegate.so"
   num_threads: 2            # CPU threads for TFLite; leaves cores free for FT Optix
   target_fps: 20            # inference rate cap; a swipe (0.3-0.6 s) still gets 6-12 frames
                             # tip: set the camera to about this rate too; every frame costs
@@ -46,6 +51,14 @@ mqtt:
   status_topic: "gesture/paperclip/status"  # heartbeat (QoS 1, retained); last will = offline
   status_interval_s: 2                      # heartbeat period in seconds
 
+# --- Live picture for the HMI ---------------------------------------------------
+# MJPEG over HTTP: the camera picture with the body points and the last gesture.
+# FT Optix WebBrowser object URL: http://<device>:8081/   (8080 is FT Optix itself)
+# Drawn and encoded only while someone watches.
+stream:
+  port: 8081
+  jpeg_quality: 70          # 1-100; lower = less bandwidth and CPU, blockier picture
+
 # --- Gesture rules ------------------------------------------------------------
 # Hand positions are measured from the middle of the shoulders, in shoulder
 # widths (SW): x = +1.0 is one shoulder width to the user's right, y = +1.0 is
@@ -56,10 +69,10 @@ mqtt:
 gestures:
   # Who counts as "the operator"
   min_keypoint_score: 0.3       # ignore body points the model is unsure about
-  min_shoulder_width: 0.12      # narrower shoulders (fraction of image) = too far away
+  min_shoulder_width: 0.07      # narrower shoulders (fraction of the padded square image) = too far away
   max_center_offset: 0.35       # shoulders further from the image centre = passer-by
-  max_wrist_speed: 15.0         # SW/s; faster "jumps" are tracking glitches, not motion
-  max_gap_s: 0.3                # no frame for this long (camera hiccup) also starts a new track; a wrist missed in any frame always does
+  max_wrist_jump: 1.5           # SW between two sightings; bigger "jumps" are tracking glitches, not motion
+  max_gap_s: 0.3                # no frame for this long (camera hiccup) also starts a new track; so does a wrist missed in 2+ frames in a row
   lost_s: 0.5                   # a person unseen this long is forgotten; a hand unseen this long counts as lowered and stopped
 
   # Repeat protection
@@ -68,20 +81,24 @@ gestures:
   release_y: -1.0               # palm gestures re-arm only after the hand drops below this
   max_off_axis_ratio: 0.5       # swipes must be mostly horizontal, palm-up mostly vertical
 
-  # open_palm: hand held still at shoulder/face height with the forearm up
+  # open_palm: hand held still at shoulder/face height with the forearm up,
+  # reported when it is then lowered (below release_y) - a swipe or palm_up
+  # that starts from the same pose wins instead
   palm_hold_s: 1.0
   palm_zone_min_y: -0.6
   palm_zone_max_y: 0.8
+  palm_max_abs_x: 1.0           # in front of the body; a hand held out to the side (end of a swipe) is not a stop sign
   palm_still_radius: 0.2
   palm_min_forearm_rise: 0.3    # wrist at least this far above the elbow
+  palm_lower_s: 0.5             # the hand must drop below release_y within this time after the hold
 
   # palm_up: hand pushed up above the head
-  up_min_rise: 1.2
-  up_window_s: 0.7
-  up_end_y: 1.0
+  up_min_rise: 0.9
+  up_window_s: 0.5
+  up_end_y: 0.8
 
   # swipe_left / swipe_right: fast horizontal hand movement, chest to head height
-  swipe_min_dx: 1.5
+  swipe_min_dx: 1.0
   swipe_window_s: 0.6
   swipe_band_min_y: -1.2
   swipe_band_max_y: 1.0
